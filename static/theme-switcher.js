@@ -65,6 +65,13 @@
         }
     };
 
+    window.FONT_SCALES = {
+        'compact':  { label: 'Compact',  size: '14px' },
+        'standard': { label: 'Standard', size: '16px' },
+        'large':    { label: 'Large',    size: '18px' },
+        'xlarge':   { label: 'Extra',    size: '20px' }
+    };
+
     window.applyThemeColors = function(colors) {
         var r = document.documentElement.style;
         for (var k in colors) {
@@ -89,6 +96,22 @@
 
         document.querySelectorAll('.cluster-theme-btn').forEach(function(btn) {
             if (btn.getAttribute('data-theme') === themeKey) {
+                btn.classList.add('active');
+            } else {
+                btn.classList.remove('active');
+            }
+        });
+        updateSettingsModalState();
+    };
+
+    window.setFontScale = function(scaleKey) {
+        if (!window.FONT_SCALES[scaleKey]) scaleKey = 'standard';
+        var entry = window.FONT_SCALES[scaleKey];
+        localStorage.setItem('rustguac_font_scale', scaleKey);
+        document.documentElement.style.setProperty('--base-font-size', entry.size);
+
+        document.querySelectorAll('.font-scale-btn').forEach(function(btn) {
+            if (btn.getAttribute('data-scale') === scaleKey) {
                 btn.classList.add('active');
             } else {
                 btn.classList.remove('active');
@@ -125,7 +148,157 @@
         });
     };
 
-    // Auto-apply on script load
+    // ── Settings Modal Component ──
+    function ensureSettingsModal() {
+        if (document.getElementById('cluster-settings-modal')) return;
+
+        var overlay = document.createElement('div');
+        overlay.id = 'cluster-settings-modal';
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = [
+            '<div class="modal settings-modal-box">',
+            '  <div class="settings-modal-header">',
+            '    <div style="display:flex; align-items:center; gap:8px;">',
+            '      <span style="font-size:20px;">⚙️</span>',
+            '      <h3 style="margin:0; border:none; padding:0;">Preferences</h3>',
+            '    </div>',
+            '    <button type="button" class="btn-small settings-close-btn" id="settings-close-btn" style="border:none; font-size:18px; line-height:1; padding:4px 8px;">&times;</button>',
+            '  </div>',
+            '  <div class="settings-modal-body">',
+            '    <label style="margin-top:0;">Color Theme</label>',
+            '    <div class="settings-theme-cards">',
+            '      <div class="settings-theme-card" data-theme="catppuccin-mocha">',
+            '        <span class="settings-theme-swatch" style="background:linear-gradient(135deg,#cba6f7 50%,#b4befe 50%)"></span>',
+            '        <div class="settings-theme-info">',
+            '          <strong>Catppuccin Mocha</strong>',
+            '          <span>Dark pastel cluster theme</span>',
+            '        </div>',
+            '      </div>',
+            '      <div class="settings-theme-card" data-theme="github-dark">',
+            '        <span class="settings-theme-swatch" style="background:linear-gradient(135deg,#58a6ff 50%,#bc8cff 50%)"></span>',
+            '        <div class="settings-theme-info">',
+            '          <strong>GitHub Dark</strong>',
+            '          <span>Deep blue & purple dark</span>',
+            '        </div>',
+            '      </div>',
+            '      <div class="settings-theme-card" data-theme="github-light">',
+            '        <span class="settings-theme-swatch" style="background:linear-gradient(135deg,#0969da 50%,#8250df 50%)"></span>',
+            '        <div class="settings-theme-info">',
+            '          <strong>GitHub Light</strong>',
+            '          <span>Clean daylight contrast</span>',
+            '        </div>',
+            '      </div>',
+            '    </div>',
+            '    <label style="margin-top:16px;">Font Size</label>',
+            '    <div class="segmented-control font-scale-control">',
+            '      <button type="button" class="segmented-btn font-scale-btn" data-scale="compact">Compact <small style="opacity:0.7">14px</small></button>',
+            '      <button type="button" class="segmented-btn font-scale-btn" data-scale="standard">Standard <small style="opacity:0.7">16px</small></button>',
+            '      <button type="button" class="segmented-btn font-scale-btn" data-scale="large">Large <small style="opacity:0.7">18px</small></button>',
+            '      <button type="button" class="segmented-btn font-scale-btn" data-scale="xlarge">Extra <small style="opacity:0.7">20px</small></button>',
+            '    </div>',
+            '    <div id="settings-extra-actions" style="margin-top:20px; padding-top:16px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:8px;">',
+            '      <button type="button" id="settings-my-creds-btn" class="btn-add" style="width:100%; justify-content:flex-start; text-align:left;">🔑 My Credentials</button>',
+            '      <button type="button" id="settings-tour-btn" class="btn-add" style="width:100%; justify-content:flex-start; text-align:left;">ℹ️ Welcome Tour</button>',
+            '    </div>',
+            '  </div>',
+            '  <div class="modal-actions" style="margin-top:18px;">',
+            '    <button type="button" class="btn-primary" id="settings-done-btn">Done</button>',
+            '  </div>',
+            '</div>'
+        ].join('');
+
+        document.body.appendChild(overlay);
+
+        // Bind events
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) closeSettingsModal();
+        });
+        document.getElementById('settings-close-btn').addEventListener('click', closeSettingsModal);
+        document.getElementById('settings-done-btn').addEventListener('click', closeSettingsModal);
+
+        overlay.querySelectorAll('.settings-theme-card').forEach(function(card) {
+            card.addEventListener('click', function() {
+                var t = card.getAttribute('data-theme');
+                window.switchTheme(t);
+            });
+        });
+
+        overlay.querySelectorAll('.font-scale-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var s = btn.getAttribute('data-scale');
+                window.setFontScale(s);
+            });
+        });
+
+        var credsBtn = document.getElementById('settings-my-creds-btn');
+        if (credsBtn) {
+            credsBtn.addEventListener('click', function() {
+                closeSettingsModal();
+                var origBtn = document.getElementById('my-creds-item') || document.getElementById('my-creds-nav');
+                if (origBtn) origBtn.click();
+            });
+            if (!document.getElementById('my-creds-modal')) credsBtn.style.display = 'none';
+        }
+
+        var tourBtn = document.getElementById('settings-tour-btn');
+        if (tourBtn) {
+            tourBtn.addEventListener('click', function() {
+                closeSettingsModal();
+                var origTour = document.getElementById('show-tour-item');
+                if (origTour) origTour.click();
+            });
+            if (!document.getElementById('onboarding-modal')) tourBtn.style.display = 'none';
+        }
+    }
+
+    function updateSettingsModalState() {
+        var modal = document.getElementById('cluster-settings-modal');
+        if (!modal) return;
+        var activeTheme = localStorage.getItem('rustguac_theme') || 'catppuccin-mocha';
+        var activeScale = localStorage.getItem('rustguac_font_scale') || 'standard';
+
+        modal.querySelectorAll('.settings-theme-card').forEach(function(c) {
+            if (c.getAttribute('data-theme') === activeTheme) c.classList.add('active');
+            else c.classList.remove('active');
+        });
+
+        modal.querySelectorAll('.font-scale-btn').forEach(function(b) {
+            if (b.getAttribute('data-scale') === activeScale) b.classList.add('active');
+            else b.classList.remove('active');
+        });
+    }
+
+    window.openSettingsModal = function() {
+        ensureSettingsModal();
+        updateSettingsModalState();
+        var modal = document.getElementById('cluster-settings-modal');
+        if (modal) modal.classList.add('active');
+    };
+
+    window.closeSettingsModal = function() {
+        var modal = document.getElementById('cluster-settings-modal');
+        if (modal) modal.classList.remove('active');
+    };
+
+    // Attach Settings modal to #user-menu-btn or settings triggers
+    document.addEventListener('DOMContentLoaded', function() {
+        var btn = document.getElementById('user-menu-btn');
+        if (btn) {
+            btn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                window.openSettingsModal();
+            });
+        }
+    });
+
+    // Auto-apply stored font scale immediately on script parse
+    var initialScale = localStorage.getItem('rustguac_font_scale') || 'standard';
+    if (window.FONT_SCALES[initialScale]) {
+        document.documentElement.style.setProperty('--base-font-size', window.FONT_SCALES[initialScale].size);
+    }
+
+    // Auto-apply theme colors immediately
     var initialTheme = localStorage.getItem('rustguac_theme') || 'catppuccin-mocha';
     if (window.CLUSTER_THEMES[initialTheme]) {
         window.applyThemeColors(window.CLUSTER_THEMES[initialTheme].colors);

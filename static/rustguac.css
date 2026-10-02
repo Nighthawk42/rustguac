@@ -1,7 +1,8 @@
 /* ============================================================
    rustguac — Modern Cluster Console Stylesheet
-   - Clean, modern system typography
+   - Clean, modern system typography with dynamic font scaling
    - Refined 8px/4px geometry and spacing
+   - Fully responsive layout for desktop, tablet, and mobile
    - Cohesive theming: Catppuccin Mocha, GitHub Dark, GitHub Light
    ============================================================ */
 
@@ -22,6 +23,23 @@
     --hop-bg: #313244; --hop-fg: #a6e3a1;
     --bg-pattern: none;
 
+    /* dynamic typography scale (standard = 16px) */
+    --base-font-size: 16px;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    --fz-xs: calc(var(--base-font-size) * 0.75);   /* ~12px */
+    --fz-sm: calc(var(--base-font-size) * 0.875);  /* ~14px */
+    --fz-md: var(--base-font-size);                /* ~16px */
+    --fz-lg: calc(var(--base-font-size) * 1.125);  /* ~18px */
+    --fz-xl: calc(var(--base-font-size) * 1.375);  /* ~22px */
+    --fz-xxl: calc(var(--base-font-size) * 1.75);  /* ~28px */
+
+    /* control heights (scaled to font) */
+    --ctl-sm: calc(var(--base-font-size) * 2.15);  /* ~34px */
+    --ctl-md: calc(var(--base-font-size) * 2.5);   /* ~40px */
+    --ctl-lg: calc(var(--base-font-size) * 2.9);   /* ~46px */
+
     /* spacing */
     --s-1: 4px;
     --s-2: 8px;
@@ -35,22 +53,6 @@
     --radius: 8px;
     --radius-lg: 12px;
     --radius-pill: 9999px;
-
-    /* control heights */
-    --ctl-sm: 32px;
-    --ctl-md: 38px;
-    --ctl-lg: 44px;
-
-    /* typography */
-    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-
-    --fz-xs: 11px;
-    --fz-sm: 13px;
-    --fz-md: 14px;
-    --fz-lg: 16px;
-    --fz-xl: 20px;
-    --fz-xxl: 24px;
 }
 
 /* ── Reset / base ─────────────────────────────── */
@@ -120,7 +122,7 @@ code {
     margin-bottom: var(--s-2);
 }
 .brand-row #site-logo {
-    height: 32px;
+    height: 34px;
     width: auto;
     display: block;
 }
@@ -133,14 +135,14 @@ nav {
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
-    gap: var(--s-4);
+    gap: var(--s-3);
     font-size: var(--fz-md);
     flex-wrap: wrap;
 }
 nav a {
     text-decoration: none;
     color: var(--text-muted);
-    padding: var(--s-1) var(--s-2);
+    padding: 6px var(--s-2);
     border-radius: var(--radius-sm);
     position: relative;
     line-height: 1.4;
@@ -149,13 +151,13 @@ nav a {
 }
 nav a:hover {
     color: var(--text);
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba(255, 255, 255, 0.05);
     text-decoration: none;
 }
 nav a.active {
     color: var(--primary);
     font-weight: 600;
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.07);
 }
 nav a.active::after {
     content: '';
@@ -171,21 +173,43 @@ nav a.active::after {
     margin-left: auto;
     display: inline-flex;
     align-items: center;
-    gap: var(--s-3);
+    gap: var(--s-2);
     position: relative;
+}
+#user-menu-btn {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--fz-sm);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 var(--s-3);
+    height: var(--ctl-sm);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    transition: all 0.15s ease;
+    user-select: none;
+}
+#user-menu-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+    background: var(--input);
 }
 #logout-item {
     color: var(--text-muted);
     font-size: var(--fz-sm);
     text-decoration: none;
-    padding: var(--s-1) var(--s-2);
+    padding: 0 var(--s-2);
+    height: var(--ctl-sm);
+    display: inline-flex;
+    align-items: center;
     border-radius: var(--radius-sm);
-    line-height: 1.4;
     transition: all 0.15s ease;
 }
 #logout-item:hover {
     color: var(--primary);
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba(255, 255, 255, 0.05);
 }
 
 /* ── Cluster Theme Switcher ────────────────── */
@@ -210,10 +234,11 @@ nav a.active::after {
     font-family: var(--font-sans);
     font-size: var(--fz-xs);
     font-weight: 500;
-    height: 24px;
+    height: 26px;
     cursor: pointer;
     transition: all 0.15s ease;
     user-select: none;
+    box-shadow: none;
 }
 .cluster-theme-btn:hover {
     color: var(--text);
@@ -231,6 +256,102 @@ nav a.active::after {
     height: 8px;
     border-radius: 50%;
     flex-shrink: 0;
+}
+
+/* ── Segmented Control & Settings Modal ─────── */
+.segmented-control {
+    display: flex;
+    background: var(--input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 3px;
+    gap: 2px;
+}
+.segmented-btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-sans);
+    font-size: var(--fz-xs);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    height: auto;
+    box-shadow: none;
+}
+.segmented-btn:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.05);
+}
+.segmented-btn.active {
+    background: var(--surface);
+    color: var(--primary);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.settings-modal-box {
+    max-width: 480px !important;
+}
+.settings-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--s-3);
+    padding-bottom: var(--s-2);
+    border-bottom: 1px solid var(--border);
+}
+.settings-theme-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 6px;
+}
+.settings-theme-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.settings-theme-card:hover {
+    border-color: var(--primary);
+    background: rgba(255, 255, 255, 0.03);
+}
+.settings-theme-card.active {
+    border-color: var(--accent);
+    background: var(--surface);
+    box-shadow: 0 0 0 1px var(--accent);
+}
+.settings-theme-swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    flex-shrink: 0;
+}
+.settings-theme-info {
+    display: flex;
+    flex-direction: column;
+}
+.settings-theme-info strong {
+    font-size: var(--fz-sm);
+    color: var(--text);
+}
+.settings-theme-info span {
+    font-size: var(--fz-xs);
+    color: var(--text-muted);
 }
 
 /* ── Buttons ─────────────────────────────────── */
@@ -397,7 +518,7 @@ table {
 }
 th, td {
     text-align: left;
-    padding: var(--s-2) var(--s-4);
+    padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     font-size: var(--fz-sm);
     vertical-align: middle;
@@ -682,8 +803,8 @@ tbody tr:last-child td {
 
 /* ── Custom Scrollbar ────────────────────────── */
 ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 6px;
+    height: 6px;
 }
 ::-webkit-scrollbar-track {
     background: var(--bg);
@@ -694,4 +815,183 @@ tbody tr:last-child td {
 }
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-dim);
+}
+
+/* ============================================================
+   RESPONSIVE & MOBILE DESIGN
+   ============================================================ */
+
+@media (max-width: 900px) {
+    .summary-cards, .status-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+    }
+}
+
+@media (max-width: 768px) {
+    body {
+        padding: 12px 14px !important;
+    }
+
+    .brand-row {
+        justify-content: space-between;
+        width: 100%;
+        margin-bottom: 8px !important;
+    }
+    .brand-row h1 {
+        font-size: 20px !important;
+    }
+    .brand-row #site-logo {
+        height: 28px !important;
+    }
+
+    /* Horizontal scrollable navigation tabs */
+    nav {
+        gap: 4px !important;
+        margin-top: 4px !important;
+        margin-bottom: 14px !important;
+        padding-bottom: 6px !important;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-wrap: nowrap !important;
+        scrollbar-width: none;
+    }
+    nav::-webkit-scrollbar {
+        display: none;
+    }
+    nav a {
+        padding: 6px 10px !important;
+        font-size: var(--fz-sm) !important;
+        white-space: nowrap !important;
+        flex-shrink: 0;
+    }
+
+    #user-menu-wrapper {
+        position: static !important;
+        margin-left: auto;
+        gap: 6px !important;
+    }
+    .cluster-theme-switcher {
+        display: none !important; /* Theme switcher moved inside Preferences modal on mobile */
+    }
+
+    /* Connections layout */
+    .layout {
+        flex-direction: column !important;
+        gap: 14px !important;
+    }
+    .sidebar {
+        min-width: 100% !important;
+        max-width: 100% !important;
+        border-right: none !important;
+        border-bottom: 1px solid var(--border) !important;
+        padding-right: 0 !important;
+        padding-bottom: 10px !important;
+    }
+    .sidebar-header {
+        margin-bottom: 8px !important;
+    }
+    .folder-list {
+        display: flex;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        gap: 8px;
+        padding-bottom: 6px;
+        margin: 0;
+        scrollbar-width: none;
+    }
+    .folder-list::-webkit-scrollbar {
+        display: none;
+    }
+    .folder-list li {
+        flex-shrink: 0;
+    }
+    .folder-row {
+        border-radius: var(--radius) !important;
+        border: 1px solid var(--border) !important;
+        border-left: 3px solid var(--border) !important;
+        min-height: 38px !important;
+        padding: 6px 12px !important;
+        background: var(--surface) !important;
+    }
+    .folder-list li.selected > .folder-row {
+        border-left-color: var(--accent) !important;
+        background: var(--input) !important;
+    }
+
+    /* Folder action bar */
+    .folder-actions {
+        flex-direction: column !important;
+        align-items: stretch !important;
+        gap: 8px !important;
+    }
+    .connections-search {
+        max-width: 100% !important;
+        width: 100% !important;
+        margin-left: 0 !important;
+    }
+
+    /* Tables: scroll horizontally on mobile without breaking layout */
+    table,
+    .entries-table,
+    #history-table,
+    #audit-table,
+    #ab-audit-table {
+        display: block !important;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+        max-width: 100% !important;
+        border-radius: var(--radius) !important;
+        white-space: nowrap;
+    }
+    th, td,
+    .entries-table th, .entries-table td {
+        padding: 8px 10px !important;
+    }
+    .entries-table td:nth-child(1) {
+        white-space: normal;
+        min-width: 120px;
+    }
+
+    /* Touch-friendly buttons on mobile */
+    .btn-connect {
+        min-height: 38px !important;
+        padding: 0 14px !important;
+        font-size: var(--fz-md) !important;
+    }
+
+    /* Modals on mobile: full screen width, comfortable padding */
+    .modal {
+        min-width: 0 !important;
+        width: 95vw !important;
+        max-width: 95vw !important;
+        margin: 8px !important;
+        padding: 16px !important;
+        max-height: 90vh !important;
+        border-radius: var(--radius) !important;
+    }
+
+    /* Summary cards & grids on mobile */
+    .summary-cards, .status-grid {
+        grid-template-columns: 1fr !important;
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 8px !important;
+    }
+    .summary-card, .status-card {
+        min-width: 100% !important;
+    }
+
+    /* Filter bars on mobile */
+    .filter-bar {
+        flex-direction: column !important;
+        align-items: stretch !important;
+        gap: 8px !important;
+    }
+    .filter-bar input {
+        width: 100% !important;
+    }
+    .btn-clear-logs {
+        margin-left: 0 !important;
+        width: 100% !important;
+    }
 }

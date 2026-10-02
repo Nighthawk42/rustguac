@@ -2,6 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>rustguac - Sessions</title>
     <link rel="stylesheet" href="/rustguac.css">
     <style>
@@ -63,7 +64,7 @@
         <a href="/docs.html">Docs</a>
         <a href="/tokens.html" id="tokens-link" style="display:none">Tokens</a>
         <a href="/admin.html" id="admin-link" style="display:none">Admin</a>
-        <span id="user-menu-wrapper"><div id="theme-switcher"></div><a href="#" id="logout-item">Logout</a></span><div id="user-menu"><div class="um-section-label">Theme</div><div id="um-theme-list"></div></div></span>
+        <span id="user-menu-wrapper"><div id="theme-switcher"></div><span id="user-menu-btn" title="Preferences">&#9881; Settings</span><a href="#" id="logout-item">Logout</a></span>
     </nav>
 
     <div id="adhoc-notice" style="display:none;background:var(--surface);padding:1em 1.5em;border-radius:6px;max-width:400px;margin:1.5em 0;color:var(--text-muted);">
@@ -202,7 +203,7 @@
     }
     if(window.renderThemeSwitcher) window.renderThemeSwitcher('theme-switcher');
 }
-        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.stopPropagation();var m=document.getElementById('user-menu');m.style.display=m.style.display==='block'?'none':'block'});document.addEventListener('click',function(){var m=document.getElementById('user-menu');if(m)m.style.display='none'});
+        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();if(window.openSettingsModal)window.openSettingsModal();});
         fetch('/api/auth/status').then(function(r){return r.json()}).then(function(d){
             if(d.site_title){document.title=d.site_title+' - Sessions';document.querySelector('h1').textContent=d.site_title;}
             initTheme(d.theme);
