@@ -8,6 +8,7 @@
         .audit-row td { padding: var(--s-2) var(--s-3); font-size: var(--fz-sm); }
     </style>
     <script>(function(){var c=localStorage.getItem('rustguac_theme_colors');if(c){try{var o=JSON.parse(c),r=document.documentElement.style;for(var k in o)r.setProperty('--'+k.replace(/_/g,'-'),o[k]);if(o.bg_pattern&&o.bg_pattern!=='none'){var s=document.createElement('style');s.id='bg-pattern-style';s.textContent='body{background-image:'+o.bg_pattern+';background-attachment:fixed}';document.head.appendChild(s)}}catch(e){}}})();</script>
+    <script src="/theme-switcher.js"></script>
 </head>
 <body>
     <div class="brand-row">
@@ -22,7 +23,7 @@
         <a href="/docs.html">Docs</a>
         <a href="/tokens.html">Tokens</a>
         <a href="/admin.html" class="active">Admin</a>
-        <span id="user-menu-wrapper"><a href="#" id="logout-item">Logout</a><span id="user-menu-btn" title="Preferences">&#9881; Settings</span><div id="user-menu"><div class="um-section-label">Theme</div><div id="um-theme-list"></div></div></span>
+        <span id="user-menu-wrapper"><div id="theme-switcher"></div><a href="#" id="logout-item">Logout</a></span><div id="user-menu"><div class="um-section-label">Theme</div><div id="um-theme-list"></div></div></span>
     </nav>
 
     <h2>System Status</h2>
@@ -97,9 +98,10 @@
     </div>
 
     <h2>Token Audit Log</h2>
-    <div style="margin-bottom:0.5em;">
+    <div style="margin-bottom:0.5em; display:flex; align-items:center; gap:8px;">
         <input type="text" id="audit-email-filter" placeholder="Filter by email" style="width:200px;">
         <button class="btn-primary" id="audit-filter-btn" style="padding:0.3em 0.8em;">Filter</button>
+        <button class="btn-clear-logs" id="clear-token-audit-btn" style="padding:0.3em 0.8em; margin-left:auto;">Clear Token Audit</button>
     </div>
     <table id="audit-table">
         <thead><tr>
@@ -113,9 +115,11 @@
     <div style="margin-bottom:0.5em;color:var(--text-muted);font-size:0.9em;">
         Destructive and mutating actions against the Connections address book. Metadata only &mdash; entry field values (passwords, keys) are never logged.
     </div>
-    <div style="margin-bottom:0.5em;">
+    <div style="margin-bottom:0.5em; display:flex; align-items:center; gap:8px;">
         <input type="text" id="ab-audit-email-filter" placeholder="Filter by email" style="width:200px;">
         <button class="btn-primary" id="ab-audit-filter-btn" style="padding:0.3em 0.8em;">Filter</button>
+        <button class="btn-clear-logs" id="clear-ab-audit-btn" style="padding:0.3em 0.8em; margin-left:auto;">Clear Connections Audit</button>
+        <button class="btn-clear-logs" id="clear-all-audit-btn" style="padding:0.3em 0.8em;">Clear All Audit Logs</button>
     </div>
     <table id="ab-audit-table">
         <thead><tr>
@@ -131,7 +135,13 @@
         function applyThemeColors(colors){var r=document.documentElement.style;for(var k in colors)r.setProperty('--'+k.replace(/_/g,'-'),colors[k]);var s=document.getElementById('bg-pattern-style');if(!s){s=document.createElement('style');s.id='bg-pattern-style';document.head.appendChild(s)}s.textContent=colors.bg_pattern&&colors.bg_pattern!=='none'?'body{background-image:'+colors.bg_pattern+';background-attachment:fixed}':'';localStorage.setItem('rustguac_theme_colors',JSON.stringify(colors))}
         var _themePresets={},_adminPreset='aurora';
         var _themeDescriptions={dark:'Navy & cyan \u2014 the default',light:'Clean white & blue','high-contrast':'Maximum readability',terminal:'Retro green-on-black',nord:'Arctic, muted blues',corporate:'Slate & steel blue',aurora:'Midnight blue with ambient glow',jaguar:'Racing green & gold'};
-        function initTheme(t){if(!t)return;_themePresets=t.presets||{};_adminPreset=t.admin_preset||'aurora';var u=localStorage.getItem('rustguac_theme'),active=u&&_themePresets[u]?u:_adminPreset,colors=(active===_adminPreset)?t.admin_colors:_themePresets[active];if(colors)applyThemeColors(colors);if(t.logo_url){var l=document.getElementById('site-logo');if(l){if(l.src!==t.logo_url&&!l.src.endsWith(t.logo_url))l.src=t.logo_url;l.style.display=''}}var menu=document.getElementById('um-theme-list');if(menu){menu.innerHTML='';Object.keys(_themePresets).forEach(function(name){var item=document.createElement('div');item.className='um-item'+(name===active?' active':'');var sw=document.createElement('span');sw.className='um-swatch';var p=_themePresets[name];sw.style.background='linear-gradient(135deg,'+p.primary+' 50%,'+p.accent+' 50%)';item.appendChild(sw);var info=document.createElement('div');info.className='um-theme-info';var nm=document.createElement('span');nm.className='um-theme-name';nm.textContent=name;info.appendChild(nm);var desc=document.createElement('span');desc.className='um-theme-desc';desc.textContent=_themeDescriptions[name]||'';info.appendChild(desc);item.appendChild(info);item.addEventListener('click',function(){localStorage.setItem('rustguac_theme',name);applyThemeColors(_themePresets[name]);menu.querySelectorAll('.um-item').forEach(function(el){el.classList.remove('active')});item.classList.add('active');document.getElementById('user-menu').style.display='none'});menu.appendChild(item)})}}
+        function initTheme(t){
+    if(t && t.logo_url){
+        var l = document.getElementById('site-logo');
+        if(l){ if(l.src !== t.logo_url && !l.src.endsWith(t.logo_url)) l.src = t.logo_url; l.style.display = ''; }
+    }
+    if(window.renderThemeSwitcher) window.renderThemeSwitcher('theme-switcher');
+}
         var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.stopPropagation();var m=document.getElementById('user-menu');m.style.display=m.style.display==='block'?'none':'block'});document.addEventListener('click',function(){var m=document.getElementById('user-menu');if(m)m.style.display='none'});
         fetch('/api/auth/status').then(function(r){return r.json()}).then(function(d){
             if(d.site_title){document.title=d.site_title+' - Admin';document.querySelector('h1').textContent=d.site_title;}
@@ -599,6 +609,14 @@
             loadAuditLog(email || undefined);
         });
 
+        document.getElementById('clear-token-audit-btn').addEventListener('click', function() {
+            if (!confirm('Are you sure you want to clear all token audit log entries?')) return;
+            fetch('/api/admin/token-audit', { method: 'DELETE', headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { if (!res.ok) throw new Error('Failed to clear token audit log'); return res.json(); })
+            .then(function() { loadAuditLog(); })
+            .catch(function(err) { showError(err.message); });
+        });
+
         // ── Connections Audit Log ──
 
         function loadAbAuditLog(emailFilter) {
@@ -646,6 +664,22 @@
         document.getElementById('ab-audit-filter-btn').addEventListener('click', function() {
             var email = document.getElementById('ab-audit-email-filter').value.trim();
             loadAbAuditLog(email || undefined);
+        });
+
+        document.getElementById('clear-ab-audit-btn').addEventListener('click', function() {
+            if (!confirm('Are you sure you want to clear all connections audit log entries?')) return;
+            fetch('/api/admin/addressbook-audit', { method: 'DELETE', headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { if (!res.ok) throw new Error('Failed to clear connections audit log'); return res.json(); })
+            .then(function() { loadAbAuditLog(); })
+            .catch(function(err) { showError(err.message); });
+        });
+
+        document.getElementById('clear-all-audit-btn').addEventListener('click', function() {
+            if (!confirm('Are you sure you want to clear ALL audit logs (token and connections)? This cannot be undone.')) return;
+            fetch('/api/admin/audit-logs', { method: 'DELETE', headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { if (!res.ok) throw new Error('Failed to clear audit logs'); return res.json(); })
+            .then(function() { loadAuditLog(); loadAbAuditLog(); })
+            .catch(function(err) { showError(err.message); });
         });
 
         // Auto-refresh

@@ -1107,6 +1107,27 @@ pub fn cleanup_old_audit_log(db: &Db, retain_days: u32) -> rusqlite::Result<usiz
     Ok(tok + ab + cli)
 }
 
+/// Clear token audit log entries.
+pub fn clear_token_audit_log(db: &Db) -> rusqlite::Result<usize> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM token_audit_log", [])
+}
+
+/// Clear addressbook audit log entries.
+pub fn clear_addressbook_audit_log(db: &Db) -> rusqlite::Result<usize> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM addressbook_audit_log", [])
+}
+
+/// Clear all audit logs (token, addressbook, cli).
+pub fn clear_all_audit_logs(db: &Db) -> rusqlite::Result<usize> {
+    let conn = db.lock().unwrap();
+    let tok = conn.execute("DELETE FROM token_audit_log", [])?;
+    let ab = conn.execute("DELETE FROM addressbook_audit_log", [])?;
+    let cli = conn.execute("DELETE FROM cli_audit_log", [])?;
+    Ok(tok + ab + cli)
+}
+
 // ── Connections (address book) audit log ──
 
 /// Log a destructive or mutating connections action. Persisted in SQLite.
@@ -1454,6 +1475,12 @@ pub fn cleanup_session_history(db: &Db, retain_days: u32) -> rusqlite::Result<us
         "DELETE FROM session_history WHERE started_at < datetime('now', ?1)",
         params![modifier],
     )
+}
+
+/// Clear all session history entries.
+pub fn clear_session_history(db: &Db) -> rusqlite::Result<usize> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM session_history", [])
 }
 
 /// Resolve the best role for a user based on their OIDC groups and the group-to-role mappings.

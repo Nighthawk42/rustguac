@@ -1,13 +1,42 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <!-- Avocado outer shape -->
-  <path d="M64 8C40 8 24 28 20 52c-4 24 4 48 20 60 8 6 16 8 24 8s16-2 24-8c16-12 24-36 20-60C104 28 88 8 64 8z" fill="#5bc0be"/>
-  <!-- Avocado pit / terminal screen -->
-  <ellipse cx="64" cy="72" rx="26" ry="30" fill="#1a1a2e"/>
-  <!-- Eyes -->
-  <circle cx="55" cy="62" r="3" fill="#e0e0e0"/>
-  <circle cx="73" cy="62" r="3" fill="#e0e0e0"/>
-  <!-- Smile -->
-  <path d="M56 72 Q64 80 72 72" fill="none" stroke="#e0e0e0" stroke-width="2" stroke-linecap="round"/>
-  <!-- Terminal prompt -->
-  <text x="48" y="92" font-family="monospace" font-weight="bold" font-size="18" fill="#e94560">&gt;_</text>
+  <defs>
+    <linearGradient id="grad-primary" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#cba6f7"/>
+      <stop offset="100%" stop-color="#89b4fa"/>
+    </linearGradient>
+    <linearGradient id="grad-accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#b4befe"/>
+      <stop offset="100%" stop-color="#94e2d5"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Ring / Hexagon Shield -->
+  <polygon points="64,10 114,38 114,90 64,118 14,90 14,38" fill="#181825" stroke="#313244" stroke-width="3"/>
+  <polygon points="64,18 106,42 106,86 64,110 22,86 22,42" fill="#1e1e2e" stroke="url(#grad-primary)" stroke-width="2" opacity="0.9"/>
+
+  <!-- Network Interconnect Lines -->
+  <line x1="64" y1="64" x2="64" y2="30" stroke="#45475a" stroke-width="2"/>
+  <line x1="64" y1="64" x2="98" y2="64" stroke="#45475a" stroke-width="2"/>
+  <line x1="64" y1="64" x2="64" y2="98" stroke="#45475a" stroke-width="2"/>
+  <line x1="64" y1="64" x2="30" y2="64" stroke="#45475a" stroke-width="2"/>
+
+  <!-- Glowing diagonal traces -->
+  <line x1="40" y1="40" x2="88" y2="88" stroke="url(#grad-accent)" stroke-width="1.5" opacity="0.6"/>
+  <line x1="88" y1="40" x2="40" y2="88" stroke="url(#grad-accent)" stroke-width="1.5" opacity="0.6"/>
+
+  <!-- Outer Satellite Nodes (Nodes of the Cluster: Hestia, Scylla, Athena, Charybdis) -->
+  <circle cx="64" cy="30" r="6" fill="#a6e3a1" filter="url(#glow)"/>
+  <circle cx="98" cy="64" r="6" fill="#fab387" filter="url(#glow)"/>
+  <circle cx="64" cy="98" r="6" fill="#74c7ec" filter="url(#glow)"/>
+  <circle cx="30" cy="64" r="6" fill="#cba6f7" filter="url(#glow)"/>
+
+  <!-- Central Cluster Hub -->
+  <circle cx="64" cy="64" r="18" fill="#11111b" stroke="url(#grad-primary)" stroke-width="2.5"/>
+
+  <!-- Z1 Cluster Monogram -->
+  <text x="64" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'JetBrains Mono', monospace" font-weight="900" font-size="14" fill="#cdd6f4" text-anchor="middle" letter-spacing="-0.5px">Z1</text>
 </svg>

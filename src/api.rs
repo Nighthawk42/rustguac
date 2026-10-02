@@ -1117,6 +1117,32 @@ pub async fn report_sessions(
     }
 }
 
+/// DELETE /api/reports/sessions — Clear session history. Poweruser+ or Admin only.
+pub async fn clear_report_sessions(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(database): Extension<Db>,
+) -> impl IntoResponse {
+    if let Some(Extension(ref id)) = identity {
+        if !id.has_role("poweruser") && !id.has_role("admin") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "poweruser or admin role required"})),
+            )
+                .into_response();
+        }
+    }
+
+    let db_clone = database.clone();
+    match tokio::task::spawn_blocking(move || db::clear_session_history(&db_clone)).await {
+        Ok(Ok(deleted)) => Json(json!({"deleted": deleted, "message": "session history cleared"})).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to clear session history"})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/reports/sessions/csv — Export session history as CSV. Poweruser+ only.
 pub async fn report_sessions_csv(
     identity: Option<Extension<AuthIdentity>>,
@@ -4406,6 +4432,84 @@ pub async fn admin_addressbook_audit(
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to list audit log"})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/token-audit — Clear token audit log. Admin only.
+pub async fn clear_admin_token_audit(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(database): Extension<Db>,
+) -> impl IntoResponse {
+    if let Some(Extension(ref id)) = identity {
+        if !id.has_role("admin") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )
+                .into_response();
+        }
+    }
+
+    let db_clone = database.clone();
+    match tokio::task::spawn_blocking(move || db::clear_token_audit_log(&db_clone)).await {
+        Ok(Ok(deleted)) => Json(json!({"deleted": deleted, "message": "token audit log cleared"})).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to clear token audit log"})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/addressbook-audit — Clear addressbook audit log. Admin only.
+pub async fn clear_admin_addressbook_audit(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(database): Extension<Db>,
+) -> impl IntoResponse {
+    if let Some(Extension(ref id)) = identity {
+        if !id.has_role("admin") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )
+                .into_response();
+        }
+    }
+
+    let db_clone = database.clone();
+    match tokio::task::spawn_blocking(move || db::clear_addressbook_audit_log(&db_clone)).await {
+        Ok(Ok(deleted)) => Json(json!({"deleted": deleted, "message": "addressbook audit log cleared"})).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to clear addressbook audit log"})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/audit-logs — Clear all audit logs. Admin only.
+pub async fn clear_all_audit_logs(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(database): Extension<Db>,
+) -> impl IntoResponse {
+    if let Some(Extension(ref id)) = identity {
+        if !id.has_role("admin") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )
+                .into_response();
+        }
+    }
+
+    let db_clone = database.clone();
+    match tokio::task::spawn_blocking(move || db::clear_all_audit_logs(&db_clone)).await {
+        Ok(Ok(deleted)) => Json(json!({"deleted": deleted, "message": "all audit logs cleared"})).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to clear audit logs"})),
         )
             .into_response(),
     }

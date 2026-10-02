@@ -242,7 +242,7 @@ install_local_vault() {
 # unseal. NOT a hardened HA setup.
 
 ui            = true
-disable_mlock = false
+disable_mlock = true
 api_addr      = "${LOCAL_API_ADDR}"
 cluster_addr  = "${LOCAL_API_ADDR/8200/8201}"
 

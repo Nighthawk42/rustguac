@@ -1155,6 +1155,7 @@ async fn run_server(config: Config, database: Db) {
         // #159: typescript register is list-only by design (no serve/delete).
         .route("/api/typescripts", get(api::list_typescripts))
         .route("/api/reports/sessions", get(api::report_sessions))
+        .route("/api/reports/sessions", delete(api::clear_report_sessions))
         .route("/api/reports/sessions/csv", get(api::report_sessions_csv))
         .route(
             "/api/reports/top-connections",
@@ -1203,10 +1204,16 @@ async fn run_server(config: Config, database: Db) {
             delete(api::admin_revoke_user_token),
         )
         .route("/api/admin/token-audit", get(api::admin_token_audit))
+        .route("/api/admin/token-audit", delete(api::clear_admin_token_audit))
         .route(
             "/api/admin/addressbook-audit",
             get(api::admin_addressbook_audit),
         )
+        .route(
+            "/api/admin/addressbook-audit",
+            delete(api::clear_admin_addressbook_audit),
+        )
+        .route("/api/admin/audit-logs", delete(api::clear_all_audit_logs))
         // Login scripts listing
         .route("/api/login-scripts", get(api::list_login_scripts))
         .route("/api/ws-ticket", post(api::create_ws_ticket))
