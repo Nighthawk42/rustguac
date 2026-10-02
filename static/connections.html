@@ -2049,7 +2049,6 @@
                 var r = m.row;
                 var e = r.entry;
                 var typeLabel = e.session_type.toUpperCase();
-                if (e.auth_pkg) typeLabel += ' <span style="font-size:0.75em;color:#888">(' + escapeHtml(e.auth_pkg) + ')</span>';
                 var typeCls = 'type-' + e.session_type;
                 var needsPrompt = (e.prompt_credentials || !e.has_credentials) && e.session_type !== 'web' && e.session_type !== 'proxmox';
                 var connectLabel = needsPrompt ? 'Login...' : 'Connect';
@@ -2299,7 +2298,6 @@
                     : '';
                 html += '<td>' + escapeHtml(label) + credPill + '</td>';
                 var typeLabel = e.session_type.toUpperCase();
-                if (e.auth_pkg) typeLabel += ' <span style="font-size:0.75em;color:#888">(' + escapeHtml(e.auth_pkg) + ')</span>';
                 html += '<td><span class="type-badge ' + typeCls + '">' + typeLabel + '</span></td>';
                 html += '<td>' + escapeHtml(hostBase) + hostSuffix + '</td>';
                 var userCol = e.session_type === 'proxmox'
@@ -2312,9 +2310,9 @@
                 html += '<td class="connect-cell"><button class="btn-connect" data-connect="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">' + connectLabel + '</button>'
                     + '<button class="btn-connect btn-connect-win" title="Open in a new window" data-connect-win="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">&#x29c9;</button></td>';
                 if (isAdmin) {
-                    html += '<td><button class="btn-small" data-edit-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '" data-type="' + escapeAttr(e.session_type) + '">edit</button></td>';
-                    html += '<td><button class="btn-small" data-clone-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">clone</button></td>';
-                    html += '<td><button class="btn-small" data-delete-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">delete</button></td>';
+                    html += '<td><button class="btn-small" data-edit-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '" data-type="' + escapeAttr(e.session_type) + '">Edit</button></td>';
+                    html += '<td><button class="btn-small" data-clone-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">Clone</button></td>';
+                    html += '<td><button class="btn-small" data-delete-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">Delete</button></td>';
                 }
                 html += '</tr>';
             });
