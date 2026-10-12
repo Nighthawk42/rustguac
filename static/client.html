@@ -1878,12 +1878,14 @@
             // Absorb a small shortfall between the framebuffer and the
             // viewport. The uniform fit in scaleDisplay() makes one axis match
             // exactly and leaves the other short when the server could not
-            // honour the requested size: Windows RDP without GFX rounds the
-            // width down to a multiple of 16, so a 1710-wide window gets a
-            // 1696-wide desktop and a 14px strip of bare page down the right
-            // edge (#251). A stretch of that last percent or two is invisible;
-            // the strip is not. A larger gap is a real aspect mismatch (fixed
-            // resolution, no resize support) and keeps the letterbox.
+            // honour the requested size. For RDP that is our own guacd:
+            // patches/007-rdp-disp-mod16 rounds both dimensions down to a
+            // multiple of 16, with or without GFX, so a 1710-wide window gets
+            // a 1696-wide desktop and up to 15px of margin (#251). That
+            // rounding is deliberate (it prevents H.264's green band along the
+            // edge) and must not be relaxed to make the margin go away. A
+            // larger gap is a real aspect mismatch (fixed resolution, no
+            // resize support) and keeps the letterbox.
             var FILL_MAX = 1.025;
             // pixelExact: the picture is already drawn one framebuffer pixel per
             // physical pixel (effective scale x devicePixelRatio == 1), so any

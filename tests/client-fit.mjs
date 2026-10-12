@@ -2,8 +2,9 @@
 /*
  * Pins the framebuffer fit in client.html (#251).
  *
- * Windows RDP rounds the requested width down to a multiple of 16, so a
- * 1710-wide window gets a 1696-wide desktop and the uniform fit leaves a
+ * Our guacd rounds the RDP size down to a multiple of 16
+ * (patches/007-rdp-disp-mod16, deliberately, against H.264's green band), so
+ * a 1710-wide window gets a 1696-wide desktop and the uniform fit leaves a
  * 14px strip. applyFill() decides what happens to that strip, and the two
  * rules it carries are exactly the ones pletch asked for on #251: a
  * pixel-exact picture (scale x devicePixelRatio == 1) is never stretched,
