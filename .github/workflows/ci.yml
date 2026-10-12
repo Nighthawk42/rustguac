@@ -59,6 +59,16 @@ jobs:
         # were never exercised on a PR.
         run: $HOME/.cargo/bin/cargo test
 
+      - name: Client tests
+        # Plain-node tests of the browser client (tests/*.mjs): no browser
+        # and no npm packages, just node's own test assertions.
+        run: |
+          apt-get install -y --no-install-recommends nodejs
+          for t in tests/*.mjs; do
+            echo "== $t"
+            node "$t"
+          done
+
       - name: Security audit
         # Ignored advisories + rationale live in .cargo/audit.toml so new
         # advisories on the same crates still surface.
