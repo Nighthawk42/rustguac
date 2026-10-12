@@ -102,6 +102,12 @@
         #player-time { color: var(--text-muted); font-size: var(--fz-sm); white-space: nowrap; }
         .btn-delete { color: var(--primary); }
         .btn-delete:hover { color: var(--primary-hover); }
+        /* Long names, emails and folder paths wrap inside their cell instead
+           of widening the table past the page: a dotted FQDN has no natural
+           break point (#252). The action buttons stay on one line. */
+        #recording-list td { overflow-wrap: anywhere; }
+        #recording-list td:last-child { overflow-wrap: normal; }
+
         /* Narrow desktops (a 1710px MacBook display): the 18px table with
            20px cell padding ran past the right edge. Same treatment as the
            connections table: 16px cells, tighter padding, 14px headers, and

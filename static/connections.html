@@ -118,6 +118,12 @@
         .entries-table td:last-child { text-align: right; white-space: nowrap; }
 
         .entries-table .actions-cell { white-space: nowrap; text-align: right; }
+        /* Long names wrap inside their cell instead of widening the table past
+           the page: a dotted FQDN like db01.prod.example.internal has no
+           natural break point, so at any width a long enough one overran it
+           whatever the padding (#252). Buttons stay on one line. */
+        .entries-table td { overflow-wrap: anywhere; }
+        .entries-table td.connect-cell, .entries-table td.actions-cell { overflow-wrap: normal; }
         .entries-table .actions-cell .btn-small { margin-left: var(--s-1); }
 
         /* Bulk selection (admins). */
