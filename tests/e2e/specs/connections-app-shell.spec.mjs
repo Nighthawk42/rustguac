@@ -57,3 +57,21 @@ test('selecting a folder scrolls the entries pane to its top, never the page', a
     expect(after.pageTop).toBe(0);
     expect(after.brandVisible, 'the brand row must not be pushed off the top').toBe(true);
 });
+
+// "host (Tenant)" names render as two lines. Without their CSS the two spans
+// ran together as "web01.acme.internalAcme Holdings".
+test('a "host (Tenant)" name reads as the host over the tenant', async ({ page }) => {
+    const folders = fixtureFolders();
+    folders.find(f => f.name === 'beta').entries.push(
+        entry('web01', 'ssh', { display_name: 'web01.acme.internal (Acme Holdings)' }));
+    await installApi(page, { folders });
+    await page.goto('/connections.html');
+    await settle(page);
+    await page.locator('.folder-row').filter({ hasText: /beta/ }).first().click();
+    const cell = page.locator('td:has(.entry-name)').first();
+    await expect(cell).toBeVisible();
+    expect(await cell.innerText()).toBe('web01.acme.internal\nAcme Holdings');
+    const host = await cell.locator('.entry-name').boundingBox();
+    const tenant = await cell.locator('.entry-sub').boundingBox();
+    expect(tenant.y, 'the tenant sits below the host').toBeGreaterThanOrEqual(host.y + host.height - 1);
+});
