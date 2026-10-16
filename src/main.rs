@@ -1399,9 +1399,10 @@ async fn run_server(config: Config, database: Db) {
         .route("/docs.html", get(serve_branded_page))
         // Optional auth only: an anonymous request still gets the page (the
         // page itself sends the user to log in), but a logged-in one gets
-        // the variant with its navigation already right.
+        // the variant with its navigation already right. No WsTicketStore
+        // here: without it optional_auth skips tickets, so a page URL
+        // carrying ?ticket= cannot use up a single-use WebSocket ticket.
         .layer(middleware::from_fn(auth::optional_auth))
-        .layer(Extension(ws_ticket_store.clone()))
         .layer(Extension(database.clone()));
 
     // Build full router (all Router<()> at this point)
@@ -1679,9 +1680,12 @@ fn page_response(
     use axum::response::IntoResponse;
 
     let page = page.variant(level);
+    // The variant depends on who is logged in, so a cache must not hand one
+    // user's copy to another: it keys on the session cookie.
     let cache_headers = [
         (header::CACHE_CONTROL, "no-cache"),
         (header::ETAG, page.etag.as_str()),
+        (header::VARY, "Cookie"),
     ];
 
     let known = headers
@@ -1952,6 +1956,24 @@ mod tests {
         // The rest of the markup survives untouched.
         assert!(out.starts_with("<link rel=\"stylesheet\""));
         assert!(out.ends_with("></script>"));
+    }
+
+    #[test]
+    fn page_response_varies_on_the_cookie() {
+        // The variant served depends on the session cookie, so a cache must
+        // never hand an admin's copy to an anonymous visitor or the reverse.
+        use axum::http::{header, HeaderMap, StatusCode};
+        let page = BrandedPage::new("<html>x</html>".to_string());
+        let res = page_response(&page, 4, &HeaderMap::new());
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::VARY], "Cookie");
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_NONE_MATCH, page.variant(4).etag.parse().unwrap());
+        let res = page_response(&page, 4, &h);
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.headers()[header::VARY], "Cookie");
+        // Another role's tag is not this variant: full page.
+        assert_eq!(page_response(&page, 1, &h).status(), StatusCode::OK);
     }
 
     #[test]
