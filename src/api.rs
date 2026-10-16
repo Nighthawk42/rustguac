@@ -3135,6 +3135,11 @@ pub fn ab_changes_for_request(
         (Some("folders"), Some(scope), Some(folder), Some("entries"), Some(_), Some(_)) => {
             Some((vec![AbChange::entries(scope, folder)], false))
         }
+        // PUT|DELETE /folders/{scope}/{folder}/defaults: the folder's default
+        // credentials also decide what every subfolder that shares its
+        // audience lends, so nothing narrower than everything is right. The
+        // handler reports nothing, which is logged as All.
+        (Some("folders"), Some(_), Some(_), Some("defaults"), None, _) => Some((Vec::new(), false)),
         // Anything else that writes under the prefix: refresh everything
         // rather than miss it.
         _ => Some((Vec::new(), false)),
@@ -7150,6 +7155,21 @@ mod tests {
         assert_eq!(
             f(&Method::DELETE, "/api/addressbook/folders/shared/x"),
             Some((vec![AbChange::tree("shared", "x")], true))
+        );
+        // folder defaults reach subfolders too: everything is refreshed
+        assert_eq!(
+            f(
+                &Method::PUT,
+                "/api/addressbook/folders/shared/a%2Fb/defaults"
+            ),
+            Some((vec![], false))
+        );
+        assert_eq!(
+            f(
+                &Method::DELETE,
+                "/api/addressbook/folders/shared/x/defaults"
+            ),
+            Some((vec![], false))
         );
         // the body knows the rest: the handler reports it
         assert_eq!(
