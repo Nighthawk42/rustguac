@@ -609,7 +609,7 @@ Update a connection entry, or create it if there is none of that name in the fol
 
 3. If no entry carries it, the entry is created.
 
-Entries in other folders that merely share the name are never touched. Responses: `400` without `external_id`; `409` if `:folder/:entry` belongs to a different `external_id`, or if the `external_id` is stored on more than one entry in the scope (nothing is changed either way); `502` with `"copied": true` if the move copied the entry but could not remove the original (it then exists in both folders, and the update is not applied). The scan in step 2 reads every entry in the scope, but it only happens when the entry is not already where the request says, that is on first sight of a device and when it moves.
+Entries in other folders that merely share the name are never touched. Responses: `400` without `external_id`; `409` if `:folder/:entry` belongs to a different `external_id`, if it has no `external_id` while another entry in the scope already carries this one (adopting it would put the id on two entries), or if the `external_id` is stored on more than one entry in the scope (nothing is changed in any of these); `502` with `"copied": true` if the move copied the entry but could not remove the original (it then exists in both folders, and the update is not applied). The scan in step 2 reads every entry in the scope, but it only happens when the entry is not already where the request says, that is on first sight of a device and when it moves.
 
 ### `DELETE /api/addressbook/folders/:scope/:folder/entries/:entry` (admin)
 

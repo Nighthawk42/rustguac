@@ -165,6 +165,12 @@ Use Event Rule **conditions** to sync only the devices you want. You can filter 
 
      `?move=true` matters when the folder is computed from the device, for example one folder per tenant: `.../folders/shared/{{ data.tenant.slug }}/entries/{{ data.name | lower }}?move=true`. When a device changes tenant, the entry carrying its `external_id` is found in the old tenant's folder and moved to the new one by the same server-side move as the Connections page uses, so its password, key and credential variables come along; the update is then applied. Entries that merely share the device's name in other folders (two tenants can each have a `fw01`) are never touched. Full rules and responses are under [`PUT .../entries/:entry`](api.md#put-apiaddressbookfoldersscopefolderentriesentry-admin).
 
+     With one folder per tenant, create each tenant's folder first (see [Folder setup](#folder-setup)). The webhook will write into a folder that has no settings, but only admins can see it until it has an `allowed_groups` or `allowed_users` list.
+
+     **Upgrading from the older `POST` webhook.** `POST` writes the whole entry on every create or update, so a password added by hand to a synced entry was lost on the next sync. Switch both the URL and the method to the template above. Entries the old webhook made have no `external_id` yet; each one takes it on its device's next update, as long as it is still at the same folder and name. If the device has already been moved or renamed in NetBox, it gets a new entry and the old one is left for you to remove.
+
+     The first time a device is seen, rustguac reads every entry in the scope to look for its `external_id`, so a first sync of thousands of devices at once is slow. Updates to a device already in place need no scan.
+
 ### Create webhook: device deleted
 
 1. **Create an Event Rule**:
@@ -181,6 +187,8 @@ Use Event Rule **conditions** to sync only the devices you want. You can filter 
      ```
      Authorization: Bearer <admin-api-key>
      ```
+
+   If the create webhook computes the folder (for example `{{ data.tenant.slug }}`), use the same expression here. Each update has already moved the entry to the device's current folder and name, so that is where the delete finds it.
 
 ### Folder setup
 
