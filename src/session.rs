@@ -33,7 +33,11 @@ pub enum SessionType {
 }
 
 /// Parameters for creating a new session.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` exists only so `reuse_fingerprint()` can hash the whole
+/// request. Never send a serialised request anywhere or log it: it carries
+/// every secret the session connects with.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     #[serde(default)]
     pub session_type: SessionType,
@@ -206,57 +210,52 @@ pub struct CreateSessionRequest {
 }
 
 impl CreateSessionRequest {
-    /// SHA-256 over the target and every credential this request would
-    /// connect with, as hex. Two requests with the same fingerprint would
-    /// open the same connection as the same principal, so a fresh Pending
-    /// session made from one can stand in for the other
-    /// (`SessionManager::find_reusable_session`). A retry with a different
-    /// password, key, domain or jump credential gets a different
-    /// fingerprint and therefore a new session. The hash is never logged
-    /// or returned to a client, and a secret cannot be recovered from it.
-    pub fn credential_fingerprint(&self) -> String {
+    /// Fields that only say how the session is drawn in this browser, not
+    /// what it connects to or how. Two requests that differ only in these
+    /// would open the same session, so they are left out of
+    /// `reuse_fingerprint()`: a second click from a resized window, or a
+    /// different devicePixelRatio, still reuses the Pending session.
+    /// - `width`, `height`: the client's window or screen size.
+    /// - `dpi`: the client's pixel density.
+    /// - `banner`: the label shown over the session in the client.
+    const DISPLAY_ONLY_FIELDS: &'static [&'static str] = &["width", "height", "dpi", "banner"];
+
+    /// SHA-256, as hex, over the whole request except the display-only
+    /// fields above. Two requests with the same fingerprint would open the
+    /// same connection, as the same principal, with the same settings, so a
+    /// fresh Pending session made from one can stand in for the other
+    /// (`SessionManager::find_reusable_session`).
+    ///
+    /// Everything else counts, including fields added later: a retry with a
+    /// different password, key, domain or jump credential, or an entry whose
+    /// admin has since turned recording on, changed the security mode or
+    /// enabled the drive, gets a new session. The hash is never logged or
+    /// returned to a client, and a secret cannot be recovered from it.
+    pub fn reuse_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        // Every field is tagged and length-prefixed, so `("ab", "c")` and
-        // `("a", "bc")` hash differently and an absent field differs from
-        // an empty one.
-        let mut field = |tag: &str, value: Option<&str>| {
-            h.update(tag.as_bytes());
-            match value {
-                Some(v) => {
-                    h.update((v.len() as u64).to_le_bytes());
-                    h.update(v.as_bytes());
-                }
-                None => h.update([0xffu8; 8]),
-            }
+        // serde_json is built without `preserve_order`, so every object,
+        // including the `container_env` map, is written with sorted keys
+        // and the encoding is canonical. JSON also keeps an absent field
+        // (null) apart from an empty one ("") and cannot confuse a value
+        // boundary.
+        let mut value = match serde_json::to_value(self) {
+            Ok(v) => v,
+            // Never expected. If it ever happens, return a fingerprint no
+            // other request can match, so nothing is reused on a guess.
+            Err(_) => return Uuid::new_v4().to_string(),
         };
-        let port = self.port.map(|p| p.to_string());
-        let jump_hosts = self
-            .jump_hosts
-            .as_ref()
-            .and_then(|j| serde_json::to_string(j).ok());
-        let jump_port = self.jump_port.map(|p| p.to_string());
-        field("type", Some(&format!("{:?}", self.session_type)));
-        field("host", self.hostname.as_deref());
-        field("port", port.as_deref());
-        field("user", self.username.as_deref());
-        field("pass", self.password.as_deref());
-        field("key", self.private_key.as_deref());
-        field("domain", self.domain.as_deref());
-        field("auth_pkg", self.auth_pkg.as_deref());
-        field("kdc", self.kdc_url.as_deref());
-        field("url", self.url.as_deref());
-        field("jumps", jump_hosts.as_deref());
-        field("jump_host", self.jump_host.as_deref());
-        field("jump_port", jump_port.as_deref());
-        field("jump_user", self.jump_username.as_deref());
-        field("jump_pass", self.jump_password.as_deref());
-        field("jump_key", self.jump_private_key.as_deref());
-        field("container_user", self.container_username.as_deref());
-        field("container_pass", self.container_password.as_deref());
-        field("proxmox_token_id", self.proxmox_token_id.as_deref());
-        field("proxmox_token_secret", self.proxmox_token_secret.as_deref());
-        hex::encode(h.finalize())
+        if let Some(obj) = value.as_object_mut() {
+            for f in Self::DISPLAY_ONLY_FIELDS {
+                obj.remove(*f);
+            }
+            // Set by the API, not the body, so serde skips it. It changes
+            // which targets are fenced, so it counts.
+            obj.insert(
+                "fence_all_targets".into(),
+                serde_json::Value::Bool(self.fence_all_targets),
+            );
+        }
+        hex::encode(Sha256::digest(value.to_string().as_bytes()))
     }
 }
 
@@ -380,10 +379,10 @@ pub struct Session {
     /// (#154). Surfaced verbatim in `SessionInfo` so client.html can
     /// trigger fullscreen on first user gesture after CONNECTED.
     pub fullscreen_on_connect: bool,
-    /// `CreateSessionRequest::credential_fingerprint()` of the request this
+    /// `CreateSessionRequest::reuse_fingerprint()` of the request this
     /// session was created from. Compared, never logged or served, when a
     /// repeat Connect asks to reuse a Pending session.
-    pub credential_fingerprint: String,
+    pub reuse_fingerprint: String,
     /// Copied from the source entry's `autohide_side_tabs` flag.
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
@@ -849,7 +848,7 @@ impl SessionManager {
         created_by: String,
     ) -> Result<SessionInfo, SessionError> {
         // Taken before any field of the request is moved out below.
-        let credential_fingerprint = req.credential_fingerprint();
+        let reuse_fingerprint = req.reuse_fingerprint();
 
         // Enforce session limits (only count active/pending sessions)
         {
@@ -2009,7 +2008,7 @@ impl SessionManager {
             shadow_tokens: Vec::new(),
             share_allowed,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
-            credential_fingerprint,
+            reuse_fingerprint,
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
         };
 
@@ -2086,7 +2085,7 @@ impl SessionManager {
     /// piling up orphans; only a Pending session is reusable, since an owner
     /// connection consumes the guacd stream and cannot be re-owned.
     ///
-    /// `credential_fingerprint` is `CreateSessionRequest::credential_fingerprint()`
+    /// `reuse_fingerprint` is `CreateSessionRequest::reuse_fingerprint()`
     /// of the fully built request, so a session is only reused by a request
     /// that would connect to the same target with the same credentials. A
     /// retry with a different password, key or domain (a mistyped prompt)
@@ -2095,7 +2094,7 @@ impl SessionManager {
         &self,
         created_by: &str,
         entry_key: &str,
-        credential_fingerprint: &str,
+        reuse_fingerprint: &str,
     ) -> Option<SessionInfo> {
         let sessions = self.sessions.read().await;
         for session in sessions.values() {
@@ -2104,7 +2103,7 @@ impl SessionManager {
                 && s.guacd_stream.is_some()
                 && s.created_by == created_by
                 && s.address_book_entry.as_deref() == Some(entry_key)
-                && s.credential_fingerprint == credential_fingerprint
+                && s.reuse_fingerprint == reuse_fingerprint
                 && (Utc::now() - s.created_at).num_seconds() < Self::REUSABLE_PENDING_SECS
             {
                 return Some(s.info());
@@ -3019,7 +3018,7 @@ mod tests {
             shadow_tokens: Vec::new(),
             share_allowed: true,
             fullscreen_on_connect: false,
-            credential_fingerprint: String::new(),
+            reuse_fingerprint: String::new(),
             autohide_side_tabs: false,
         }
     }
@@ -3588,18 +3587,18 @@ mod tests {
         s.guacd_stream = Some(Box::new(a));
         s.created_by = created_by.into();
         s.address_book_entry = req.address_book_entry.clone();
-        s.credential_fingerprint = req.credential_fingerprint();
+        s.reuse_fingerprint = req.reuse_fingerprint();
         s
     }
 
     #[test]
-    fn credential_fingerprint_tracks_target_and_credentials() {
+    fn reuse_fingerprint_tracks_target_and_credentials() {
         let base = entry_request(serde_json::json!({}));
         let same = entry_request(serde_json::json!({}));
-        assert_eq!(base.credential_fingerprint(), same.credential_fingerprint());
-        assert_eq!(base.credential_fingerprint().len(), 64);
+        assert_eq!(base.reuse_fingerprint(), same.reuse_fingerprint());
+        assert_eq!(base.reuse_fingerprint().len(), 64);
         // Does not contain a secret in the clear.
-        assert!(!base.credential_fingerprint().contains("correct horse"));
+        assert!(!base.reuse_fingerprint().contains("correct horse"));
 
         for (key, value) in [
             ("password", serde_json::json!("wrong horse")),
@@ -3612,18 +3611,15 @@ mod tests {
         ] {
             let other = entry_request(serde_json::json!({ key: value }));
             assert_ne!(
-                base.credential_fingerprint(),
-                other.credential_fingerprint(),
+                base.reuse_fingerprint(),
+                other.reuse_fingerprint(),
                 "{key} must change the fingerprint"
             );
         }
         // Display params are not part of it: a second click from a resized
         // window still reuses the session.
         let resized = entry_request(serde_json::json!({ "width": 800, "height": 600 }));
-        assert_eq!(
-            base.credential_fingerprint(),
-            resized.credential_fingerprint()
-        );
+        assert_eq!(base.reuse_fingerprint(), resized.reuse_fingerprint());
         // Absent and empty are different, and so is a shifted boundary.
         let empty_pw = entry_request(serde_json::json!({ "password": "" }));
         let no_pw = {
@@ -3631,13 +3627,86 @@ mod tests {
             r.password = None;
             r
         };
-        assert_ne!(
-            empty_pw.credential_fingerprint(),
-            no_pw.credential_fingerprint()
-        );
+        assert_ne!(empty_pw.reuse_fingerprint(), no_pw.reuse_fingerprint());
         let ab_c = entry_request(serde_json::json!({ "username": "ab", "password": "c" }));
         let a_bc = entry_request(serde_json::json!({ "username": "a", "password": "bc" }));
-        assert_ne!(ab_c.credential_fingerprint(), a_bc.credential_fingerprint());
+        assert_ne!(ab_c.reuse_fingerprint(), a_bc.reuse_fingerprint());
+    }
+
+    #[test]
+    fn reuse_fingerprint_covers_every_setting_but_display() {
+        // Not just credentials: an entry whose admin has turned recording
+        // on, changed the security mode or enabled the drive since the
+        // first click must not hand back the session made without it.
+        let base = entry_request(serde_json::json!({}));
+        for (key, value) in [
+            ("enable_recording", serde_json::json!(true)),
+            ("record_typescript", serde_json::json!(true)),
+            ("security", serde_json::json!("nla")),
+            ("ignore_cert", serde_json::json!(true)),
+            ("enable_drive", serde_json::json!(true)),
+            ("disable_copy", serde_json::json!(true)),
+            ("allow_sharing", serde_json::json!(true)),
+            ("container_env", serde_json::json!({"A": "1"})),
+        ] {
+            let other = entry_request(serde_json::json!({ key: value }));
+            assert_ne!(
+                base.reuse_fingerprint(),
+                other.reuse_fingerprint(),
+                "{key} must change the fingerprint"
+            );
+        }
+        let mut fenced = entry_request(serde_json::json!({}));
+        fenced.fence_all_targets = true;
+        assert_ne!(base.reuse_fingerprint(), fenced.reuse_fingerprint());
+
+        // Display-only fields do not: a resized window, another pixel
+        // density or banner still reuses the Pending session.
+        let display = entry_request(serde_json::json!({
+            "width": 1696, "height": 944, "dpi": 192, "banner": "elsewhere"
+        }));
+        assert_eq!(base.reuse_fingerprint(), display.reuse_fingerprint());
+
+        // A map's insertion order does not matter.
+        let ab = entry_request(serde_json::json!({ "container_env": {"A": "1", "B": "2"} }));
+        let ba = entry_request(serde_json::json!({ "container_env": {"B": "2", "A": "1"} }));
+        assert_eq!(ab.reuse_fingerprint(), ba.reuse_fingerprint());
+    }
+
+    #[tokio::test]
+    async fn changed_entry_settings_get_a_new_session() {
+        let mgr = new_manager_for_tests();
+        let req = entry_request(serde_json::json!({}));
+        let id = insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
+
+        for change in [
+            serde_json::json!({ "enable_recording": true }),
+            serde_json::json!({ "security": "nla" }),
+            serde_json::json!({ "ignore_cert": true }),
+            serde_json::json!({ "enable_drive": true }),
+        ] {
+            let next = entry_request(change.clone());
+            assert!(
+                mgr.find_reusable_session(
+                    "alice@example.com",
+                    "shared/ops/rdp-1",
+                    &next.reuse_fingerprint(),
+                )
+                .await
+                .is_none(),
+                "{change} must not reuse the earlier session"
+            );
+        }
+        let resized = entry_request(serde_json::json!({ "width": 800, "height": 600, "dpi": 144 }));
+        let found = mgr
+            .find_reusable_session(
+                "alice@example.com",
+                "shared/ops/rdp-1",
+                &resized.reuse_fingerprint(),
+            )
+            .await
+            .expect("only the display changed: reused");
+        assert_eq!(found.session_id, id);
     }
 
     #[tokio::test]
@@ -3651,7 +3720,7 @@ mod tests {
             .find_reusable_session(
                 "alice@example.com",
                 "shared/ops/rdp-1",
-                &again.credential_fingerprint(),
+                &again.reuse_fingerprint(),
             )
             .await
             .expect("same entry, same credentials, within the window: reused");
@@ -3672,7 +3741,7 @@ mod tests {
             .find_reusable_session(
                 "alice@example.com",
                 "shared/ops/rdp-1",
-                &retry.credential_fingerprint(),
+                &retry.reuse_fingerprint(),
             )
             .await
             .is_none());
@@ -3681,7 +3750,7 @@ mod tests {
             .find_reusable_session(
                 "alice@example.com",
                 "shared/ops/rdp-1",
-                &other_user.credential_fingerprint(),
+                &other_user.reuse_fingerprint(),
             )
             .await
             .is_none());
@@ -3691,7 +3760,7 @@ mod tests {
     async fn reuse_is_scoped_to_user_entry_status_and_age() {
         let mgr = new_manager_for_tests();
         let req = entry_request(serde_json::json!({}));
-        let fp = req.credential_fingerprint();
+        let fp = req.reuse_fingerprint();
 
         insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
         // Another user's identical Pending session is not ours to take.

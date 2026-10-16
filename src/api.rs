@@ -3463,11 +3463,7 @@ pub async fn ab_connect_entry(
     // the old Pending session, which still holds the old credentials. The
     // fingerprint is a hash, compared only, never logged.
     if let Some(existing) = manager
-        .find_reusable_session(
-            &admin_name,
-            &ab_entry_key,
-            &create_req.credential_fingerprint(),
-        )
+        .find_reusable_session(&admin_name, &ab_entry_key, &create_req.reuse_fingerprint())
         .await
     {
         tracing::info!(
