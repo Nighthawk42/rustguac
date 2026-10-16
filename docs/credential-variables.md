@@ -162,11 +162,18 @@ At connect time, an entry with no password or private key of its own, and not se
 
 Entries covered by defaults list with `has_credentials: true` and `inherited_credentials: true`, and show a `[folder]` marker in Connections.
 
+A default password or username can be a credential variable such as `$tenant_password`. Defaults are applied before variables are resolved, so each user connects with their own value from My Credentials. The "credentials needed" marker in Connections only checks an entry's own fields, so it won't flag a variable that comes from a folder default.
+
 ### Inheritance and the `inherit_from_parent` boundary
 
 A subfolder without its own `.defaults` uses its nearest ancestor's, per session type: the nearest folder on the path wins for each type, and a type it lacks comes from the next folder up.
 
-The walk up the tree follows the same rule as access: it continues past a folder only while that folder's `.config` has `inherit_from_parent: true`. A folder with `inherit_from_parent: false` is isolated for access (see [Roles and access control](roles-and-access-control.md#inheritance)), and defaults set on its parent do not flow into it. Otherwise a parent's key would be usable in a subfolder shared with someone else through `allowed_users`. The isolated folder's own `.defaults` still apply to its entries and to subfolders that inherit from it. A folder with no `.config`, or one written before the flag existed, counts as not inheriting, exactly as the access check treats it.
+A parent's defaults reach a subfolder only when exactly the parent's audience can open it: the subfolder's `.config` has `inherit_from_parent: true` and grants no `allowed_groups` or `allowed_users` of its own. The walk up the tree stops at any other folder:
+
+- A folder with `inherit_from_parent: false` is isolated for access (see [Roles and access control](roles-and-access-control.md#inheritance)), so its parent's defaults do not flow into it.
+- A folder that inherits but also grants groups or users of its own admits people the parent doesn't (access is the union of both), so its parent's defaults do not flow into it either. Otherwise a contractor added to `corp/partner` through `allowed_users` could connect with `corp`'s key.
+
+The folder where the walk stops still applies its own `.defaults` to its entries and to subfolders that share its audience. A folder with no `.config`, or one written before the flag existed, counts as not inheriting, exactly as the access check treats it.
 
 ### Migration between Vaults
 

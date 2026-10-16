@@ -167,21 +167,24 @@ pub trait DefaultsSource {
         folder: &str,
     ) -> Result<Option<FolderDefaults>, VaultError>;
 
-    /// The folder's `inherit_from_parent` flag. A folder with no `.config`
+    /// Whether the folder's parent may lend it defaults: see
+    /// `FolderConfig::shares_parent_audience`. A folder with no `.config`
     /// does not inherit, which is how `resolve_folder_access` treats it too.
-    async fn inherits_from_parent(&self, scope: &str, folder: &str) -> Result<bool, VaultError>;
+    async fn takes_parent_defaults(&self, scope: &str, folder: &str) -> Result<bool, VaultError>;
 }
 
 /// The defaults that apply to entries in `folder`: its own `.defaults`, then
 /// each ancestor's for any session type still unset, walking up only while
-/// the folder just visited has `inherit_from_parent: true`.
+/// the folder just visited is seen by exactly its parent's audience
+/// (`FolderConfig::shares_parent_audience`).
 ///
-/// That flag is how a folder is isolated for access (its own
-/// `allowed_groups` / `allowed_users` decide, nothing is taken from the
-/// parent), so a secret set on a parent must not flow past it either: a
-/// subfolder shared with someone through `allowed_users` would otherwise
-/// hand them the parent's key. The isolated folder's own `.defaults` still
-/// apply to its entries. `None` when no folder on the walk has any.
+/// A secret set on a parent must reach only people who could already reach
+/// the parent. A folder with `inherit_from_parent: false` is isolated, and
+/// one that inherits but also grants groups or users of its own admits
+/// people the parent doesn't, so the walk stops at either: otherwise a
+/// subfolder shared with a contractor through `allowed_users` would hand
+/// them the parent's key. That folder's own `.defaults` still apply to its
+/// entries. `None` when no folder on the walk has any.
 pub async fn resolve_effective_defaults<S: DefaultsSource>(
     src: &S,
     scope: &str,
@@ -198,7 +201,7 @@ pub async fn resolve_effective_defaults<S: DefaultsSource>(
         // Top-level folder: nothing above it to consult.
         let Some(i) = path.rfind('/') else { break };
         // Isolated folder: what its parent lends stops here.
-        if !src.inherits_from_parent(scope, &path).await? {
+        if !src.takes_parent_defaults(scope, &path).await? {
             break;
         }
         path.truncate(i);
@@ -223,9 +226,9 @@ impl DefaultsSource for VaultClient {
         }
     }
 
-    async fn inherits_from_parent(&self, scope: &str, folder: &str) -> Result<bool, VaultError> {
+    async fn takes_parent_defaults(&self, scope: &str, folder: &str) -> Result<bool, VaultError> {
         match self.get_folder_config(scope, folder).await {
-            Ok(c) => Ok(c.inherit_from_parent),
+            Ok(c) => Ok(c.shares_parent_audience()),
             Err(VaultError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
@@ -233,6 +236,15 @@ impl DefaultsSource for VaultClient {
 }
 
 impl FolderConfig {
+    /// Whether exactly the parent's audience can open this folder: it
+    /// inherits the parent's access and grants nobody of its own. Only then
+    /// may the parent's `.defaults` flow into it; access is a union, so a
+    /// folder that inherits and also has `allowed_groups` / `allowed_users`
+    /// admits people the parent does not.
+    pub fn shares_parent_audience(&self) -> bool {
+        self.inherit_from_parent && self.allowed_groups.is_empty() && self.allowed_users.is_empty()
+    }
+
     /// Whether this folder's own settings let `who` in: a shared group, or
     /// their email in `allowed_users`. Inheritance is the caller's concern.
     pub fn grants(&self, who: FolderSubject<'_>) -> bool {
@@ -698,7 +710,9 @@ impl EntryInfo {
     /// Mark an entry as connectable through folder defaults when it has no
     /// secret of its own and the defaults cover its session type.
     pub fn apply_inherited(&mut self, e: &AddressBookEntry, defaults: Option<&FolderDefaults>) {
-        if self.has_credentials {
+        // An entry with secrets of its own, or one set to prompt, never uses
+        // the folder's, so it must not be labelled as if it did.
+        if self.has_credentials || !entry_takes_folder_defaults(e) {
             return;
         }
         if let Some(d) = defaults.and_then(|d| d.get(&e.session_type)) {
@@ -2563,7 +2577,7 @@ mod tests {
         ) -> Result<Option<FolderDefaults>, VaultError> {
             Ok(self.defaults.get(folder).cloned())
         }
-        async fn inherits_from_parent(
+        async fn takes_parent_defaults(
             &self,
             _scope: &str,
             folder: &str,
@@ -2704,7 +2718,7 @@ mod tests {
             ) -> Result<Option<FolderDefaults>, VaultError> {
                 Ok(Some(ssh_key("k")))
             }
-            async fn inherits_from_parent(&self, _s: &str, _f: &str) -> Result<bool, VaultError> {
+            async fn takes_parent_defaults(&self, _s: &str, _f: &str) -> Result<bool, VaultError> {
                 Err(VaultError::Forbidden)
             }
         }
@@ -2717,6 +2731,35 @@ mod tests {
             .await
             .unwrap();
         assert!(d.is_some());
+    }
+
+    #[test]
+    fn parent_defaults_reach_only_the_parents_audience() {
+        // Folder access is a union: a subfolder that inherits and also grants
+        // someone of its own admits people the parent doesn't. corp/partner
+        // inherits from corp but adds a contractor, so corp's default key
+        // must not flow into it, or the contractor connects with it.
+        let cfg = |inherit: bool, groups: &[&str], users: &[&str]| -> FolderConfig {
+            serde_json::from_value(serde_json::json!({
+                "allowed_groups": groups,
+                "allowed_users": users,
+                "inherit_from_parent": inherit,
+            }))
+            .unwrap()
+        };
+        assert!(cfg(true, &[], &[]).shares_parent_audience());
+        assert!(
+            !cfg(true, &[], &["contractor@ext.example"]).shares_parent_audience(),
+            "an extra user is an extra audience"
+        );
+        assert!(
+            !cfg(true, &["partners"], &[]).shares_parent_audience(),
+            "an extra group is an extra audience"
+        );
+        assert!(
+            !cfg(false, &[], &[]).shares_parent_audience(),
+            "an isolated folder takes nothing from its parent"
+        );
     }
 
     #[test]
@@ -2747,6 +2790,17 @@ mod tests {
         let mut info = EntryInfo::from(("box", &e));
         info.apply_inherited(&e, Some(&defaults));
         assert!(info.has_credentials && !info.inherited_credentials);
+
+        // set to prompt: connecting prompts, so it is not labelled as using
+        // the folder's credentials
+        let e = AddressBookEntry {
+            session_type: "ssh".into(),
+            prompt_credentials: Some(true),
+            ..Default::default()
+        };
+        let mut info = EntryInfo::from(("box", &e));
+        info.apply_inherited(&e, Some(&defaults));
+        assert!(!info.has_credentials && !info.inherited_credentials);
 
         // the JSON omits the flag when false
         let v = serde_json::to_value(&info).unwrap();

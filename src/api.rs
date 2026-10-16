@@ -2382,10 +2382,10 @@ impl DefaultsSource for VaultBackends {
             .await
     }
 
-    async fn inherits_from_parent(&self, scope: &str, folder: &str) -> Result<bool, VaultError> {
+    async fn takes_parent_defaults(&self, scope: &str, folder: &str) -> Result<bool, VaultError> {
         self.scoped(scope)
             .await?
-            .inherits_from_parent(scope, folder)
+            .takes_parent_defaults(scope, folder)
             .await
     }
 }
@@ -2684,6 +2684,26 @@ pub async fn ab_put_folder_defaults(
                 Json(json!({"error": format!("invalid session type key {:?}", session_type)})),
             )
                 .into_response();
+        }
+    }
+
+    // Only on a folder that exists: writing <path>/.defaults on its own would
+    // make a folder with no .config, which nobody but an admin can see.
+    match vault.get_folder_config(&scope, &folder).await {
+        Ok(_) => {}
+        Err(VaultError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "folder not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
         }
     }
 
@@ -7199,7 +7219,7 @@ mod tests {
         ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
             Ok(self.defaults.get(folder).cloned())
         }
-        async fn inherits_from_parent(
+        async fn takes_parent_defaults(
             &self,
             _scope: &str,
             folder: &str,
@@ -7275,7 +7295,7 @@ mod tests {
             ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
                 Err(VaultError::Forbidden)
             }
-            async fn inherits_from_parent(&self, _s: &str, _f: &str) -> Result<bool, VaultError> {
+            async fn takes_parent_defaults(&self, _s: &str, _f: &str) -> Result<bool, VaultError> {
                 Err(VaultError::Forbidden)
             }
         }

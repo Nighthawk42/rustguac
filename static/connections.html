@@ -738,7 +738,7 @@
             <div class="field-hint">When ticked, if this folder's own groups list doesn't grant a user access, the check walks up to the parent (and further ancestors if they also inherit). Uncheck to enforce this folder's groups list on its own. Top-level folders have no parent so this has no effect.</div>
             <details class="fm-defaults" id="fm-defaults">
                 <summary>Default credentials</summary>
-                <div class="field-hint">Lent to entries in this folder that have no password or key of their own, per session type, so an entry created without secrets (a NetBox webhook, an import) connects straight away. An entry's own credentials always win; subfolders inherit per type, but not past a folder with "Inherit permissions from parent folder" unticked. A web entry's default password is typed into the page, where the user can read it. Secrets are write-only: leave a field blank to keep what is stored, tick clear to drop a type.</div>
+                <div class="field-hint">Lent to entries in this folder that have no password or key of their own, per session type, so an entry created without secrets (a NetBox webhook, an import) connects straight away. An entry's own credentials always win; subfolders inherit per type, but only those that inherit permissions from this folder and share it with nobody extra. A web entry's default password is typed into the page, where the user can read it. Secrets are write-only: leave a field blank to keep what is stored, tick clear to drop a type.</div>
                 <table class="fm-defaults-table">
                     <tbody id="fm-defaults-rows"></tbody>
                 </table>
@@ -3466,6 +3466,8 @@
                     '<td><input type="password" class="fmd-pass" autocomplete="new-password" placeholder="' + (d && d.has_password ? '(stored)' : 'password') + '"></td>' +
                     '<td>' + (t === 'ssh'
                         ? '<textarea class="fmd-key" rows="1" spellcheck="false" placeholder="' + (d && d.has_private_key ? '(stored)' : 'private key') + '"></textarea>'
+                        : t === 'rdp'
+                        ? '<input class="fmd-domain" placeholder="domain" autocomplete="off" value="' + escapeAttr((d && d.domain) || '') + '">'
                         : '') + '</td>' +
                     '<td><label class="fmd-clear-label"><input type="checkbox" class="fmd-clear"> clear</label></td></tr>');
             });
@@ -3486,6 +3488,8 @@
                 var part = {};
                 var user = tr.querySelector('.fmd-user').value.trim();
                 if (user !== ((d && d.username) || '')) part.username = user;
+                var domEl = tr.querySelector('.fmd-domain');
+                if (domEl && domEl.value.trim() !== ((d && d.domain) || '')) part.domain = domEl.value.trim();
                 var pass = tr.querySelector('.fmd-pass').value;
                 if (pass) part.password = pass;
                 var keyEl = tr.querySelector('.fmd-key');

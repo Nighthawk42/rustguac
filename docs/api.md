@@ -613,7 +613,7 @@ Entries in other folders that merely share the name are never touched. Responses
 
 ### `GET /api/addressbook/folders/:scope/:folder/defaults` (admin)
 
-The folder's default credentials, secrets stripped. These are lent to entries in the folder (and in subfolders without their own, per session type, up to but not past a subfolder with `inherit_from_parent: false`) that have no password or private key of their own, so an entry created without secrets by a webhook or an import is connectable the moment it exists. An entry's own credentials always win, and an entry set to `prompt_credentials` still prompts. See [Folder default credentials](credential-variables.md#folder-default-credentials) for the storage layout, the inheritance rule and the note on web entries.
+The folder's default credentials, secrets stripped. These are lent to entries in the folder (and in subfolders without their own, per session type, but only subfolders that inherit access and grant no groups or users of their own) that have no password or private key of their own, so an entry created without secrets by a webhook or an import is connectable the moment it exists. An entry's own credentials always win, and an entry set to `prompt_credentials` still prompts. See [Folder default credentials](credential-variables.md#folder-default-credentials) for the storage layout, the inheritance rule and the note on web entries.
 
 ```json
 {
