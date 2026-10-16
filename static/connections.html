@@ -2332,6 +2332,7 @@
         // reloads its own status (saveMyCredentials).
         var LIVE_POLL_MS = 3000;
         var liveVersion = null;   // the version this tab's view reflects
+        var liveEpoch = null;     // which server process that version came from
         var liveTimer = null;
         var liveBusy = false;
 
@@ -2350,7 +2351,12 @@
             var stale = false;
             var touched = {};
             var under = function(k, key) { return k === key || k.indexOf(key + '/') === 0; };
-            (changes || []).forEach(function(c) { if (c.kind === 'all') all = true; });
+            // A tree row without a folder means a folder changed somewhere
+            // this user may not be told about (the server never names a
+            // folder they cannot open): refresh what is shown, as for `all`.
+            (changes || []).forEach(function(c) {
+                if (c.kind === 'all' || (c.kind === 'tree' && !c.folder)) all = true;
+            });
             if (!all) changes.forEach(function(c) {
                 var key = c.scope + '|' + c.folder;
                 if (c.kind === 'tree') {
@@ -2387,6 +2393,18 @@
                 if (what === 'drop') plan.drop.push(k); else plan.fetch.push(k);
             });
             return plan;
+        }
+
+        // What a poll answer means, given the version and epoch this tab
+        // last saw. Pure, tested in tests/connections-live.mjs. Returns
+        // undefined when there is nothing to do, null to refresh what is
+        // shown, or the list of changes. A different epoch is a restarted
+        // server: its version counter started again, so its changes are not
+        // the ones after ours, whatever the numbers say.
+        function liveChanges(data, version, epoch) {
+            if (data.epoch !== epoch) return null;
+            if (data.version === version && data.changes) return undefined;
+            return data.changes;
         }
 
         function liveView() {
@@ -2539,11 +2557,14 @@
                     if (liveVersion === null) {
                         // Baseline: the page is loading this version now.
                         liveVersion = data.version;
+                        liveEpoch = data.epoch;
                         return;
                     }
-                    if (data.version === liveVersion && data.changes) return;
+                    var changes = liveChanges(data, liveVersion, liveEpoch);
                     liveVersion = data.version;
-                    liveApply(livePlan(data.changes, liveView()));
+                    liveEpoch = data.epoch;
+                    if (changes === undefined) return;
+                    liveApply(livePlan(changes, liveView()));
                 })
                 .catch(function() {})
                 .then(function() { liveBusy = false; });

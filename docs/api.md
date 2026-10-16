@@ -705,7 +705,11 @@ The response lists what happened to each entry, plus a count per outcome:
 
 ### `GET /api/addressbook/version?since=N`
 
-The address book's change log, answered from memory: no Vault or disk read, so clients may poll it often. Requires **operator**. `version` counts every successful change made through this API to entries, folders and folder config (moves, copies and bulk operations included); `changed_at` is unix milliseconds, `0` before the first change since start. With `since`, `changes` lists what moved after that version, one row per folder: `kind` is `entries` (entries in the folder were written), `tree` (the folder itself was created, deleted or its config changed) or `all` (not attributable; refresh everything). It is `null` when `since` is omitted, when the log no longer reaches back that far (it keeps the last few hundred changes), or when the server restarted since, and the client should refresh what it shows once.
+The address book's change log, answered from memory: no Vault or disk read, so clients may poll it often. Requires **operator**. `version` counts every successful change made through this API to entries, folders and folder config (moves, copies and bulk operations included); `changed_at` is unix milliseconds, `0` before the first change since start. With `since`, `changes` lists what moved after that version, one row per folder: `kind` is `entries` (entries in the folder were written), `tree` (the folder itself was created, deleted or its config changed) or `all` (not attributable; refresh everything). It is `null` when `since` is omitted, or when the log no longer reaches back that far (it keeps the last few hundred changes), and the client should refresh what it shows once.
+
+`epoch` identifies the server process the log belongs to. The version counter starts again at 0 when rustguac restarts, so a client should remember the `epoch` that came with its version and, when it changes, refresh what it shows once and ignore `changes`: after a restart they come from a different log, even when the numbers line up.
+
+For callers below **admin**, rows only ever name folders the caller can open. An `entries` row for any other folder is left out, and every `tree` row is replaced by one without a path (`"scope": "*", "folder": ""`), since a folder that was created, deleted or had its access changed may be one the caller cannot see; a client should treat it like `all`. Admins get every row as logged. Filtering reads folder config only when there are changes to answer, so a poll with nothing new still costs no Vault read.
 
 A user's own credential variables (`/api/me/credentials`) are not address-book changes and never appear here. The log is per process: with several rustguac instances on one Vault, each sees only its own changes.
 
@@ -715,6 +719,7 @@ The Connections page polls this every 3 seconds while visible and re-reads only 
 {
   "version": 17,
   "changed_at": 1760155200000,
+  "epoch": 3418867302915441,
   "changes": [
     { "scope": "shared", "folder": "customers/acme", "kind": "entries" },
     { "scope": "instance", "folder": "lab", "kind": "tree" }

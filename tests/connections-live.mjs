@@ -179,4 +179,37 @@ for (const changes of [[all()], null, [entries('instance', 'lab'), all()]]) {
     assert.equal(p.tree, true);
 }
 
+// A tree row without a folder: the server never names a folder this user
+// cannot open, so it only says the tree changed somewhere. The tab treats it
+// as `all`: the folder list and the open folder are re-read, the rest dropped.
+{
+    const p = livePlan([{ scope: '*', folder: '', kind: 'tree' }, entries('shared', 'other')], looking());
+    assert.equal(p.tree, true);
+    assert.equal(p.treeAll, true);
+    assert.deepEqual(p.fetch, ['shared|cust/acme']);
+    assert.deepEqual(p.drop.sort(), ['instance|lab', 'shared|cust', 'shared|cust/acme/dc1']);
+}
+
+// The epoch: a restarted server's version counter starts again, so its
+// changes are not the ones after ours whatever the numbers say.
+vm.runInContext(lift('liveChanges'), ctx);
+const liveChanges = (data, version, epoch) => {
+    const out = ctx.liveChanges(data, version, epoch);
+    return out === undefined ? undefined : JSON.parse(JSON.stringify(out));
+};
+{
+    // Same process, nothing new: nothing to do.
+    assert.equal(liveChanges({ version: 5, epoch: 7, changes: [] }, 5, 7), undefined);
+    // Same process, new changes: those changes.
+    assert.deepEqual(liveChanges({ version: 6, epoch: 7, changes: [entries('shared', 'a')] }, 5, 7),
+        [entries('shared', 'a')]);
+    // The log no longer reaches back: refresh.
+    assert.equal(liveChanges({ version: 900, epoch: 7, changes: null }, 5, 7), null);
+    // Restarted and already past our version, with an answer that looks
+    // complete: refresh anyway, the rows belong to a different log.
+    assert.equal(liveChanges({ version: 7, epoch: 8, changes: [entries('shared', 'b')] }, 5, 7), null);
+    // Restarted and at exactly our version, which would read as "no change".
+    assert.equal(liveChanges({ version: 5, epoch: 8, changes: [] }, 5, 7), null);
+}
+
 console.log('connections-live: ok');

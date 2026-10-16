@@ -2924,6 +2924,16 @@ impl AbChange {
             kind: AbChangeKind::All,
         }
     }
+    /// A folder changed somewhere, without saying which: what a caller who
+    /// may not see every folder is told about folder-level changes, so a
+    /// poll never names a folder they cannot access.
+    pub fn tree_anywhere() -> Self {
+        AbChange {
+            scope: "*".to_string(),
+            folder: String::new(),
+            kind: AbChangeKind::Tree,
+        }
+    }
 }
 
 /// Response extension a handler sets to name the folders it changed when
@@ -2944,9 +2954,31 @@ fn with_ab_changes(mut response: Response, changes: Vec<AbChange>) -> Response {
 const AB_CHANGE_LOG_LEN: usize = 512;
 
 /// The change log: a version counter and the recent changes behind it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AddressBookChanges {
     inner: Arc<std::sync::Mutex<AbChangeLog>>,
+    /// Identifies this process's log. The version counter starts again at
+    /// 0 on a restart, so a page that saw version 5 before the restart and
+    /// polls once the new process has also reached 5 or more would be
+    /// answered from a different log; a new epoch tells it to refresh what
+    /// it shows instead.
+    epoch: u64,
+}
+
+impl Default for AddressBookChanges {
+    fn default() -> Self {
+        AddressBookChanges {
+            inner: Default::default(),
+            epoch: new_ab_epoch(),
+        }
+    }
+}
+
+/// A fresh log id: random, so two processes never share one, and below
+/// 2^53 so the page's JavaScript compares it exactly.
+fn new_ab_epoch() -> u64 {
+    use rand::RngExt;
+    (rand::rng().random::<u64>() >> 11).max(1)
 }
 
 #[derive(Default)]
@@ -2971,6 +3003,11 @@ pub struct AbChangesSince {
 }
 
 impl AddressBookChanges {
+    /// This process's log id, sent with every version answer.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Log a change set under one new version; returns that version.
     pub fn record(&self, changes: Vec<AbChange>) -> u64 {
         let now_ms = std::time::SystemTime::now()
@@ -3105,8 +3142,10 @@ pub fn ab_changes_for_request(
 }
 
 /// Middleware: log the address-book changes of every successful mutating
-/// request. Sits inside the auth layer, so only requests that were allowed
-/// to change anything get here.
+/// request. It runs outside `require_auth`, so it also sees requests that
+/// were refused; those fail and are not logged. A failed request is logged
+/// only when its handler reported what it changed anyway (`AbChanged`), as
+/// a move that copied the entry but could not remove the original does.
 pub async fn ab_change_track(
     changes: Option<Extension<AddressBookChanges>>,
     request: axum::extract::Request,
@@ -3115,8 +3154,9 @@ pub async fn ab_change_track(
     let implied = ab_changes_for_request(request.method(), request.uri().path());
     let response = next.run(request).await;
     if let Some((mut found, mut complete)) = implied {
+        let reported = response.extensions().get::<AbChanged>();
         if response.status().is_success() {
-            if let Some(AbChanged(reported)) = response.extensions().get::<AbChanged>() {
+            if let Some(AbChanged(reported)) = reported {
                 found.extend(reported.iter().cloned());
                 complete = true;
             }
@@ -3125,6 +3165,10 @@ pub async fn ab_change_track(
             }
             if let Some(Extension(log)) = changes {
                 log.record(found);
+            }
+        } else if let (Some(AbChanged(reported)), Some(Extension(log))) = (reported, changes) {
+            if !reported.is_empty() {
+                log.record(reported.clone());
             }
         }
     }
@@ -3136,22 +3180,73 @@ pub struct AbVersionQuery {
     pub since: Option<u64>,
 }
 
+/// Most change rows a non-admin's poll checks one by one. Past this (a big
+/// bulk change) the rows are replaced by one path-less tree marker and the
+/// page refreshes what it shows, so a burst costs each tab a bounded number
+/// of folder-config reads.
+const AB_VERSION_MAX_CHECKED_ROWS: usize = 32;
+
+/// The changes a caller who is not an admin may be told about. An entries
+/// row is kept only for a folder the caller can open directly (the
+/// `check_folder_access` rule); folder-level rows never name the folder,
+/// since a folder that was created, deleted or had its access changed may
+/// be one the caller cannot see. `can_access` is only consulted when there
+/// are rows to answer, so an empty poll still costs no Vault read.
+async fn ab_changes_visible_to<F, Fut>(changes: Vec<AbChange>, can_access: F) -> Vec<AbChange>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, VaultError>>,
+{
+    if changes.iter().any(|c| c.kind == AbChangeKind::All) {
+        return vec![AbChange::all()];
+    }
+    if changes.len() > AB_VERSION_MAX_CHECKED_ROWS {
+        return vec![AbChange::tree_anywhere()];
+    }
+    let mut out = Vec::new();
+    let mut tree = false;
+    for c in changes {
+        match c.kind {
+            AbChangeKind::Tree => tree = true,
+            AbChangeKind::Entries => match can_access(c.scope.clone(), c.folder.clone()).await {
+                Ok(true) => out.push(c),
+                // No access, or the folder has gone: nothing to say.
+                Ok(false) | Err(VaultError::NotFound) => {}
+                // Can't tell: have the page refresh rather than miss it,
+                // without naming the folder.
+                Err(_) => tree = true,
+            },
+            AbChangeKind::All => unreachable!("handled above"),
+        }
+    }
+    if tree {
+        out.push(AbChange::tree_anywhere());
+    }
+    out
+}
+
 /// GET /api/addressbook/version?since=N — the change log since version N,
-/// answered from memory. Requires operator.
+/// answered from memory. Requires operator. `epoch` identifies this
+/// process's log: a page that sees it change refreshes what it shows.
 pub async fn ab_version(
     identity: Option<Extension<AuthIdentity>>,
     changes: Option<Extension<AddressBookChanges>>,
+    vault: Option<Extension<VaultState>>,
     Query(q): Query<AbVersionQuery>,
 ) -> impl IntoResponse {
-    if !matches!(identity, Some(Extension(ref id)) if id.has_role("operator")) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "operator role required"})),
-        )
-            .into_response();
-    }
+    let id = match identity {
+        Some(Extension(id)) if id.has_role("operator") => id,
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "operator role required"})),
+            )
+                .into_response();
+        }
+    };
     let Some(Extension(log)) = changes else {
-        return Json(json!({ "version": 0, "changed_at": 0, "changes": null })).into_response();
+        return Json(json!({ "version": 0, "changed_at": 0, "epoch": 0, "changes": null }))
+            .into_response();
     };
     let answer = match q.since {
         Some(since) => log.since(since),
@@ -3164,10 +3259,28 @@ pub async fn ab_version(
             }
         }
     };
+    let changes = match answer.changes {
+        Some(rows) if !rows.is_empty() && !id.has_role("admin") => {
+            let who = id.folder_subject();
+            Some(match vault {
+                Some(Extension(vault)) => {
+                    ab_changes_visible_to(rows, |scope, folder| {
+                        let vault = vault.clone();
+                        async move { vault.resolve_folder_access(&scope, &folder, who).await }
+                    })
+                    .await
+                }
+                // No Vault to check against: say only that something changed.
+                None => vec![AbChange::tree_anywhere()],
+            })
+        }
+        other => other,
+    };
     Json(json!({
         "version": answer.version,
         "changed_at": answer.changed_at_ms,
-        "changes": answer.changes,
+        "epoch": log.epoch(),
+        "changes": changes,
     }))
     .into_response()
 }
@@ -4638,8 +4751,14 @@ pub async fn ab_update_entry(
         )
         .await;
     }
+    // The live refresh hears about the target folder from the request path;
+    // a move also changed the folder the entry came from, and did so even
+    // when what came after it failed.
+    let moved_changes = moved_from
+        .map(|from| upsert_move_changes(&scope, &from.folder, &folder))
+        .unwrap_or_default();
 
-    match result {
+    let response = match result {
         Ok(outcome) => {
             let details = json!({
                 "type": outcome.entry.session_type,
@@ -4678,7 +4797,22 @@ pub async fn ab_update_entry(
             Json(json!({"error": error.to_string()})),
         )
             .into_response(),
+    };
+    if moved_changes.is_empty() {
+        response
+    } else {
+        with_ab_changes(response, moved_changes)
     }
+}
+
+/// The folders a `PUT ...?move=true` that moved an entry changed: the one
+/// it came from and the one it went to (both in the request's scope).
+fn upsert_move_changes(scope: &str, from_folder: &str, to_folder: &str) -> Vec<AbChange> {
+    let mut changes = vec![AbChange::entries(scope, from_folder)];
+    if from_folder != to_folder {
+        changes.push(AbChange::entries(scope, to_folder));
+    }
+    changes
 }
 
 /// Body for `POST .../entries/{entry}/move` and `.../copy`.
@@ -4857,16 +4991,24 @@ pub async fn ab_move_entry(
                 Some(&details),
             )
             .await;
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "error": format!(
-                        "entry was copied to the target folder but the original could not be removed: {e}"
-                    ),
-                    "copied": true,
-                })),
-            )
-                .into_response();
+            // The target folder did change: tell the live refresh, though
+            // the request failed.
+            return with_ab_changes(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!(
+                            "entry was copied to the target folder but the original could not be removed: {e}"
+                        ),
+                        "copied": true,
+                    })),
+                )
+                    .into_response(),
+                vec![
+                    AbChange::entries(&scope, &folder),
+                    AbChange::entries(&req.target_scope, &req.target_folder),
+                ],
+            );
         }
     }
 
@@ -7215,6 +7357,154 @@ mod tests {
             .is_success());
         assert_eq!(log.since(2).changes, Some(vec![AbChange::all()]));
         assert_eq!(log.snapshot().0, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_move_that_changed_folders_is_still_logged() {
+        // A move that copied the entry but could not remove the original
+        // answers 502, yet both folders changed: the handler reports them
+        // and the log records exactly those, not the request's own path.
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::put;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let log = AddressBookChanges::default();
+        let app = Router::new()
+            .route(
+                "/api/addressbook/folders/{scope}/{folder}/entries/{entry}",
+                put(|| async {
+                    with_ab_changes(
+                        (StatusCode::BAD_GATEWAY, "copied").into_response(),
+                        upsert_move_changes("shared", "tenant-a", "tenant-b"),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(ab_change_track))
+            .layer(Extension(log.clone()));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/addressbook/folders/shared/tenant-b/entries/fw01?move=true")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            log.since(0).changes,
+            Some(vec![
+                AbChange::entries("shared", "tenant-a"),
+                AbChange::entries("shared", "tenant-b"),
+            ])
+        );
+    }
+
+    #[test]
+    fn upsert_move_changes_names_both_folders_once() {
+        assert_eq!(
+            upsert_move_changes("shared", "a", "b"),
+            vec![
+                AbChange::entries("shared", "a"),
+                AbChange::entries("shared", "b")
+            ]
+        );
+        // A rename within the folder changed one folder.
+        assert_eq!(
+            upsert_move_changes("shared", "a", "a"),
+            vec![AbChange::entries("shared", "a")]
+        );
+    }
+
+    #[test]
+    fn address_book_change_log_epochs_differ_and_fit_javascript() {
+        // The page compares epochs as JavaScript numbers, so they must be
+        // exact below 2^53, and two processes must not share one.
+        let a = AddressBookChanges::default();
+        let b = AddressBookChanges::default();
+        assert_ne!(a.epoch(), b.epoch());
+        for e in [a.epoch(), b.epoch()] {
+            assert!(e > 0 && e < (1u64 << 53), "{e}");
+        }
+        // A clone is the same log.
+        assert_eq!(a.clone().epoch(), a.epoch());
+    }
+
+    #[tokio::test]
+    async fn version_rows_never_name_a_folder_the_caller_cannot_open() {
+        // An operator granted only teamA polls while an admin works in
+        // secretco and creates a folder there. The answer may say that
+        // teamA's entries changed and that the tree changed somewhere, and
+        // nothing else: no secretco path, not even in a tree row.
+        let can_open = |scope: String, folder: String| async move {
+            Ok::<_, VaultError>(scope == "shared" && folder == "teamA")
+        };
+        let rows = vec![
+            AbChange::entries("shared", "teamA"),
+            AbChange::entries("shared", "customers/secretco"),
+            AbChange::tree("shared", "customers/secretco/new"),
+            AbChange::tree("shared", "teamA"),
+        ];
+        let out = ab_changes_visible_to(rows, can_open).await;
+        assert_eq!(
+            out,
+            vec![
+                AbChange::entries("shared", "teamA"),
+                AbChange::tree_anywhere()
+            ]
+        );
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("secretco"), "{text}");
+
+        // Only a change the caller can't see: just "the tree changed" if a
+        // folder moved, otherwise nothing at all.
+        let out = ab_changes_visible_to(
+            vec![AbChange::entries("shared", "customers/secretco")],
+            can_open,
+        )
+        .await;
+        assert!(out.is_empty(), "{out:?}");
+
+        // A folder that has gone, or an access check that fails, never
+        // names the folder; a failure still makes the page refresh.
+        let out = ab_changes_visible_to(
+            vec![
+                AbChange::entries("shared", "gone"),
+                AbChange::entries("shared", "flaky"),
+            ],
+            |_scope: String, folder: String| async move {
+                if folder == "gone" {
+                    Err(VaultError::NotFound)
+                } else {
+                    Err(VaultError::Parse("vault down".into()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(out, vec![AbChange::tree_anywhere()]);
+
+        // `all` names nothing and passes through as is.
+        let out = ab_changes_visible_to(
+            vec![AbChange::entries("shared", "teamA"), AbChange::all()],
+            can_open,
+        )
+        .await;
+        assert_eq!(out, vec![AbChange::all()]);
+
+        // A burst is not checked row by row: one path-less marker, and no
+        // access check at all.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let many: Vec<AbChange> = (0..=AB_VERSION_MAX_CHECKED_ROWS)
+            .map(|i| AbChange::entries("shared", &format!("f{i}")))
+            .collect();
+        let out = ab_changes_visible_to(many, |_s: String, _f: String| {
+            checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok::<_, VaultError>(true) }
+        })
+        .await;
+        assert_eq!(out, vec![AbChange::tree_anywhere()]);
+        assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
     use std::path::Path;
 
