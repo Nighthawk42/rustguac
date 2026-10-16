@@ -7216,7 +7216,7 @@ mod tests {
         assert_eq!(initial_session_size("ssh", true, win, scr), win);
         assert_eq!(initial_session_size("telnet", true, win, scr), win);
         assert_eq!(initial_session_size("web", true, win, scr), win);
-        // not fullscreen, or no screen size offered: window size — still on
+        // not fullscreen, or no screen size offered: window size, still on
         // the mod-16 grid for RDP, since the client's first size send is
         // rounded to it by guacd either way (no resize on connect).
         let win16 = (Some(1696), Some(944));
