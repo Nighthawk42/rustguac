@@ -1341,8 +1341,10 @@ async fn run_server(config: Config, database: Db) {
         .merge(session_create_route)
         .with_state(manager.clone())
         .layer(middleware::from_fn(auth::require_auth))
-        // Inside auth: only requests allowed to change the address book
-        // are logged. The log itself is layered below so this sees it.
+        // Added after require_auth, so it runs outside it and also sees
+        // refused requests. Those fail, and only successful changes (or a
+        // failed one whose handler reports what it changed anyway) are
+        // logged. The log itself is layered below so this sees it.
         .layer(middleware::from_fn(api::ab_change_track))
         .layer(Extension(ws_ticket_store.clone()))
         .layer(Extension(vault_client.clone()))
