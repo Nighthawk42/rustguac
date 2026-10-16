@@ -151,7 +151,14 @@ export async function installApi(page, options = {}) {
 
         // ── address book ──
         if (path === '/api/addressbook') return route.fulfill(json({ folders, unavailable_scopes: [] }));
-        if (path === '/api/addressbook/version') return route.fulfill(json({ version: state.version, changed_at: 0 }));
+        // As the server answers: `changes` is null for the baseline poll
+        // (no `since`) and lists nothing after it, so a stubbed poll is not
+        // read as "refresh everything". Specs that need a change supply
+        // their own route.
+        if (path === '/api/addressbook/version') return route.fulfill(json({
+            version: state.version, changed_at: 0, epoch: 1,
+            changes: url.searchParams.has('since') ? [] : null
+        }));
         if (path === '/api/addressbook/search-index') return route.fulfill(json(searchIndex()));
         if (path === '/api/addressbook/folder-paths') return route.fulfill(json({
             paths: folders.map(f => ({ scope: f.scope, path: f.path ?? f.name }))
