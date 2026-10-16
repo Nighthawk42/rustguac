@@ -3669,21 +3669,23 @@ async fn relocate_by_external_id<S: EntryStore>(
 
     // Already here: the steady state of a sync, and the only case that
     // needs no scan.
-    match store.get_entry(scope, folder, entry).await {
-        Ok(existing) => {
-            return match existing.external_id.as_deref() {
-                Some(other) if other != external_id => Err(UpsertError::Rejected(
+    let adopting = match store.get_entry(scope, folder, entry).await {
+        Ok(existing) => match existing.external_id.as_deref() {
+            Some(other) if other != external_id => {
+                return Err(UpsertError::Rejected(
                     StatusCode::CONFLICT,
                     format!("{folder}/{entry} belongs to another device (external_id {other})"),
-                )),
-                // The same device, or an entry made by hand before syncing
-                // began: it is updated in place and adopts the id.
-                _ => Ok(None),
-            };
-        }
-        Err(VaultError::NotFound) => {}
+                ))
+            }
+            Some(_) => return Ok(None),
+            // An entry made by hand before syncing began: it is updated in
+            // place and adopts the id, but only once the scan below shows no
+            // other entry already carries it, or the id would end up on two.
+            None => true,
+        },
+        Err(VaultError::NotFound) => false,
         Err(e) => return Err(reject(e)),
-    }
+    };
 
     let mut found = Vec::new();
     for other_folder in store.folder_paths(scope).await.map_err(reject)? {
@@ -3707,6 +3709,21 @@ async fn relocate_by_external_id<S: EntryStore>(
                 });
             }
         }
+    }
+
+    if adopting && !found.is_empty() {
+        let where_ = found
+            .iter()
+            .map(|f| format!("{}/{}", f.folder, f.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(UpsertError::Rejected(
+            StatusCode::CONFLICT,
+            format!(
+                "{folder}/{entry} is an entry without an external_id, and external_id {external_id} \
+                 is already stored on {where_}; nothing was changed"
+            ),
+        ));
     }
 
     match found.len() {
@@ -6533,6 +6550,51 @@ mod tests {
         let e = store.stored("tenant-a", "fw01").unwrap();
         assert_eq!(e.password.as_deref(), Some("typed-in"));
         assert_eq!(e.external_id.as_deref(), Some("netbox:device:1"));
+    }
+
+    #[tokio::test]
+    async fn move_upsert_does_not_adopt_when_the_id_is_already_elsewhere() {
+        // Device 1 moves to tenant B, where someone had made an fw01 by
+        // hand. Adopting it would leave device 1's id on two entries and
+        // every later sync of the device refused as ambiguous, so it is
+        // refused now with both entries as they were.
+        let store = FakeStore::with(&[
+            ("tenant-a", "fw01", fw01_stored()),
+            (
+                "tenant-b",
+                "fw01",
+                entry(json!({"type": "ssh", "hostname": "10.0.1.1", "password": "typed-in"})),
+            ),
+        ]);
+        let (status, msg) = rejected(
+            upsert_entry(
+                &store,
+                "shared",
+                "tenant-b",
+                "fw01",
+                fw01_webhook("10.0.1.9"),
+                true,
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.contains("tenant-a/fw01"), "{msg}");
+        let b = store.stored("tenant-b", "fw01").unwrap();
+        assert_eq!(
+            b.external_id, None,
+            "the hand-made entry did not take the id"
+        );
+        assert_eq!(b.hostname.as_deref(), Some("10.0.1.1"));
+        assert_eq!(b.password.as_deref(), Some("typed-in"));
+        assert_eq!(
+            store
+                .stored("tenant-a", "fw01")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("$tenant_a_password")
+        );
     }
 
     #[tokio::test]
