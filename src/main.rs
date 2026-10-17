@@ -664,12 +664,35 @@ struct TlsEnabled(bool);
 /// showing (#249). Chromium decodes straight from the stream bytes and never
 /// fetches a URL, so it hid the problem. The remote mouse cursor
 /// (`cursor: url(data:...)`) and blob: image URLs need the same allowance.
+///
+/// No page may be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`):
+/// a framed rustguac page, above all a live session, would take the clicks
+/// and keystrokes of whoever is fooled into using it. The one exception is
+/// `FRAMEABLE_CONTENT_SECURITY_POLICY` below.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
     script-src 'self' 'unsafe-inline'; \
     style-src 'self' 'unsafe-inline'; \
     connect-src 'self' wss: ws:; \
     img-src 'self' data: blob:; \
+    frame-ancestors 'none'";
+
+/// The policy for the one page that may be framed, and only by our own
+/// origin: the session client of a session opened from an entry with
+/// fullscreen-on-connect, which the Connections page loads in a same-origin
+/// iframe so the tab can go fullscreen on the Connect click (#257). See
+/// `ClientFrameable` and docs/security.md.
+const FRAMEABLE_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline'; \
+    connect-src 'self' wss: ws:; \
+    img-src 'self' data: blob:; \
     frame-ancestors 'self'";
+
+/// Response marker set by `serve_client_page` when that session's client may
+/// be framed by our own origin; `security_headers` then sends the framing
+/// headers that allow it instead of the deny-all defaults.
+#[derive(Clone, Copy)]
+struct ClientFrameable;
 
 async fn security_headers(
     tls: Extension<TlsEnabled>,
@@ -677,13 +700,15 @@ async fn security_headers(
     next: middleware::Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    let frameable = response.extensions().get::<ClientFrameable>().is_some();
+    let (frame_options, csp) = if frameable {
+        ("SAMEORIGIN", FRAMEABLE_CONTENT_SECURITY_POLICY)
+    } else {
+        ("DENY", CONTENT_SECURITY_POLICY)
+    };
     let headers = response.headers_mut();
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    // SAMEORIGIN (not DENY) so the Connections page can host a session in a
-    // full-viewport same-origin iframe for zero-click fullscreen-on-connect.
-    // Cross-origin framing stays blocked (clickjacking); CSP frame-ancestors
-    // 'self' is the modern equivalent for browsers that honour it.
-    headers.insert("X-Frame-Options", "SAMEORIGIN".parse().unwrap());
+    headers.insert("X-Frame-Options", frame_options.parse().unwrap());
     headers.insert(
         "Referrer-Policy",
         "strict-origin-when-cross-origin".parse().unwrap(),
@@ -692,10 +717,7 @@ async fn security_headers(
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),
     );
-    headers.insert(
-        "Content-Security-Policy",
-        CONTENT_SECURITY_POLICY.parse().unwrap(),
-    );
+    headers.insert("Content-Security-Policy", csp.parse().unwrap());
     if tls.0 .0 {
         headers.insert(
             "Strict-Transport-Security",
@@ -1881,15 +1903,37 @@ async fn serve_branded_page(
 /// Serve the client HTML page for SSH sessions.
 /// The session_id is extracted by the JS on the page, not by this handler.
 async fn serve_client_page(
+    axum::extract::State(manager): axum::extract::State<crate::api::AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
     Extension(pages): Extension<BrandedPages>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match pages.get("client.html") {
+    let mut response = match pages.get("client.html") {
         Some(page) => page_response(page, 0, &headers),
         // Unreachable: the map always carries the embedded copy.
         None => Html(include_str!("../static/client.html")).into_response(),
+    };
+    let session = match uuid::Uuid::parse_str(&session_id) {
+        Ok(id) => manager.get_session(id).await,
+        Err(_) => None,
+    };
+    if session
+        .as_ref()
+        .is_some_and(|s| client_frameable(s.fullscreen_on_connect, s.address_book_entry.is_some()))
+    {
+        response.extensions_mut().insert(ClientFrameable);
     }
+    response
+}
+
+/// Whether a session's client page may be framed by our own origin: only a
+/// session opened from a saved entry whose admin turned fullscreen-on-connect
+/// on. That is the only case the Connections page hosts the client in an
+/// iframe; an ad-hoc session, whatever its request said, and an unknown or
+/// ended session are never frameable.
+fn client_frameable(fullscreen_on_connect: bool, from_entry: bool) -> bool {
+    fullscreen_on_connect && from_entry
 }
 
 /// HTML-escape a string to prevent XSS when injecting config values into HTML.
@@ -1949,22 +1993,87 @@ mod tests {
     }
 
     #[test]
-    fn test_csp_allows_same_origin_framing_only() {
-        // Zero-click fullscreen loads the client in a same-origin iframe
-        // (#257), which needs frame-ancestors 'self'; anything wider would
-        // reopen clickjacking from other origins.
-        let directives: Vec<&str> = CONTENT_SECURITY_POLICY.split(';').map(str::trim).collect();
-        let fa = directives
-            .iter()
-            .find(|d| d.starts_with("frame-ancestors "))
-            .expect("CSP must carry a frame-ancestors directive");
-        let sources: Vec<&str> = fa.split_whitespace().skip(1).collect();
+    fn framing_is_denied_except_for_the_frameable_client() {
+        // Clickjacking: no page may be framed, by anyone. The one exception,
+        // the client of a fullscreen-on-connect entry's session (#257), may
+        // be framed by our own origin and nothing wider. The two policies
+        // must otherwise be identical, so the exception loosens framing and
+        // nothing else.
+        let ancestors = |csp: &str| -> Vec<String> {
+            let d = csp
+                .split(';')
+                .map(str::trim)
+                .find(|d| d.starts_with("frame-ancestors "))
+                .expect("CSP must carry a frame-ancestors directive");
+            d.split_whitespace().skip(1).map(String::from).collect()
+        };
+        assert_eq!(ancestors(CONTENT_SECURITY_POLICY), vec!["'none'"]);
+        assert_eq!(ancestors(FRAMEABLE_CONTENT_SECURITY_POLICY), vec!["'self'"]);
+        let rest = |csp: &str| -> Vec<String> {
+            csp.split(';')
+                .map(str::trim)
+                .filter(|d| !d.starts_with("frame-ancestors "))
+                .map(String::from)
+                .collect()
+        };
         assert_eq!(
-            sources,
-            vec!["'self'"],
-            "only the same origin may frame the client"
+            rest(CONTENT_SECURITY_POLICY),
+            rest(FRAMEABLE_CONTENT_SECURITY_POLICY)
         );
     }
+
+    #[test]
+    fn only_fullscreen_entry_sessions_are_frameable() {
+        assert!(client_frameable(true, true));
+        assert!(!client_frameable(false, true), "a normal entry");
+        assert!(
+            !client_frameable(true, false),
+            "an ad-hoc session cannot opt itself in"
+        );
+        assert!(!client_frameable(false, false));
+    }
+
+    #[tokio::test]
+    async fn security_headers_deny_framing_unless_the_page_is_marked() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::response::IntoResponse;
+        let app = Router::new()
+            .route("/plain", get(|| async { "x" }))
+            .route(
+                "/client",
+                get(|| async {
+                    let mut r = "x".into_response();
+                    r.extensions_mut().insert(ClientFrameable);
+                    r
+                }),
+            )
+            .layer(middleware::from_fn(security_headers))
+            .layer(Extension(TlsEnabled(false)));
+        let get_headers = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .headers()
+                    .clone()
+            }
+        };
+        let plain = get_headers("/plain").await;
+        assert_eq!(plain["x-frame-options"], "DENY");
+        assert!(plain["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
+        let client = get_headers("/client").await;
+        assert_eq!(client["x-frame-options"], "SAMEORIGIN");
+        assert!(client["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'self'"));
+    }
+
     #[test]
     fn test_csp_allows_data_and_blob_images() {
         // Safari and Firefox draw Guacamole image streams through data: URIs

@@ -7,6 +7,13 @@ primary supported path is **HAProxy + Knocknoc** (see
 production. This document covers other reverse proxies and a specific
 gotcha that affects nested folder paths across several of them.
 
+**Give rustguac its own hostname** (e.g. `console.example.com`), at `/`,
+rather than a path beside other applications on a shared host. Browsers
+treat everything on the same scheme, host and port as one origin, and
+rustguac's protections against framing and other cross-site tricks rely
+on that origin being rustguac's alone. See
+[Framing and clickjacking](security.md#framing-and-clickjacking).
+
 ## The `%2F` gotcha
 
 rustguac's connections tree uses URL path segments for folder names. When

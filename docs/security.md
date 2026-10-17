@@ -164,12 +164,38 @@ All responses include the following headers:
 
 | Header | Value |
 |--------|-------|
-| Content-Security-Policy | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'` |
+| Content-Security-Policy | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; img-src 'self' data: blob:; frame-ancestors 'none'` |
 | X-Frame-Options | `DENY` |
 | X-Content-Type-Options | `nosniff` |
 | Strict-Transport-Security | `max-age=31536000; includeSubDomains` (when TLS enabled) |
 | Referrer-Policy | `strict-origin-when-cross-origin` |
 | Permissions-Policy | `camera=(), microphone=(), geolocation=()` |
+
+The one exception to the framing headers is described below.
+
+### Framing and clickjacking
+
+Clickjacking is when another site loads a page in an invisible frame and lines it up under something harmless, so a visitor's clicks and keystrokes land on the framed page while they are logged in. For most applications that means a stray click on a button. For rustguac it would be worse: a framed **live session** would pass the visitor's keystrokes and clicks to a remote server. So by default no rustguac page can be framed by anyone, including rustguac itself (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
+
+**The exception: fullscreen on connect.** A browser only lets the tab that received the click go fullscreen. To open a session fullscreen on the Connect click, rather than in a new tab that needs a second click, the Connections page puts its own tab into fullscreen and loads the session in a frame inside it. For that one case, and only for it, the session client page is served with `frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN`:
+
+- Only the client page of a session opened from a saved entry with **Open in fullscreen on connect** turned on. That is an admin setting on the entry, so framing is opt-in per entry: with no such entries, nothing in rustguac can be framed.
+- Only by pages on the rustguac origin. Every other site is still refused, exactly as for every other page.
+- Never an ad-hoc session (whatever its request says), a normal entry's session, an unknown or ended session, or any other page (Connections, Admin, Tokens, Recordings and the rest).
+- Someone joining such a session through a share link loads the same client page, so it is frameable by the rustguac origin too.
+
+The **⧉** (new window) button never uses a frame.
+
+We weighed four approaches before settling on this one:
+
+| Approach | For | Against |
+|---|---|---|
+| Deny all framing | Nothing to reason about | Fullscreen on connect needs a new tab and a second click, and the session resizes after it starts |
+| Allow same-origin framing for every page | One simple rule | Every page, including Admin and Tokens, becomes frameable by any page on the origin, though only the client needs it |
+| Allow it for the client page only | Management pages stay unframeable | Every session's client is frameable, though only fullscreen entries need it |
+| Allow it per session, for fullscreen-on-connect entries only (chosen) | Smallest exposure; off unless an admin turns it on for an entry | One more rule in the server |
+
+**What is left.** Same-origin framing is only a risk if something other than rustguac can put a page on the rustguac origin. Nothing does today: files downloaded from a session are saved to disk, never opened as pages; recordings are played by rustguac's own script; web sessions are streamed as pixels, not rendered. An XSS flaw would already allow anything framing could. The case to avoid is a **shared origin**: if rustguac is served at `/` on the same host and port as another application (for example another app at `/grafana/` behind the same reverse proxy), that application's pages count as the same origin. Give rustguac its own hostname. To rule framing out entirely, leave **Open in fullscreen on connect** off on every entry.
 
 ## Audit logging
 
