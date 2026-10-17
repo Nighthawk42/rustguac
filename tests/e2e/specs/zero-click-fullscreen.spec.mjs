@@ -55,3 +55,50 @@ test('a non-fullscreen entry connects the old way, with no frame', async ({ page
     expect(await page.locator('#rg-session-overlay').count()).toBe(0);
     if (popup) await popup.close();
 });
+
+// Leaving fullscreen (Escape held, F11, the OS) must not end the session: the
+// frame stays at the tab's size and a button takes it back to fullscreen.
+// Headless Chromium refuses real fullscreen, so the browser's side is faked:
+// fullscreenElement is set and cleared and fullscreenchange fired, exactly
+// what the launcher listens to.
+test('leaving fullscreen keeps the session and offers to go back', async ({ page }) => {
+    await page.addInitScript(() => {
+        let fs = null;
+        Object.defineProperty(Document.prototype, 'fullscreenElement', { configurable: true, get: () => fs });
+        // Like a real browser, the change event fires after the call returns.
+        const change = (el) => new Promise((resolve) => setTimeout(() => {
+            fs = el;
+            document.dispatchEvent(new Event('fullscreenchange'));
+            resolve();
+        }, 50));
+        Element.prototype.requestFullscreen = function () { return change(document.documentElement); };
+        document.exitFullscreen = function () { return change(null); };
+        window.__leaveFullscreen = () => document.exitFullscreen();
+    });
+    await installApi(page);
+    await page.goto('/connections.html');
+    await settle(page);
+    await page.locator('.folder-row').filter({ hasText: /acme/ }).first().click();
+    const kiosk = page.locator('.entries-table tbody tr').filter({ hasText: 'kiosk' });
+    await kiosk.locator('button', { hasText: /^Connect/ }).first().click();
+
+    const overlay = page.locator('#rg-session-overlay');
+    const back = page.locator('#rg-session-fs');
+    await expect(overlay).toBeVisible();
+    await expect(back).toBeHidden();
+
+    // The user leaves fullscreen: the session is still there.
+    await page.evaluate(() => window.__leaveFullscreen());
+    await expect(overlay).toBeVisible();
+    await expect(page.locator('#rg-session-frame')).toHaveCount(1);
+    await expect(back).toBeVisible();
+
+    // The button goes back to fullscreen and hides itself.
+    await back.click();
+    await expect(back).toBeHidden();
+    await expect(overlay).toBeVisible();
+
+    // Exit still ends it.
+    await page.locator('#rg-session-exit').click();
+    await expect(overlay).toHaveCount(0);
+});

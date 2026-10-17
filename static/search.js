@@ -422,7 +422,8 @@
         } else fsRefused();
         var ov = document.createElement('div'); ov.id = 'rg-session-overlay';
         ov.innerHTML = '<div id="rg-session-spinner"></div>' +
-            '<button id="rg-session-exit" type="button" title="Exit">× Exit</button>' +
+            '<button id="rg-session-fs" class="rg-session-btn" type="button" title="Back to fullscreen" hidden>⛶ Fullscreen</button>' +
+            '<button id="rg-session-exit" class="rg-session-btn" type="button" title="Leave the session">× Exit</button>' +
             '<iframe id="rg-session-frame" allow="fullscreen; clipboard-read; clipboard-write" title="Session"></iframe>';
         document.body.appendChild(ov);
         if (btn) { btn.classList.add('loading'); btn.disabled = true; }
@@ -450,11 +451,23 @@
                 // the settle check covers both.
                 if (!started) armSettle();
             }
-            else if (enteredFs) { teardown(); }
+            // Leaving fullscreen (Escape held, F11, the OS) keeps the session:
+            // it carries on at the tab's size and the button takes it back
+            // to fullscreen. Only Exit, or the session ending, closes it.
+            else if (enteredFs) { showFsButton(true); }
+            if (document.fullscreenElement) showFsButton(false);
+        }
+        function showFsButton(on) {
+            var b = document.getElementById('rg-session-fs'); if (b) b.hidden = !on;
+            if (!on) { var f = document.getElementById('rg-session-frame'); try { if (f) f.focus(); } catch (e) {} }
         }
         window.addEventListener('message', onMsg);
         document.addEventListener('fullscreenchange', onFsChange);
         document.getElementById('rg-session-exit').addEventListener('click', teardown);
+        document.getElementById('rg-session-fs').addEventListener('click', function () {
+            // A click is a fresh gesture, so the browser allows fullscreen again.
+            try { var p = req && req.call(el); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+        });
         // Create the session at the measured viewport size — the size the
         // frame paints into — so there is nothing to resize afterwards.
         function startConnect() {

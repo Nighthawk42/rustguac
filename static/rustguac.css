@@ -1141,12 +1141,15 @@ html:not([data-role-level="4"]) .admin-only { display: none !important; }
     border: 3px solid rgba(255,255,255,0.25); border-top-color: var(--accent, #5bc0be);
     border-radius: 50%; animation: rg-btn-spin 0.8s linear infinite;
 }
-#rg-session-exit {
-    position: absolute; top: 10px; right: 14px; z-index: 5001;
+#rg-session-exit { position: absolute; top: 10px; right: 14px; }
+#rg-session-fs { position: absolute; top: 10px; right: 104px; }
+#rg-session-fs[hidden] { display: none; }
+.rg-session-btn {
+    z-index: 5001;
     height: 32px; padding: 0 var(--s-3, 14px);
     background: rgba(20,24,38,0.72); color: var(--text, #e0e0e0);
     border: 1px solid var(--border, #333); border-radius: var(--radius, 2px);
     font-family: monospace; font-size: var(--fz-sm, 16px); cursor: pointer;
     opacity: 0.35; transition: opacity 0.15s;
 }
-#rg-session-exit:hover { opacity: 1; background: var(--surface, #16213e); border-color: var(--primary, #e94560); color: var(--text, #e0e0e0); }
+.rg-session-btn:hover { opacity: 1; background: var(--surface, #16213e); border-color: var(--primary, #e94560); color: var(--text, #e0e0e0); }
