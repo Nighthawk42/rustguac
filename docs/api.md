@@ -418,6 +418,16 @@ Delete a recording file. Requires **admin** role.
 
 List all OIDC users.
 
+### `POST /api/users`
+
+Add a user ahead of their first OIDC login, which is how anyone gets in when `[oidc] auto_create_users = false`.
+
+```json
+{ "email": "jsmith@example.com", "role": "operator", "name": "J Smith" }
+```
+
+`role` is one of `admin`, `poweruser`, `operator`, `viewer`; `name` is optional and replaced by the provider's name on login. The email must contain `@`, be at most 254 characters and have no spaces or control characters; the name at most 200 characters. Responses: `201` with the user; `400` for an invalid email, name or role; `409` if a user with that email already exists, ignoring case. See [How a login is matched to a user](roles-and-access-control.md#how-a-login-is-matched-to-a-user).
+
 ### `PUT /api/users/:email/role`
 
 Set a user's role.

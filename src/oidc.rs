@@ -470,6 +470,14 @@ pub async fn callback(
         }
     };
 
+    // Users are found by email, so an email the provider itself says it has
+    // not verified is not good enough to log anyone in. Providers that do not
+    // send the claim at all are trusted as before.
+    if claims.email().is_some() && claims.email_verified() == Some(false) {
+        tracing::warn!("OIDC login rejected: the provider marked the email as unverified");
+        return Redirect::to("/?sso_error=email_unverified").into_response();
+    }
+
     // Extract user info from claims
     let subject = claims.subject().to_string();
     let email: String = claims
@@ -530,10 +538,28 @@ pub async fn callback(
     })
     .await
     {
-        Ok(Ok(Some(user))) => user,
-        Ok(Ok(None)) => {
+        Ok(Ok(db::OidcLogin::User(user))) => user,
+        Ok(Ok(db::OidcLogin::NoAccount)) => {
             tracing::warn!(email = %email, "OIDC login rejected: no account and auto_create_users is disabled");
             return Redirect::to("/?sso_error=no_account").into_response();
+        }
+        Ok(Ok(db::OidcLogin::SubjectMismatch)) => {
+            // Same email, different provider account: possibly someone else
+            // claiming the address, or a provider migration that needs
+            // `rustguac reset-oidc-subject`.
+            tracing::warn!(
+                email = %email,
+                "OIDC login rejected: this email is bound to a different OIDC subject \
+                 (if the identity provider changed, run rustguac reset-oidc-subject)"
+            );
+            return Redirect::to("/?sso_error=account_mismatch").into_response();
+        }
+        Ok(Ok(db::OidcLogin::Ambiguous)) => {
+            tracing::warn!(
+                email = %email,
+                "OIDC login rejected: several users have this email in different case"
+            );
+            return Redirect::to("/?sso_error=account_mismatch").into_response();
         }
         Ok(Err(e)) => {
             tracing::error!("Failed to upsert user: {}", e);

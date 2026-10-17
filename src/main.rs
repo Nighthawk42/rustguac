@@ -141,6 +141,15 @@ enum Command {
         name: String,
     },
 
+    /// Forget the identity provider account a user is bound to, so their next
+    /// OIDC login binds to whichever account it comes from. For moving to a
+    /// different identity provider, where every user's subject changes.
+    ResetOidcSubject {
+        /// User email
+        #[arg(long)]
+        email: String,
+    },
+
     /// Set a user's role
     SetRole {
         /// User email
@@ -287,6 +296,7 @@ async fn main() {
         Some(Command::AddUser { email, role, name }) => {
             cmd_add_user(&database, &email, &role, &name)
         }
+        Some(Command::ResetOidcSubject { email }) => cmd_reset_oidc_subject(&database, &email),
         Some(Command::SetRole { email, role }) => cmd_set_role(&database, &email, &role),
         Some(Command::DisableUser { email }) => cmd_disable_user(&database, &email),
         Some(Command::DeleteUser { email }) => cmd_delete_user(&database, &email),
@@ -534,8 +544,14 @@ fn cmd_list_users(database: &Db) {
 }
 
 fn cmd_add_user(database: &Db, email: &str, role: &str, name: &str) {
+    let email = email.trim();
+    let name = name.trim();
     if !["admin", "poweruser", "operator", "viewer"].contains(&role) {
         eprintln!("Role must be admin, poweruser, operator, or viewer.");
+        std::process::exit(1);
+    }
+    if let Err(msg) = db::check_user_email(email).and_then(|_| db::check_user_name(name)) {
+        eprintln!("Invalid user: {msg}.");
         std::process::exit(1);
     }
     match db::create_user(database, email, name, role) {
@@ -543,8 +559,31 @@ fn cmd_add_user(database: &Db, email: &str, role: &str, name: &str) {
             println!("User '{}' added with role '{}'.", email, role);
             audit_cli(database, "add_user", email, Some(&format!("role={}", role)));
         }
-        Err(e) if e.to_string().contains("UNIQUE") => {
-            eprintln!("User '{}' already exists.", email);
+        Err(db::CreateUserError::Exists) => {
+            eprintln!(
+                "A user with email '{}' already exists (emails match ignoring case).",
+                email
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_reset_oidc_subject(database: &Db, email: &str) {
+    match db::reset_oidc_subject(database, email.trim()) {
+        Ok(Some(stored)) => {
+            println!(
+                "OIDC subject for '{}' cleared. Their next login binds to the identity provider account it comes from.",
+                stored
+            );
+            audit_cli(database, "reset_oidc_subject", &stored, None);
+        }
+        Ok(None) => {
+            eprintln!("No single user with email '{}'.", email.trim());
             std::process::exit(1);
         }
         Err(e) => {

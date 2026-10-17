@@ -1597,12 +1597,9 @@ pub async fn create_user(
     }
 
     let email = req.email.trim().to_string();
-    if email.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "email is required"})),
-        )
-            .into_response();
+    let name = req.name.trim().to_string();
+    if let Err(msg) = db::check_user_email(&email).and_then(|_| db::check_user_name(&name)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     }
     if !["admin", "poweruser", "operator", "viewer"].contains(&req.role.as_str()) {
         return (
@@ -1613,15 +1610,22 @@ pub async fn create_user(
     }
 
     let db_clone = database.clone();
-    let name = req.name.trim().to_string();
     let role = req.role.clone();
+    let admin = identity
+        .as_ref()
+        .map(|Extension(id)| id.display_name().to_string())
+        .unwrap_or_default();
+    let (log_email, log_role) = (email.clone(), role.clone());
     match tokio::task::spawn_blocking(move || db::create_user(&db_clone, &email, &name, &role))
         .await
     {
-        Ok(Ok(user)) => (StatusCode::CREATED, Json(json!(user))).into_response(),
-        Ok(Err(e)) if e.to_string().contains("UNIQUE") => (
+        Ok(Ok(user)) => {
+            tracing::info!(admin = %admin, email = %log_email, role = %log_role, "user added");
+            (StatusCode::CREATED, Json(json!(user))).into_response()
+        }
+        Ok(Err(db::CreateUserError::Exists)) => (
             StatusCode::CONFLICT,
-            Json(json!({"error": "user already exists"})),
+            Json(json!({"error": "a user with that email already exists (emails match ignoring case)"})),
         )
             .into_response(),
         _ => (

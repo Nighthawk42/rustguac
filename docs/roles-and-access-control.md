@@ -49,7 +49,33 @@ OIDC users are assigned a role through three mechanisms (in order of precedence)
 2. **Manual role assignment** — admins can set a user's role via CLI, API, or the Admin page.
 3. **Default role** — new users get the `default_role` from OIDC config on first login (default: `operator`).
 
-With `auto_create_users = false` in `[oidc]`, rustguac does not create accounts on login: a user must be added first via `rustguac add-user --email <email> --role <role>`, `POST /api/users` (`{"email": "...", "role": "...", "name": "..."}`), or the Admin page. Anyone else who authenticates with the identity provider gets a 403. The pre-assigned role is kept; `default_role` is not applied, but group-to-role mappings still are.
+#### Only users you have added
+
+With `auto_create_users = false` in `[oidc]`, rustguac does not create accounts on login: a user must be added first with `rustguac add-user --email <email> --role <role>`, `POST /api/users`, or **Add User** on the Admin page. Anyone else who authenticates with the identity provider is sent back to the login page with "You do not have an account here". The role the admin chose is kept; `default_role` is not applied, but group-to-role mappings still are.
+
+```bash
+rustguac add-user --email jsmith@example.com --role operator --name "J Smith"
+```
+
+Emails are matched ignoring case, so it does not matter whether the provider sends `JSmith@Example.com` or `jsmith@example.com`, and two users cannot differ only in case.
+
+#### How a login is matched to a user
+
+Users are found by email, but an email on its own is not proof of who someone is: some identity providers let people set or change their own address. So the first time a user logs in, rustguac records their provider account's **subject** (the OIDC `sub` claim, a permanent ID the provider never reuses), and from then on that user can only be signed in as by that same provider account. A login with the same email but a different subject is refused with "This sign-in does not match the account used here before", and logged as a warning. This applies whether or not `auto_create_users` is on.
+
+A user an admin added who has not logged in yet has no subject, so their first login records it.
+
+rustguac also refuses a login when the provider explicitly marks the email as unverified (`email_verified: false`). Providers that do not send the claim are trusted as before.
+
+#### Moving to a different identity provider
+
+Every user's subject changes when you switch providers (for example from JumpCloud to Entra ID), so after the switch everyone would be refused. Clear each user's recorded subject and their next login records the new one:
+
+```bash
+rustguac reset-oidc-subject --email jsmith@example.com
+```
+
+Their role, group mappings, tokens and credentials are kept. This is CLI-only on purpose: it needs shell access to the rustguac host, and each use is written to the CLI audit log. The same command fixes a single user whose provider account was deleted and recreated.
 
 ## Endpoint access control
 
@@ -89,6 +115,7 @@ With `auto_create_users = false` in `[oidc]`, rustguac does not create accounts 
 | Endpoint | Required role |
 |----------|--------------|
 | `GET /api/users` | admin |
+| `POST /api/users` | admin |
 | `PUT /api/users/:email/role` | admin |
 | `DELETE /api/users/:email` | admin |
 | `POST /api/users/:email/disable` | admin |
@@ -252,6 +279,14 @@ This means:
 ```bash
 # List all OIDC users
 rustguac list-users
+
+# Add a user ahead of their first login (needed with auto_create_users = false)
+rustguac add-user --email user@example.com --role operator --name "A User"
+
+# Forget the identity provider account a user is bound to, after a provider
+# migration or a recreated provider account (see "Moving to a different
+# identity provider" above)
+rustguac reset-oidc-subject --email user@example.com
 
 # Set a user's role
 rustguac set-role --email user@example.com --role poweruser
