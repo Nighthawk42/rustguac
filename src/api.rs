@@ -4122,8 +4122,11 @@ pub struct UpdateFolderRequest {
     pub allowed_users: Option<Vec<String>>,
     #[serde(default)]
     pub description: String,
+    /// Title shown over the folder key. Omitted means "leave as is", like
+    /// `allowed_users`, so a client or script that predates the field cannot
+    /// wipe it by saving the folder; `""` clears it.
     #[serde(default)]
-    pub display_name: String,
+    pub display_name: Option<String>,
     #[serde(default)]
     pub inherit_from_parent: bool,
 }
@@ -4151,16 +4154,30 @@ pub async fn ab_update_folder(
         }
     };
 
+    // Fields the request may leave out keep their stored values, so the
+    // stored config is read once when any of them is missing.
+    let existing = if req.allowed_users.is_none() || req.display_name.is_none() {
+        match vault.get_folder_config(&scope, &folder).await {
+            Ok(existing) => Some(existing),
+            Err(VaultError::NotFound) => None,
+            Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
+        }
+    } else {
+        None
+    };
     let allowed_users = match req.allowed_users {
         Some(users) => match normalize_allowed_users(users) {
             Ok(u) => u,
             Err(msg) => return ab_error(StatusCode::BAD_REQUEST, msg),
         },
-        None => match vault.get_folder_config(&scope, &folder).await {
-            Ok(existing) => existing.allowed_users,
-            Err(VaultError::NotFound) => Vec::new(),
-            Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
-        },
+        None => existing
+            .as_ref()
+            .map(|c| c.allowed_users.clone())
+            .unwrap_or_default(),
+    };
+    let display_name = match req.display_name {
+        Some(d) => d.trim().to_string(),
+        None => existing.map(|c| c.display_name).unwrap_or_default(),
     };
     let allowed_count = req.allowed_groups.len();
     let users_count = allowed_users.len();
@@ -4169,7 +4186,7 @@ pub async fn ab_update_folder(
         allowed_groups: req.allowed_groups,
         allowed_users,
         description: req.description,
-        display_name: req.display_name.trim().to_string(),
+        display_name,
         inherit_from_parent: req.inherit_from_parent,
     };
 
@@ -7141,6 +7158,20 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_update_leaves_an_omitted_display_name_alone() {
+        // A client or script that predates display names saves a folder
+        // without the field: that must not wipe the stored title. An empty
+        // string is how a title is cleared on purpose.
+        let old: UpdateFolderRequest =
+            serde_json::from_str(r#"{"allowed_groups":["ops"],"description":"x"}"#).unwrap();
+        assert_eq!(old.display_name, None);
+        assert_eq!(old.allowed_users, None);
+        let cleared: UpdateFolderRequest =
+            serde_json::from_str(r#"{"allowed_groups":[],"display_name":""}"#).unwrap();
+        assert_eq!(cleared.display_name.as_deref(), Some(""));
+    }
 
     #[test]
     fn address_book_change_attribution() {

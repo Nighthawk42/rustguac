@@ -521,6 +521,7 @@ Create a folder.
   "allowed_groups": ["engineering", "devops"],
   "allowed_users": ["oncall@example.com"],
   "description": "Production servers",
+  "display_name": "Production",
   "inherit_from_parent": false
 }
 ```
@@ -528,10 +529,11 @@ Create a folder.
 - `allowed_groups`: OIDC groups that can see the folder.
 - `allowed_users` (optional): login emails of individual users who can see the folder. They need not have logged in yet. Up to 500 per folder; blanks and repeats (ignoring case) are dropped, and an entry containing spaces or control characters is refused with `400`.
 - With both lists empty the folder is admin-only. See [Folder access control](roles-and-access-control.md#folder-access-control).
+- `display_name` (optional): a title shown over the folder name in Connections and in search results, for example a customer's full name over a short folder key. The folder name stays the key used in paths and the API. Left out of the stored config when empty.
 
 ### `PUT /api/addressbook/folders/:scope/:folder` (admin)
 
-Update folder configuration (`allowed_groups`, `allowed_users`, `description`, `inherit_from_parent`). If `allowed_users` is left out, the stored list is kept as it is; send `[]` to clear it.
+Update folder configuration (`allowed_groups`, `allowed_users`, `description`, `display_name`, `inherit_from_parent`). If `allowed_users` or `display_name` is left out, the stored value is kept as it is; send `[]` or `""` to clear it.
 
 ### `GET /api/addressbook/folders/:scope/:folder/config` (admin)
 
