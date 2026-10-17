@@ -341,6 +341,13 @@
         // the entry says, so no cover asking for a click.
         var windowed = urlParams.get('fs') === '0';
         function rgNotifyParent(kind) { if (!embedded) return; try { window.parent.postMessage({ rgSession: kind }, location.origin); } catch (e) {} }
+        // Every navigation away from the session goes through here. Embedded,
+        // it moves the whole tab: the frame may only hold this session's
+        // client, and any other page refuses to load in a frame.
+        function rgGo(url) {
+            if (embedded) { try { window.top.location.href = url; return; } catch (e) {} }
+            window.location.href = url;
+        }
         // Embedded: the launcher enters fullscreen, waits for the viewport to
         // stop changing and creates the session at that measured size, so the
         // frame paints into exactly the size the remote was given. The connect
@@ -707,7 +714,7 @@
                     // back to Connections. Session may keep running until
                     // socket closes; user can explicitly terminate from
                     // Connections' active-session card.
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                 });
                 document.getElementById('cp-fullscreen').addEventListener('click', function() {
                     rgEnterFullscreen();
@@ -1760,7 +1767,7 @@
             document.getElementById('fs-disconnect').addEventListener('click', function() {
                 rgExitFullscreen();
                 try { if (window.__guac_client) window.__guac_client.disconnect(); } catch (e) {}
-                window.location.href = '/connections.html';
+                rgGo('/connections.html');
             });
 
             client.onstatechange = function(state) {
@@ -1921,9 +1928,12 @@
 
             // Disconnected overlay buttons
             document.getElementById('btn-close-session').addEventListener('click', function() {
+                // Embedded: the launcher closes the frame and the tab is back
+                // on Connections.
+                if (embedded) { rgNotifyParent('end'); return; }
                 window.close();
                 // window.close() may be blocked if not opened by script — navigate away as fallback
-                window.location.href = '/';
+                rgGo('/');
             });
             // Reconnect launches a fresh session against the same Connections
             // entry, then navigates to it. Reloading the dead session URL
@@ -1945,7 +1955,7 @@
                 // Ad-hoc sessions have no entry to relaunch from. Send the
                 // user back to Connections so they can pick where to go.
                 if (!relaunchInfo) {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                     return;
                 }
 
@@ -1957,7 +1967,7 @@
                 var firstSlash = key.indexOf('/');
                 var lastSlash = key.lastIndexOf('/');
                 if (firstSlash < 0 || lastSlash <= firstSlash) {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                     return;
                 }
                 var scope = key.substring(0, firstSlash);
@@ -1991,7 +2001,7 @@
                         // none of those are fixable from this page. Punt to
                         // Connections where the user can fill in what's
                         // missing or pick a different entry.
-                        window.location.href = '/connections.html';
+                        rgGo('/connections.html');
                         return;
                     }
                     return res.json().then(function(data) {
@@ -2000,14 +2010,14 @@
                             if (relaunchInfo.display_name) {
                                 dest += '?name=' + encodeURIComponent(relaunchInfo.display_name);
                             }
-                            window.location.href = dest;
+                            rgGo(dest);
                         } else {
-                            window.location.href = '/connections.html';
+                            rgGo('/connections.html');
                         }
                     });
                 })
                 .catch(function() {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                 });
             });
 
