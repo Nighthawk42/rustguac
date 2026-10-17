@@ -228,6 +228,14 @@ Controls session recording behaviour and disk management.
 | `typescript_path` | string | (unset) | Directory for SSH typescript (raw terminal text) files. Unset = disabled. See below. |
 | `typescript_name` | string | `{connection}-{user}-{date}-{time}` | Filename template for typescripts. Tokens listed below. |
 | `create_typescript_path` | bool | `false` | Ask guacd to create `typescript_path` if it does not exist. |
+| `mp4_enabled` | bool | `true` | Offer recordings as MP4 downloads (see below). Off by itself when guacenc is not installed. |
+| `guacenc_path` | string | `/opt/rustguac/bin/guacenc` | The guacenc binary that converts recordings. |
+| `mp4_cache_path` | string | `<path>/mp4-cache` | Where converted MP4s are kept. |
+| `mp4_cache_hours` | integer | `24` | Remove a converted MP4 this many hours after it was made. |
+| `mp4_max_jobs` | integer | `1` | Conversions that run at once; more wait their turn. |
+| `mp4_timeout_secs` | integer | `1800` | Give up on a conversion after this many seconds. |
+| `mp4_bitrate` | integer | `2000000` | Video bitrate, in bits per second. |
+| `mp4_max_width`, `mp4_max_height` | integer | `1920`, `1080` | Largest video size. Bigger recordings are scaled down to fit, keeping their shape. |
 
 ```toml
 [recording]
@@ -304,6 +312,42 @@ Keystroke logging in the *graphical* recording (guacd's
 that depends on guacd-driven graphical recording, which rustguac does not
 use (it records the proxied stream itself). It is therefore not wired up;
 the typescript is the supported text-audit path.
+
+### MP4 downloads
+
+A `.guac` recording only plays in rustguac's own player. The Recordings page
+can also give you an MP4 that plays anywhere (VLC, a browser, a video
+editor): click **mp4** next to a recording. rustguac converts it in the
+background with `guacenc`, which comes with guacamole-server, and the file
+downloads when it is ready. Converting a long session takes a while, so the
+button shows **converting...** until then.
+
+- The same people can get the MP4 as can download the recording (poweruser
+  and admin).
+- A recording whose session is still running is not converted, since the
+  file is not finished.
+- Converted files are kept in `mp4_cache_path` for `mp4_cache_hours`, so a
+  second download is instant, and removed when their recording is. When
+  rotation needs disk space it removes them all before touching any
+  recording.
+- The video is the recording's own size, scaled down to fit
+  `mp4_max_width` x `mp4_max_height`.
+- The button only appears when guacenc is installed. It is part of the
+  `.deb`, the Docker image and `install.sh` from 1.11.1; on a build without
+  it the button is not shown.
+
+To convert recordings yourself, for example a batch for an audit, run
+guacenc on the rustguac host. It writes `<recording>.m4v` (an MP4 file)
+next to the input, so copy recordings somewhere writable first:
+
+```bash
+cp /opt/rustguac/recordings/<id>.guac /tmp/
+/opt/rustguac/bin/guacenc -s 1920x1080 -r 2000000 /tmp/<id>.guac
+# -> /tmp/<id>.guac.m4v
+```
+
+guacenc reports failures in its output but exits 0 either way, so check
+that the `.m4v` file exists.
 
 #### Encryption at rest (LUKS)
 

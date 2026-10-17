@@ -11,6 +11,7 @@ mod oidc;
 mod protocol;
 mod pve;
 mod recording;
+mod recording_mp4;
 mod session;
 mod tunnel;
 mod vault;
@@ -1236,6 +1237,25 @@ async fn run_server(config: Config, database: Db) {
         }
     }
 
+    // MP4 downloads of recordings (#241): guacenc on request, cached.
+    let mp4_converter = Arc::new(recording_mp4::Mp4Converter::new(
+        &manager.recording_config(),
+        manager.recording_path(),
+    ));
+    {
+        // Clear out what an earlier run left (work directories, expired and
+        // orphaned MP4s) now, then every hour.
+        let conv = mp4_converter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let c = conv.clone();
+                let _ = tokio::task::spawn_blocking(move || c.purge(false)).await;
+            }
+        });
+    }
+
     // Spawn recording rotation background task
     {
         let rec_config = manager.recording_config();
@@ -1248,6 +1268,7 @@ async fn run_server(config: Config, database: Db) {
                 interval_secs
             );
             let rot_manager = manager.clone();
+            let rot_conv = mp4_converter.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -1258,8 +1279,19 @@ async fn run_server(config: Config, database: Db) {
                     // Snapshot recordings of still-live sessions so rotation
                     // never deletes an in-progress (open) recording.
                     let active = rot_manager.active_recording_paths().await;
-                    let _ =
-                        tokio::task::spawn_blocking(move || recording::rotate(&cfg, &active)).await;
+                    let conv = rot_conv.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        // Converted MP4s are copies, so they go before any
+                        // recording does when the disk is too full.
+                        if cfg.max_disk_percent > 0
+                            && recording::disk_usage_percent(&cfg.path)
+                                .is_ok_and(|p| p > cfg.max_disk_percent as f64)
+                        {
+                            conv.purge(true);
+                        }
+                        recording::rotate(&cfg, &active)
+                    })
+                    .await;
                 }
             });
         }
@@ -1313,6 +1345,14 @@ async fn run_server(config: Config, database: Db) {
         .route("/api/recordings", get(api::list_recordings))
         .route("/api/recordings/{name}", get(api::serve_recording))
         .route("/api/recordings/{name}", delete(api::delete_recording))
+        .route(
+            "/api/recordings/{name}/mp4",
+            post(api::start_recording_mp4).get(api::serve_recording_mp4),
+        )
+        .route(
+            "/api/recordings/{name}/mp4/status",
+            get(api::recording_mp4_status),
+        )
         // #159: typescript register is list-only by design (no serve/delete).
         .route("/api/typescripts", get(api::list_typescripts))
         .route("/api/reports/sessions", get(api::report_sessions))
@@ -1455,7 +1495,8 @@ async fn run_server(config: Config, database: Db) {
         .layer(Extension(vault_configured.clone()))
         .layer(Extension(credential_default_scope.clone()))
         .layer(Extension(database.clone()))
-        .layer(Extension(ab_changes.clone()));
+        .layer(Extension(ab_changes.clone()))
+        .layer(Extension(mp4_converter.clone()));
     // Applied OUTSIDE require_auth so requests with bad credentials are
     // counted too: a flood of bogus keys is throttled before each one
     // queues on the database lock to be looked up.

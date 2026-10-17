@@ -911,6 +911,7 @@ pub struct CredentialDefaultScope(pub String);
 pub async fn list_recordings(
     State(manager): State<AppState>,
     identity: Option<Extension<AuthIdentity>>,
+    mp4: Option<Extension<Arc<crate::recording_mp4::Mp4Converter>>>,
 ) -> impl IntoResponse {
     match &identity {
         Some(Extension(id)) if id.has_role("poweruser") => {}
@@ -923,6 +924,9 @@ pub async fn list_recordings(
         }
     }
     let recording_path = manager.recording_path().to_path_buf();
+    // Each recording's MP4 state (#241), when conversion is available here;
+    // the field is left out otherwise, which is how the page knows.
+    let mp4 = mp4.map(|Extension(c)| c).filter(|c| c.enabled());
 
     match tokio::task::spawn_blocking(move || {
         let mut recordings = Vec::new();
@@ -974,6 +978,9 @@ pub async fn list_recordings(
                 if let Some(ref t) = sidecar.session_type {
                     rec["session_type"] = json!(t);
                 }
+            }
+            if let Some(ref conv) = mp4 {
+                rec["mp4"] = mp4_state_json(&conv.state(&name))["state"].clone();
             }
             recordings.push(rec);
         }
@@ -1478,6 +1485,144 @@ pub async fn serve_recording(
             format!("inline; filename=\"{}\"", name),
         )
         .body(body)
+        .unwrap()
+        .into_response()
+}
+
+/// The check every recording read makes (download, MP4): poweruser or
+/// admin, and a plain `.guac` name inside the recording directory.
+#[allow(clippy::result_large_err)]
+fn check_recording_read(
+    identity: &Option<Extension<AuthIdentity>>,
+    name: &str,
+    recording_dir: &std::path::Path,
+) -> Result<(), Response> {
+    match identity {
+        Some(Extension(id)) if id.has_role("poweruser") => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "requires poweruser or admin role"})),
+            )
+                .into_response())
+        }
+    }
+    if !is_safe_recording_name(name, recording_dir) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid recording name"})),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+fn mp4_state_json(state: &crate::recording_mp4::Mp4State) -> serde_json::Value {
+    use crate::recording_mp4::Mp4State;
+    match state {
+        Mp4State::Unavailable => json!({"state": "unavailable"}),
+        Mp4State::None => json!({"state": "none"}),
+        Mp4State::Running => json!({"state": "running"}),
+        Mp4State::Ready { size_bytes } => json!({"state": "ready", "size_bytes": size_bytes}),
+        Mp4State::Failed(why) => json!({"state": "failed", "error": why}),
+    }
+}
+
+/// POST /api/recordings/{name}/mp4: Start converting a recording to MP4
+/// (#241). Same access as downloading the recording. 202 while it converts,
+/// 200 when a converted copy is already there, 409 while the recording's
+/// session is still live, 503 when conversion is not available here.
+pub async fn start_recording_mp4(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    use crate::recording_mp4::StartOutcome;
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    let who = identity
+        .as_ref()
+        .map(|Extension(id)| id.display_name().to_string())
+        .unwrap_or_default();
+    let live = manager
+        .active_recording_paths()
+        .await
+        .contains(&manager.recording_path().join(&name));
+    match mp4.start(&name, live, &who) {
+        StartOutcome::Started | StartOutcome::AlreadyRunning => {
+            (StatusCode::ACCEPTED, Json(json!({"state": "running"}))).into_response()
+        }
+        StartOutcome::AlreadyReady { size_bytes } => {
+            Json(json!({"state": "ready", "size_bytes": size_bytes})).into_response()
+        }
+        StartOutcome::Live => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "this session is still being recorded; try again once it has ended"})),
+        )
+            .into_response(),
+        StartOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "recording not found"})),
+        )
+            .into_response(),
+        StartOutcome::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "MP4 conversion is not available on this server"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/recordings/{name}/mp4/status: Where a recording's MP4 stands:
+/// `none`, `running`, `ready` (with `size_bytes`), `failed` (with `error`)
+/// or `unavailable`.
+pub async fn recording_mp4_status(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    Json(mp4_state_json(&mp4.state(&name))).into_response()
+}
+
+/// GET /api/recordings/{name}/mp4: Download the converted MP4, once ready.
+pub async fn serve_recording_mp4(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    use crate::recording_mp4::Mp4State;
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    let not_yet = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no MP4 yet; start one with POST"})),
+        )
+            .into_response()
+    };
+    if !matches!(mp4.state(&name), Mp4State::Ready { .. }) {
+        return not_yet();
+    }
+    let file = match tokio::fs::File::open(mp4.mp4_path(&name)).await {
+        Ok(f) => f,
+        Err(_) => return not_yet(),
+    };
+    let stem = name.strip_suffix(".guac").unwrap_or(&name);
+    axum::response::Response::builder()
+        .header("content-type", "video/mp4")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{}.mp4\"", stem),
+        )
+        .body(Body::from_stream(ReaderStream::new(file)))
         .unwrap()
         .into_response()
 }
@@ -8684,6 +8829,50 @@ mod tests {
         // segment — covers `foo..bar.guac`, `.guac..evil.guac`, etc.
         assert!(!is_safe_recording_name("foo..bar.guac", Path::new("/tmp")));
         assert!(!is_safe_recording_name("..guac", Path::new("/tmp")));
+    }
+
+    #[test]
+    fn recording_mp4_access_matches_recording_download() {
+        // The MP4 endpoints (#241) share the download's check: poweruser or
+        // admin, and a plain .guac name inside the recording directory.
+        let dir = std::env::temp_dir().join(format!("rustguac-rec-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.guac"), "x").unwrap();
+        let user = |role: &str| {
+            Some(Extension(AuthIdentity::User {
+                email: "u@example.com".into(),
+                role: role.into(),
+                groups: vec![],
+            }))
+        };
+        let status = |id: &Option<Extension<AuthIdentity>>, name: &str| {
+            check_recording_read(id, name, &dir)
+                .err()
+                .map(|r| r.status())
+        };
+        assert_eq!(status(&user("poweruser"), "s.guac"), None);
+        assert_eq!(status(&user("admin"), "s.guac"), None);
+        assert_eq!(
+            status(&Some(Extension(AuthIdentity::ApiKey("k".into()))), "s.guac"),
+            None
+        );
+        assert_eq!(
+            status(&user("operator"), "s.guac"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(&user("viewer"), "s.guac"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(status(&None, "s.guac"), Some(StatusCode::FORBIDDEN));
+        for bad in ["../s.guac", "a/s.guac", "s.mp4", "..guac", "s.guac\0"] {
+            assert_eq!(
+                status(&user("admin"), bad),
+                Some(StatusCode::BAD_REQUEST),
+                "{bad}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

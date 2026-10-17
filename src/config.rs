@@ -227,6 +227,63 @@ pub struct RecordingConfig {
     /// Ask guacd to create `typescript_path` if it doesn't already exist.
     #[serde(default)]
     pub create_typescript_path: bool,
+    /// Offer recordings as MP4 downloads, converted on request with guacenc
+    /// (#241). Default: true. Has no effect when guacenc is not installed.
+    #[serde(default = "default_true")]
+    pub mp4_enabled: bool,
+    /// The guacenc binary. Default: /opt/rustguac/bin/guacenc.
+    #[serde(default = "default_guacenc_path")]
+    pub guacenc_path: PathBuf,
+    /// Where converted MP4s are kept. Default: `mp4-cache` inside the
+    /// recording directory. Emptied first when rotation needs disk space.
+    #[serde(default)]
+    pub mp4_cache_path: Option<PathBuf>,
+    /// Remove a converted MP4 this many hours after it was made. Default: 24.
+    #[serde(default = "default_mp4_cache_hours")]
+    pub mp4_cache_hours: u64,
+    /// Conversions run at once; more wait their turn. Default: 1.
+    #[serde(default = "default_mp4_max_jobs")]
+    pub mp4_max_jobs: u32,
+    /// Give up on a conversion after this many seconds. Default: 1800.
+    #[serde(default = "default_mp4_timeout_secs")]
+    pub mp4_timeout_secs: u64,
+    /// Video bitrate in bits per second. Default: 2000000.
+    #[serde(default = "default_mp4_bitrate")]
+    pub mp4_bitrate: u32,
+    /// Largest video size; bigger recordings are scaled down to fit, keeping
+    /// their shape. Default: 1920 x 1080.
+    #[serde(default = "default_mp4_max_width")]
+    pub mp4_max_width: u32,
+    #[serde(default = "default_mp4_max_height")]
+    pub mp4_max_height: u32,
+}
+
+fn default_guacenc_path() -> PathBuf {
+    PathBuf::from("/opt/rustguac/bin/guacenc")
+}
+
+fn default_mp4_cache_hours() -> u64 {
+    24
+}
+
+fn default_mp4_max_jobs() -> u32 {
+    1
+}
+
+fn default_mp4_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_mp4_bitrate() -> u32 {
+    2_000_000
+}
+
+fn default_mp4_max_width() -> u32 {
+    1920
+}
+
+fn default_mp4_max_height() -> u32 {
+    1080
 }
 
 fn default_max_disk_percent() -> u8 {
@@ -248,6 +305,15 @@ impl Default for RecordingConfig {
             typescript_path: None,
             typescript_name: None,
             create_typescript_path: false,
+            mp4_enabled: true,
+            guacenc_path: default_guacenc_path(),
+            mp4_cache_path: None,
+            mp4_cache_hours: default_mp4_cache_hours(),
+            mp4_max_jobs: default_mp4_max_jobs(),
+            mp4_timeout_secs: default_mp4_timeout_secs(),
+            mp4_bitrate: default_mp4_bitrate(),
+            mp4_max_width: default_mp4_max_width(),
+            mp4_max_height: default_mp4_max_height(),
         }
     }
 }

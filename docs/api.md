@@ -402,11 +402,23 @@ To build your own client, open the WebSocket at `ws_url` with the `guacamole` su
 
 ### `GET /api/recordings`
 
-List all recording files. Requires **operator** role or higher.
+List all recording files. Requires **poweruser** role or higher. When MP4 conversion is available on the server, each recording has an `mp4` field with the state of its MP4 (see below); without it, the field is left out.
 
 ### `GET /api/recordings/:name`
 
-Serve a recording file for playback. Requires **operator** role or higher. Filename is validated against path traversal.
+Serve a recording file for playback. Requires **poweruser** role or higher. Filename is validated against path traversal.
+
+### `POST /api/recordings/:name/mp4`
+
+Start converting a recording to MP4 with guacenc (see [MP4 downloads](configuration.md#mp4-downloads)). Same access as downloading the recording. Responses: `202` `{"state":"running"}` while it converts (asking again while it runs changes nothing); `200` `{"state":"ready","size_bytes":...}` when a converted copy is already there; `409` while the recording's session is still live; `404` for an unknown recording; `503` when conversion is not available on this server.
+
+### `GET /api/recordings/:name/mp4/status`
+
+Where a recording's MP4 stands: `{"state": "none" | "running" | "ready" | "failed" | "unavailable"}`, with `size_bytes` when ready and `error` when failed. A failed conversion is retried by the next `POST`.
+
+### `GET /api/recordings/:name/mp4`
+
+Download the converted MP4 (`video/mp4`, saved as `<recording>.mp4`). `404` until it is ready.
 
 ### `DELETE /api/recordings/:name`
 

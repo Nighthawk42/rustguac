@@ -439,7 +439,86 @@
 
         function renderRecordings(recordings) {
             recView = sortRecordings(recordings, recSortCol, recSortAsc);
+            // The server lists an `mp4` state per recording only when it can
+            // convert them (#241). A state this page is tracking (a
+            // conversion it started) wins over a stale listing.
+            mp4Available = recordings.some(function(r) { return 'mp4' in r; });
+            recordings.forEach(function(r) {
+                if ('mp4' in r && !mp4Polling[r.name]) mp4State[r.name] = r.mp4;
+            });
             renderRecPage();
+        }
+
+        // ── MP4 downloads (#241) ──
+        // Start a conversion, show its progress on the button by polling the
+        // status, and download the file as soon as it is ready. Downloads go
+        // through fetch so API-key sessions send their header, and are saved
+        // with a.download, never opened as a page.
+        var mp4Available = false;
+        var mp4State = {};      // recording name -> none|running|ready|failed
+        var mp4Polling = {};    // recording name -> true while this page polls
+        var MP4_LABELS = { running: 'converting\u2026', ready: 'mp4 \u2193', failed: 'mp4 (retry)' };
+
+        function mp4Button(name) {
+            var st = mp4State[name] || 'none';
+            return '<button class="btn-small btn-mp4" data-mp4="' + escapeAttr(name) + '"' +
+                (st === 'running' ? ' disabled' : '') +
+                ' title="Download as an MP4 video that plays anywhere">' +
+                (MP4_LABELS[st] || 'mp4') + '</button>';
+        }
+
+        function setMp4State(name, st) {
+            mp4State[name] = st;
+            var btn = document.querySelector('[data-mp4="' + CSS.escape(name) + '"]');
+            if (btn) btn.outerHTML = mp4Button(name);
+        }
+
+        function mp4Url(name, suffix) {
+            return '/api/recordings/' + encodeURIComponent(name) + '/mp4' + (suffix || '');
+        }
+
+        function downloadMp4(name) {
+            fetch(mp4Url(name), { headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) {
+                if (!res.ok) throw new Error('The MP4 is no longer available; convert it again.');
+                return res.blob();
+            })
+            .then(function(blob) {
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = name.replace(/\.guac$/, '') + '.mp4';
+                a.click();
+                setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+            })
+            .catch(function(err) { setMp4State(name, 'none'); rgAlert(err.message); });
+        }
+
+        function pollMp4(name) {
+            mp4Polling[name] = true;
+            fetch(mp4Url(name, '/status'), { headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (data.state === 'running') { setTimeout(function() { pollMp4(name); }, 2000); return; }
+                delete mp4Polling[name];
+                setMp4State(name, data.state);
+                if (data.state === 'ready') downloadMp4(name);
+                else if (data.state === 'failed') rgAlert('MP4 conversion failed: ' + (data.error || 'unknown error'));
+            })
+            .catch(function() { setTimeout(function() { pollMp4(name); }, 5000); });
+        }
+
+        function startMp4(name) {
+            if (mp4State[name] === 'ready') { downloadMp4(name); return; }
+            setMp4State(name, 'running');
+            fetch(mp4Url(name), { method: 'POST', headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { return res.json().then(function(data) { return { res: res, data: data }; }); })
+            .then(function(r) {
+                if (r.res.status === 200 && r.data.state === 'ready') { setMp4State(name, 'ready'); downloadMp4(name); return; }
+                if (r.res.status === 202) { pollMp4(name); return; }
+                setMp4State(name, 'none');
+                rgAlert(r.data.error || 'Could not start the MP4 conversion.');
+            })
+            .catch(function() { setMp4State(name, 'none'); rgAlert('Could not start the MP4 conversion.'); });
         }
 
         function renderRecPage() {
@@ -465,7 +544,7 @@
                 sortHeader('Folder', 'folder') +
                 sortHeader('Size', 'size_bytes') +
                 sortHeader('Date', 'modified') +
-                '<th></th><th></th><th></th>' +
+                '<th></th><th></th>' + (mp4Available ? '<th></th>' : '') + '<th></th>' +
                 '</tr></thead><tbody>';
             slice.forEach(function(r) {
                 var date = r.modified ? new Date(r.modified).toLocaleString() : (r.created_at ? new Date(r.created_at).toLocaleString() : '');
@@ -480,6 +559,7 @@
                     '<td>' + date + '</td>' +
                     '<td><button class="btn-small" data-play="' + escapeAttr(r.name) + '">play</button></td>' +
                     '<td><a class="btn-small" href="/api/recordings/' + encodeURIComponent(r.name) + '" download="' + escapeAttr(r.name) + '">download</a></td>' +
+                    (mp4Available ? '<td>' + mp4Button(r.name) + '</td>' : '') +
                     '<td><button class="btn-small btn-delete" data-delete-rec="' + escapeAttr(r.name) + '">delete</button></td>' +
                     '</tr>';
             });
@@ -504,6 +584,11 @@
             var playName = e.target.getAttribute('data-play');
             if (playName) {
                 playRecording(playName);
+                return;
+            }
+            var mp4Name = e.target.getAttribute('data-mp4');
+            if (mp4Name) {
+                startMp4(mp4Name);
                 return;
             }
             var deleteName = e.target.getAttribute('data-delete-rec');
