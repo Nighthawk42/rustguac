@@ -167,7 +167,10 @@
                     return;
                 }
                 if (!data || typeof data.version !== 'number') { if (!cachedOk) fetchIndex(null); return; }
-                var v = data.version;
+                // The counter starts again at 0 when the server restarts, so a
+                // version alone could match an index cached before the
+                // restart: key the cache to the server process (epoch) too.
+                var v = (data.epoch != null ? data.epoch + ':' : '') + data.version;
                 if (cachedOk && String(v) === String(knownVersion)) return; // up to date
                 fetchIndex(v);
             })
@@ -187,6 +190,11 @@
         checkVersion(!!cached);                                    // refresh only if changed
         if (!pollTimer) pollTimer = setInterval(function () { if (!document.hidden) checkVersion(true); }, 30000);
     }
+
+    // The connections page's live refresh knows the moment the address book
+    // changes; it calls this so the index is checked now rather than at the
+    // next 30 s poll.
+    window.rgSearchRecheck = function () { if (searchIndex) checkVersion(true); };
 
     function setEngaged(on) {
         if (searchEngaged === on) return;

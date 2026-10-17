@@ -213,3 +213,27 @@ test('without a change counter on the server the index is reloaded on each page,
     await expect(page.locator('#rg-search')).toBeEnabled();
     expect(fetches()).toBe(2);                 // but a fresh copy on the next page
 });
+
+// The version counter starts again at 0 when the server restarts, so the same
+// number can name a different address book. The cached index is keyed to the
+// server process (epoch) as well, and a restart re-fetches it.
+test('a server restart at the same version re-fetches the cached index', async ({ page }) => {
+    let epoch = 111;
+    const api = await installApi(page, { routes: {
+        'GET /api/addressbook/version': () => ({ version: 1, changed_at: 0, epoch, changes: [] })
+    } });
+    const fetches = () => api.calls.filter(c => c.path === '/api/addressbook/search-index').length;
+    await page.goto('/recordings.html');
+    await settle(page);
+    await expect(page.locator('#rg-search')).toBeEnabled();
+    expect(fetches()).toBe(1);
+    // Same process: the cache is current, nothing is fetched.
+    await page.goto('/sessions.html');
+    await settle(page);
+    expect(fetches()).toBe(1);
+    // Restarted: same version number, new epoch.
+    epoch = 222;
+    await page.goto('/reports.html');
+    await settle(page);
+    await expect.poll(fetches).toBe(2);
+});
