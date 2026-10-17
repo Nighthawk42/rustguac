@@ -30,8 +30,13 @@ pub async fn create_session(
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     let identity = identity.map(|Extension(id)| id);
-    // Ad-hoc targets from anyone below admin get every network fence.
-    req.fence_all_targets = !identity.as_ref().is_some_and(|id| id.has_role("admin"));
+    // Ad-hoc targets from anyone below admin get every network fence, and
+    // none of the fields only a saved entry may set.
+    let is_admin = identity.as_ref().is_some_and(|id| id.has_role("admin"));
+    req.fence_all_targets = !is_admin;
+    if !is_admin {
+        req.clear_entry_only_fields();
+    }
     let caller_name = identity
         .as_ref()
         .map(|id| id.display_name().to_string())

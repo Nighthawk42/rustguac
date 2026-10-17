@@ -210,6 +210,25 @@ pub struct CreateSessionRequest {
 }
 
 impl CreateSessionRequest {
+    /// Forget every field that only a saved Connections entry may set, for an
+    /// ad-hoc request from anyone below admin. These name the entry the
+    /// session belongs to and carry its admin's policy:
+    ///
+    /// - `address_book_entry` / `address_book_folder` / `entry_display_name`
+    ///   attribute the session and its recording to an entry. Claimed by an
+    ///   ad-hoc caller together with `max_recordings`, per-entry rotation
+    ///   would delete that entry's older recordings when the session ended.
+    /// - `max_recordings` is that rotation limit.
+    /// - `record_typescript` writes a plaintext terminal log; it is an
+    ///   admin's choice per entry, not the caller's.
+    pub fn clear_entry_only_fields(&mut self) {
+        self.address_book_entry = None;
+        self.address_book_folder = None;
+        self.entry_display_name = None;
+        self.max_recordings = None;
+        self.record_typescript = None;
+    }
+
     /// Fields that only say how the session is drawn in this browser, not
     /// what it connects to or how. Two requests that differ only in these
     /// would open the same session, so they are left out of
@@ -2792,6 +2811,33 @@ pub(crate) fn check_share_token_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_hoc_requests_cannot_claim_an_entry() {
+        // A poweruser's ad-hoc request naming a real entry and a rotation
+        // limit of 1 would have deleted that entry's older recordings when
+        // the session ended.
+        let mut req: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "session_type": "ssh",
+            "hostname": "10.0.0.1",
+            "address_book_entry": "shared/prod/db01",
+            "address_book_folder": "prod",
+            "entry_display_name": "db01",
+            "max_recordings": 1,
+            "record_typescript": true,
+            "enable_recording": true
+        }))
+        .unwrap();
+        req.clear_entry_only_fields();
+        assert_eq!(req.address_book_entry, None);
+        assert_eq!(req.address_book_folder, None);
+        assert_eq!(req.entry_display_name, None);
+        assert_eq!(req.max_recordings, None);
+        assert_eq!(req.record_typescript, None);
+        // What the caller may choose is left alone.
+        assert_eq!(req.hostname.as_deref(), Some("10.0.0.1"));
+        assert_eq!(req.enable_recording, Some(true));
+    }
 
     #[test]
     fn vdi_username_must_be_a_plain_name() {
