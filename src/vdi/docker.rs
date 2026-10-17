@@ -560,14 +560,32 @@ impl DockerDriver {
                 // Persistent home directory bind mount
                 let binds = if let Some(ref base) = spec.home_base {
                     let base_path = std::path::Path::new(base);
-                    let host_path = base_path.join(&spec.username);
-                    // Verify no path traversal (username is sanitized but belt-and-suspenders)
-                    if !host_path.starts_with(base_path) {
-                        return Err(VdiError::Docker("path traversal in home_base".into()));
+                    // The username is validated where the session is made;
+                    // this is the second line of defence. A plain name has
+                    // exactly one normal path component, so `..`, `/` and an
+                    // absolute path never get this far.
+                    let mut parts = std::path::Path::new(&spec.username).components();
+                    if !matches!(
+                        (parts.next(), parts.next()),
+                        (Some(std::path::Component::Normal(_)), None)
+                    ) {
+                        return Err(VdiError::Docker(
+                            "invalid VDI username for home_base".into(),
+                        ));
                     }
-                    // Ensure host directory exists
+                    let host_path = base_path.join(&spec.username);
                     if let Err(e) = std::fs::create_dir_all(&host_path) {
                         tracing::warn!(path = ?host_path, "Failed to create VDI home dir: {}", e);
+                    }
+                    // And compare real paths, so a symlink inside home_base
+                    // cannot point the mount somewhere else either.
+                    match (base_path.canonicalize(), host_path.canonicalize()) {
+                        (Ok(b), Ok(h)) if h.starts_with(&b) && h != b => {}
+                        _ => {
+                            return Err(VdiError::Docker(
+                                "VDI home directory is outside home_base".into(),
+                            ))
+                        }
                     }
                     let mount = format!(
                         "{}:/home/{}:nosuid,nodev",

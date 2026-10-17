@@ -1591,6 +1591,18 @@ impl SessionManager {
                 // are scoped per-operator. When the override is set the same
                 // container is shared by everyone connecting with that entry,
                 // which is the desired behaviour for shared baked-in accounts.
+                // The username names the container and the home directory
+                // under `home_base`, so an override must be a plain name: a
+                // `../` here would bind-mount any host directory.
+                if let Some(name) = req.container_username.as_deref().filter(|s| !s.is_empty()) {
+                    if !valid_vdi_username(name) {
+                        return Err(SessionError::ValidationError(
+                            "container_username must be 1-32 letters, digits, '.', '_' or '-', \
+                             not starting with '.' or '-'"
+                                .into(),
+                        ));
+                    }
+                }
                 let vdi_username = req
                     .container_username
                     .as_ref()
@@ -2704,6 +2716,20 @@ fn drive_cleanup_settings(drive: &Option<DriveConfig>) -> (bool, u64) {
     }
 }
 
+/// A VDI container username: it becomes the container name suffix and a
+/// directory under `home_base`, so only a plain name is accepted. Letters,
+/// digits, '.', '_' and '-', at most 32 characters (the Linux limit), not
+/// starting with '.' or '-' (which rules out `.` and `..`).
+pub(crate) fn valid_vdi_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     GuacdConnection(String),
@@ -2766,6 +2792,32 @@ pub(crate) fn check_share_token_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vdi_username_must_be_a_plain_name() {
+        // It becomes a directory under home_base that is bind-mounted into the
+        // container, so anything that could leave home_base is refused.
+        for ok in ["alice", "svc.backup", "j_smith-2", "A1", &"a".repeat(32)] {
+            assert!(valid_vdi_username(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../../etc",
+            "../root",
+            "a/b",
+            "/etc",
+            ".hidden",
+            "-rf",
+            "a b",
+            "a\\b",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert!(!valid_vdi_username(bad), "{bad:?} should be refused");
+        }
+    }
 
     // ── Typescript filename templating (#159) ──
 
