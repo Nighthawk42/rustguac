@@ -110,7 +110,7 @@ cmd_build_guacd() {
             --with-rdp \
             --with-spice \
             --without-telnet \
-            --without-kubernetes \
+            --disable-kubernetes \
             --disable-guacenc \
             --disable-guaclog \
             --disable-guacclip \

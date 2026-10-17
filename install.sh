@@ -205,7 +205,7 @@ build_guacd() {
         --with-rdp \
         --with-spice \
         --without-telnet \
-        --without-kubernetes \
+        --disable-kubernetes \
         --disable-guacenc \
         --disable-guaclog \
         --disable-guacclip \
@@ -216,6 +216,7 @@ build_guacd() {
 
     info "Installing guacd to $PREFIX..."
     make install
+    bash "$SCRIPT_DIR/scripts/check-guacd-plugins.sh" "$PREFIX/lib"
 
     # Verify FreeRDP plugins were installed (required for drive redirection + audio)
     local freerdp_plugin_dir

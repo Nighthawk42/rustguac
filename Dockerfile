@@ -43,6 +43,7 @@ RUN git clone https://github.com/apache/guacamole-server.git \
 
 # Apply patches for FreeRDP 3.x / Debian 13 compatibility
 COPY patches/ /build/patches/
+COPY scripts/check-guacd-plugins.sh /build/
 WORKDIR /build/guacamole-server
 RUN for patch in /build/patches/*.patch; do \
         [ -f "$patch" ] || continue; \
@@ -60,16 +61,17 @@ RUN /build/guacamole-server/configure \
         --with-rdp \
         --with-spice \
         --without-telnet \
-        --without-kubernetes \
+        --disable-kubernetes \
         --disable-guacenc \
         --disable-guaclog \
         --disable-guacclip \
         --disable-static \
     && make -j"$(nproc)" \
     && make install \
+    && bash /build/check-guacd-plugins.sh /opt/rustguac/lib \
     && mkdir -p /opt/rustguac/lib/freerdp3 \
     && cp /opt/rustguac/lib/libguac*.so* /opt/rustguac/lib/freerdp3/ \
-    && cp /usr/lib/x86_64-linux-gnu/freerdp3/libguac*.so* /opt/rustguac/lib/freerdp3/ 2>/dev/null || true
+    && { cp /usr/lib/x86_64-linux-gnu/freerdp3/libguac*.so* /opt/rustguac/lib/freerdp3/ 2>/dev/null || true; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: Build rustguac

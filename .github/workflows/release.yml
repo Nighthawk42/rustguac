@@ -34,7 +34,7 @@ jobs:
             libpango1.0-dev libpulse-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libcunit1-dev libtelnet-dev libwebsockets-dev \
-            uuid-dev freerdp3-dev \
+            uuid-dev freerdp3-dev libspice-client-glib-2.0-dev \
             dpkg-dev debhelper fakeroot build-essential
 
       - name: Install Rust
@@ -54,11 +54,14 @@ jobs:
           mkdir /tmp/guacd-build && cd /tmp/guacd-build
           /tmp/guacamole-server/configure \
             --prefix=/opt/rustguac \
-            --with-ssh --with-vnc --with-rdp \
-            --without-telnet --without-kubernetes \
+            --with-ssh --with-vnc --with-rdp --with-spice \
+            --without-telnet --disable-kubernetes \
             --disable-guacenc --disable-guaclog --disable-static
           make -j"$(nproc)"
           make DESTDIR="$GITHUB_WORKSPACE/debian/staging" install
+          # guacd's configure skips a protocol whose library is missing, even
+          # when asked for it, so check every one rustguac needs was built.
+          bash "$GITHUB_WORKSPACE/scripts/check-guacd-plugins.sh" "$GITHUB_WORKSPACE/debian/staging/opt/rustguac/lib"
 
       - name: Build rustguac
         run: $HOME/.cargo/bin/cargo build --release
@@ -139,7 +142,7 @@ jobs:
             libpango1.0-dev libpulse-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libcunit1-dev libtelnet-dev libwebsockets-dev \
-            uuid-dev freerdp3-dev \
+            uuid-dev freerdp3-dev libspice-client-glib-2.0-dev \
             dpkg-dev debhelper fakeroot build-essential
 
       - name: Install Rust
@@ -159,11 +162,14 @@ jobs:
           mkdir /tmp/guacd-build && cd /tmp/guacd-build
           /tmp/guacamole-server/configure \
             --prefix=/opt/rustguac \
-            --with-ssh --with-vnc --with-rdp \
-            --without-telnet --without-kubernetes \
+            --with-ssh --with-vnc --with-rdp --with-spice \
+            --without-telnet --disable-kubernetes \
             --disable-guacenc --disable-guaclog --disable-static
           make -j"$(nproc)"
           make DESTDIR="$GITHUB_WORKSPACE/debian/staging" install
+          # guacd's configure skips a protocol whose library is missing, even
+          # when asked for it, so check every one rustguac needs was built.
+          bash "$GITHUB_WORKSPACE/scripts/check-guacd-plugins.sh" "$GITHUB_WORKSPACE/debian/staging/opt/rustguac/lib"
 
       - name: Build rustguac
         run: $HOME/.cargo/bin/cargo build --release
