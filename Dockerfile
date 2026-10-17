@@ -62,7 +62,6 @@ RUN /build/guacamole-server/configure \
         --with-spice \
         --without-telnet \
         --disable-kubernetes \
-        --disable-guacenc \
         --disable-guaclog \
         --disable-guacclip \
         --disable-static \
@@ -111,6 +110,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install guacd
 COPY --from=guacd-builder /opt/rustguac/sbin/ /opt/rustguac/sbin/
+# guacenc converts recordings to video for MP4 downloads
+COPY --from=guacd-builder /opt/rustguac/bin/guacenc /opt/rustguac/bin/guacenc
 COPY --from=guacd-builder /opt/rustguac/lib/ /opt/rustguac/lib/
 
 # Install rustguac binary

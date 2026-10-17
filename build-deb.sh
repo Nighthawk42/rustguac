@@ -122,7 +122,6 @@ build_guacd() {
         --with-spice \
         --without-telnet \
         --disable-kubernetes \
-        --disable-guacenc \
         --disable-guaclog \
         --disable-guacclip \
         --disable-static

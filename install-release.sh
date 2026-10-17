@@ -66,6 +66,9 @@ mkdir -p "$PREFIX"/{bin,sbin,lib,static,data,recordings,tls}
 # Binaries
 install -m 755 "$SCRIPT_DIR/bin/rustguac" "$PREFIX/bin/rustguac"
 install -m 755 "$SCRIPT_DIR/sbin/guacd"   "$PREFIX/sbin/guacd"
+# guacenc converts recordings to video for MP4 downloads (absent from
+# tarballs built before 1.11.1)
+[[ -f "$SCRIPT_DIR/bin/guacenc" ]] && install -m 755 "$SCRIPT_DIR/bin/guacenc" "$PREFIX/bin/guacenc"
 
 # Libraries
 cp -a "$SCRIPT_DIR/lib/"*.so* "$PREFIX/lib/"
