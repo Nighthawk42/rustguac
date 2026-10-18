@@ -448,32 +448,55 @@ async fn proxy_ws_guacd(
     let browser_to_guacd =
         tokio::spawn(async move { ws_to_guacd(ws_read, guacd_write, ws_sink_b).await });
 
-    // Wait for either direction to finish, or cancellation
-    let result = tokio::select! {
-        result = guacd_to_browser => {
-            let err = match result {
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(e) => Some(e.to_string()),
-                _ => None,
-            };
-            ProxyResult::GuacdEnded(err)
-        }
-        result = browser_to_guacd => {
-            let err = match result {
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(e) => Some(e.to_string()),
-                _ => None,
-            };
-            ProxyResult::BrowserEnded(err)
-        }
-        _ = cancel.cancelled() => {
-            ProxyResult::Cancelled
-        }
+    // Wait for either direction to finish, or cancellation, then stop both.
+    let result = match race_and_abort(guacd_to_browser, browser_to_guacd, &cancel).await {
+        Race::First(result) => ProxyResult::GuacdEnded(task_error(result)),
+        Race::Second(result) => ProxyResult::BrowserEnded(task_error(result)),
+        Race::Cancelled => ProxyResult::Cancelled,
     };
 
     ProxyOutcome {
         result,
         server_disconnected: server_disconnected.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Which side of `race_and_abort` finished first.
+enum Race<A, B> {
+    First(A),
+    Second(B),
+    Cancelled,
+}
+
+/// Wait for the first of two tasks to finish, or for `cancel`, then abort
+/// both. Dropping a `JoinHandle` only detaches its task, so without the
+/// abort a terminated session (or one whose browser went away) kept both
+/// pump tasks running: traffic still flowed to and from the target and the
+/// guacd connection stayed open until the other side happened to close.
+/// Aborting a task that has already finished does nothing.
+async fn race_and_abort<A, B>(
+    mut first: tokio::task::JoinHandle<A>,
+    mut second: tokio::task::JoinHandle<B>,
+    cancel: &CancellationToken,
+) -> Race<Result<A, tokio::task::JoinError>, Result<B, tokio::task::JoinError>> {
+    let outcome = tokio::select! {
+        r = &mut first => Race::First(r),
+        r = &mut second => Race::Second(r),
+        _ = cancel.cancelled() => Race::Cancelled,
+    };
+    first.abort();
+    second.abort();
+    outcome
+}
+
+/// The error text of a pump task that ended, if it ended badly.
+fn task_error<E: std::fmt::Display>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> Option<String> {
+    match result {
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(e.to_string()),
+        _ => None,
     }
 }
 
@@ -646,6 +669,77 @@ pub(crate) fn origin_host_matches(origin: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task that runs until aborted; `alive` turns false when it is dropped.
+    fn forever(
+        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        // Captured by the future, so dropping the task (polled or not)
+        // drops the flag.
+        let flag = Flag(alive);
+        tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+    }
+
+    async fn gone(alive: &std::sync::atomic::AtomicBool) -> bool {
+        for _ in 0..100 {
+            if !alive.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn terminating_a_session_stops_both_pump_tasks() {
+        // Terminate fires the cancel token. Before, the select dropped the
+        // two task handles, which only detaches them: traffic kept flowing
+        // to the target after the session was "terminated".
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (a, b) = (
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let cancel = CancellationToken::new();
+        let race = tokio::spawn({
+            let (a, b, cancel) = (a.clone(), b.clone(), cancel.clone());
+            async move {
+                matches!(
+                    race_and_abort(forever(a), forever(b), &cancel).await,
+                    Race::Cancelled
+                )
+            }
+        });
+        cancel.cancel();
+        assert!(race.await.unwrap(), "cancellation wins the race");
+        assert!(gone(&a).await, "guacd to browser task stopped");
+        assert!(gone(&b).await, "browser to guacd task stopped");
+    }
+
+    #[tokio::test]
+    async fn one_direction_ending_stops_the_other() {
+        // The browser goes away: its task ends, and the guacd side must not be
+        // left running with the connection open.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let other = Arc::new(AtomicBool::new(true));
+        let ended: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async { Ok(()) });
+        let cancel = CancellationToken::new();
+        let r = race_and_abort(forever(other.clone()), ended, &cancel).await;
+        assert!(matches!(r, Race::Second(Ok(Ok(())))));
+        assert!(gone(&other).await, "the still-running side was stopped");
+    }
 
     fn user(email: &str, role: &str) -> AuthIdentity {
         AuthIdentity::User {

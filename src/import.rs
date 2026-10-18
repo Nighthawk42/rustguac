@@ -188,6 +188,16 @@ pub async fn cmd_import_guacamole(
             proxmox_token_secret: None,
             proxmox_verify_tls: None,
             max_monitors: None,
+            ssh_font_size: param_map.get("font-size").and_then(|s| s.parse().ok()),
+            wol_send_packet: param_map
+                .get("wol-send-packet")
+                .map(|s| s.eq_ignore_ascii_case("true")),
+            wol_mac_addr: param_map.get("wol-mac-addr").map(|s| s.to_string()),
+            wol_broadcast_addr: param_map.get("wol-broadcast-addr").map(|s| s.to_string()),
+            wol_udp_port: param_map.get("wol-udp-port").and_then(|s| s.parse().ok()),
+            wol_wait_time: param_map.get("wol-wait-time").and_then(|s| s.parse().ok()),
+            // A Guacamole dump is a one-off import, not a sync source.
+            external_id: None,
         };
 
         if !cred_maps.is_empty()
@@ -277,10 +287,10 @@ pub async fn cmd_import_guacamole(
         }
     };
 
-    let secret_id = match std::env::var("VAULT_SECRET_ID") {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            eprintln!("Error: VAULT_SECRET_ID env var required");
+    let secret_id = match vault_config.login_secret("VAULT_SECRET_ID") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
             std::process::exit(1);
         }
     };
@@ -299,7 +309,9 @@ pub async fn cmd_import_guacamole(
     // to write identical allowed_groups on every child.
     let root_config = FolderConfig {
         allowed_groups: allowed_groups.to_vec(),
+        allowed_users: Vec::new(),
         description: "Imported from Guacamole".to_string(),
+        display_name: String::new(),
         inherit_from_parent: false,
     };
     if let Err(e) = client.put_folder_config(scope, folder, &root_config).await {
@@ -328,7 +340,9 @@ pub async fn cmd_import_guacamole(
         let full = format!("{}/{}", folder, sub);
         let cfg = FolderConfig {
             allowed_groups: vec![],
+            allowed_users: Vec::new(),
             description: format!("Imported from Guacamole: {}", sub),
+            display_name: String::new(),
             inherit_from_parent: true,
         };
         if let Err(e) = client.put_folder_config(scope, &full, &cfg).await {
@@ -898,70 +912,7 @@ mod tests {
     fn test_deduplicate_names() {
         let entry = || AddressBookEntry {
             session_type: "ssh".into(),
-            hostname: None,
-            port: None,
-            username: None,
-            password: None,
-            private_key: None,
-            url: None,
-            domain: None,
-            security: None,
-            server_layout: None,
-            ignore_cert: None,
-            display_name: None,
-            enable_drive: None,
-            auth_pkg: None,
-            kdc_url: None,
-            prompt_credentials: None,
-            color_depth: None,
-            jump_hosts: None,
-            jump_host: None,
-            jump_port: None,
-            jump_username: None,
-            jump_password: None,
-            jump_private_key: None,
-            remote_app: None,
-            remote_app_dir: None,
-            remote_app_args: None,
-            enable_recording: None,
-            max_recordings: None,
-            record_typescript: None,
-            login_script: None,
-            autofill: None,
-            allowed_domains: None,
-            disable_copy: None,
-            disable_paste: None,
-            banner: None,
-            enable_gfx: None,
-            enable_desktop_composition: None,
-            enable_wallpaper: None,
-            enable_theming: None,
-            enable_full_window_drag: None,
-            force_lossless: None,
-            enable_h264: None,
-            container_image: None,
-            container_cpu_limit: None,
-            container_memory_limit: None,
-            container_env: None,
-            container_username: None,
-            container_password: None,
-            container_idle_timeout_mins: None,
-            allow_sharing: None,
-            auto_open_if_singleton: None,
-            fullscreen_on_connect: None,
-            autohide_side_tabs: None,
-            spice_tls: None,
-            spice_tls_port: None,
-            spice_ca_cert: None,
-            spice_cert_subject: None,
-            spice_proxy: None,
-            proxmox_url: None,
-            proxmox_node: None,
-            proxmox_vmid: None,
-            proxmox_token_id: None,
-            proxmox_token_secret: None,
-            proxmox_verify_tls: None,
-            max_monitors: None,
+            ..Default::default()
         };
         let mut entries = vec![
             (("".into(), "web".into()), entry()),

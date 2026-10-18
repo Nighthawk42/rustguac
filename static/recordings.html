@@ -2,7 +2,6 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>rustguac - Recordings</title>
     <link rel="stylesheet" href="/rustguac.css">
     <style>
@@ -103,10 +102,30 @@
         #player-time { color: var(--text-muted); font-size: var(--fz-sm); white-space: nowrap; }
         .btn-delete { color: var(--primary); }
         .btn-delete:hover { color: var(--primary-hover); }
+        /* Long names, emails and folder paths wrap inside their cell instead
+           of widening the table past the page: a dotted FQDN has no natural
+           break point (#252). The action buttons stay on one line. */
+        #recording-list td { overflow-wrap: anywhere; }
+        #recording-list td:last-child { overflow-wrap: normal; }
+
+        /* Narrow desktops (a 1710px MacBook display): the 18px table with
+           20px cell padding ran past the right edge. Same treatment as the
+           connections table: 16px cells, tighter padding, 14px headers, and
+           the actions kept on one line. Nothing is hidden. */
+        @media (max-width: 1800px) {
+            table th, table td {
+                padding: var(--s-2) var(--s-3);
+                font-size: var(--fz-sm);
+            }
+            table th { font-size: var(--fz-xs); letter-spacing: 0.08em; }
+            table td:last-child { white-space: nowrap; }
+            .btn-small { padding: 0 var(--s-1); }
+        }
     </style>
     <script>(function(){var c=localStorage.getItem('rustguac_theme_colors');if(c){try{var o=JSON.parse(c),r=document.documentElement.style;for(var k in o)r.setProperty('--'+k.replace(/_/g,'-'),o[k]);if(o.bg_pattern&&o.bg_pattern!=='none'){var s=document.createElement('style');s.id='bg-pattern-style';s.textContent='body{background-image:'+o.bg_pattern+';background-attachment:fixed}';document.head.appendChild(s)}}catch(e){}}})();</script>
 
     <!-- Guacamole JS modules (same as client.html) -->
+    <script src="/filters.js"></script>
     <script src="/guac/Namespace.js"></script>
     <script src="/guac/Client.js"></script>
     <script src="/guac/Display.js"></script>
@@ -142,7 +161,6 @@
     <script src="/guac/Object.js"></script>
     <script src="/guac/RawAudioFormat.js"></script>
     <script src="/guac/SessionRecording.js"></script>
-    <script src="/theme-switcher.js"></script>
 </head>
 <body>
     <div class="brand-row">
@@ -151,16 +169,15 @@
     </div>
     <nav>
         <a href="/connections.html">Connections</a>
-        <a href="/sessions.html" id="sessions-link">Sessions</a>
+        <a href="/sessions.html" id="sessions-link" data-min-role="poweruser">Sessions</a>
         <a href="/recordings.html" class="active">Recordings</a>
-        <a href="/reports.html" id="reports-link" style="display:none">Reports</a>
+        <a href="/reports.html" id="reports-link" data-min-role="poweruser">Reports</a>
         <a href="/docs.html">Docs</a>
-        <a href="/tokens.html" id="tokens-link" style="display:none">Tokens</a>
-        <a href="/admin.html" id="admin-link" style="display:none">Admin</a>
-        <span id="user-menu-wrapper"><div id="theme-switcher"></div><span id="user-menu-btn" title="Preferences">&#9881; Settings</span><a href="#" id="logout-item">Logout</a></span>
+        <a href="/tokens.html" id="tokens-link" data-min-role="operator">Tokens</a>
+        <a href="/admin.html" id="admin-link" data-min-role="admin">Admin</a>
+        <a href="/connections.html#my-credentials" id="my-creds-nav" title="Manage your saved credential variables"><span class="nav-key">&#128273;</span> Credentials</a>
+        <span id="user-menu-wrapper"><a href="#" id="logout-item">Logout</a><span id="user-menu-btn" title="Preferences">&#9881; Settings</span><div id="user-menu"><div class="um-section-label">Theme</div><div id="um-theme-list"></div></div></span>
     </nav>
-
-    <h2>Recordings</h2>
 
     <div id="player-section">
         <div id="player-header">
@@ -179,7 +196,10 @@
     </div>
 
     <div style="max-width:1200px;margin-bottom:1em">
-        <input type="text" id="rec-search" placeholder="Search recordings (user, entry, folder...)" style="width:100%;padding:0.5em;background:var(--input);border:1px solid var(--border);color:var(--text);font-family:monospace;font-size:1em;border-radius:3px;box-sizing:border-box">
+        <div class="list-tools">
+            <input type="text" id="rec-search" placeholder="Search recordings (user, entry, folder&#8230;)" class="list-search">
+            <div id="rec-filters"></div>
+        </div>
     </div>
     <div id="recording-list"></div>
     <div id="rec-pagination" style="max-width:1200px;margin-top:0.8em;font-family:monospace;font-size:0.9em"></div>
@@ -201,14 +221,8 @@
         function applyThemeColors(colors){var r=document.documentElement.style;for(var k in colors)r.setProperty('--'+k.replace(/_/g,'-'),colors[k]);var s=document.getElementById('bg-pattern-style');if(!s){s=document.createElement('style');s.id='bg-pattern-style';document.head.appendChild(s)}s.textContent=colors.bg_pattern&&colors.bg_pattern!=='none'?'body{background-image:'+colors.bg_pattern+';background-attachment:fixed}':'';localStorage.setItem('rustguac_theme_colors',JSON.stringify(colors))}
         var _themePresets={},_adminPreset='aurora';
         var _themeDescriptions={dark:'Navy & cyan \u2014 the default',light:'Clean white & blue','high-contrast':'Maximum readability',terminal:'Retro green-on-black',nord:'Arctic, muted blues',corporate:'Slate & steel blue',aurora:'Midnight blue with ambient glow',jaguar:'Racing green & gold'};
-        function initTheme(t){
-    if(t && t.logo_url){
-        var l = document.getElementById('site-logo');
-        if(l){ if(l.src !== t.logo_url && !l.src.endsWith(t.logo_url)) l.src = t.logo_url; l.style.display = ''; }
-    }
-    if(window.renderThemeSwitcher) window.renderThemeSwitcher('theme-switcher');
-}
-        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();if(window.openSettingsModal)window.openSettingsModal();});
+        function initTheme(t){if(!t)return;_themePresets=t.presets||{};_adminPreset=t.admin_preset||'aurora';var u=localStorage.getItem('rustguac_theme'),active=u&&_themePresets[u]?u:_adminPreset,colors=(active===_adminPreset)?t.admin_colors:_themePresets[active];if(colors)applyThemeColors(colors);if(t.logo_url){var l=document.getElementById('site-logo');if(l){if(l.src!==t.logo_url&&!l.src.endsWith(t.logo_url))l.src=t.logo_url;l.style.display=''}}var menu=document.getElementById('um-theme-list');if(menu){menu.innerHTML='';Object.keys(_themePresets).forEach(function(name){var item=document.createElement('div');item.className='um-item'+(name===active?' active':'');var sw=document.createElement('span');sw.className='um-swatch';var p=_themePresets[name];sw.style.background='linear-gradient(135deg,'+p.primary+' 50%,'+p.accent+' 50%)';item.appendChild(sw);var info=document.createElement('div');info.className='um-theme-info';var nm=document.createElement('span');nm.className='um-theme-name';nm.textContent=name;info.appendChild(nm);var desc=document.createElement('span');desc.className='um-theme-desc';desc.textContent=_themeDescriptions[name]||'';info.appendChild(desc);item.appendChild(info);item.addEventListener('click',function(){localStorage.setItem('rustguac_theme',name);applyThemeColors(_themePresets[name]);menu.querySelectorAll('.um-item').forEach(function(el){el.classList.remove('active')});item.classList.add('active');document.getElementById('user-menu').style.display='none'});menu.appendChild(item)})}}
+        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.stopPropagation();var m=document.getElementById('user-menu');m.style.display=m.style.display==='block'?'none':'block'});document.addEventListener('click',function(){var m=document.getElementById('user-menu');if(m)m.style.display='none'});
         fetch('/api/auth/status').then(function(r){return r.json()}).then(function(d){
             if(d.site_title){document.title=d.site_title+' - Recordings';document.querySelector('h1').textContent=d.site_title;}
             initTheme(d.theme);
@@ -218,6 +232,8 @@
         // Check auth: either API key or cookie
         var roleLevel = { admin: 4, poweruser: 3, operator: 2, viewer: 1 };
         if (apiKey) {
+            // A key is never on the page GET, so the server served the anonymous variant.
+            document.documentElement.setAttribute('data-role-level', '4');
             document.getElementById('admin-link').style.display = '';
             document.getElementById('tokens-link').style.display = '';
             document.getElementById('reports-link').style.display = '';
@@ -232,6 +248,9 @@
                 if (!data) return;
                 if (data.role === 'admin') document.getElementById('admin-link').style.display = '';
                 var level = roleLevel[data.role] || 0;
+                // Reconcile the server-written nav gate (see rustguac.css): the page
+                // GET carried no API key, so key users arrive on the anonymous variant.
+                document.documentElement.setAttribute('data-role-level', String((typeof apiKey !== 'undefined' && apiKey) ? 4 : level));
                 if (level >= 2) document.getElementById('tokens-link').style.display = '';
                 if (level >= 3) {
                     document.getElementById('reports-link').style.display = '';
@@ -255,6 +274,13 @@
             return h;
         }
 
+        // "host (Tenant)" display names, as the NetBox sync writes them, read
+        // as the host over a quieter tenant line.
+        function entryNameHtml(label) {
+            var m = /^(.*\S)\s+\(([^()]+)\)$/.exec(label || '');
+            if (!m) return escapeHtml(label || '');
+            return '<span class="entry-name">' + escapeHtml(m[1]) + '</span><span class="entry-sub">' + escapeHtml(m[2]) + '</span>';
+        }
         function formatBytes(bytes) {
             if (bytes < 1024) return bytes + ' B';
             if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
@@ -349,9 +375,24 @@
         function recSearchQuery() {
             return (document.getElementById('rec-search').value || '').toLowerCase();
         }
+        // Shared facet filters (filters.js): Type, Folder, User; applied on top
+        // of the text search. Selections persist in sessionStorage for this tab.
+        var recFilters = rgFilters.create({
+            mount: document.getElementById('rec-filters'),
+            id: 'recordings',
+            facets: [
+                { key: 'type', label: 'Type', value: function(r) { return r.session_type; },
+                  render: function(v) { return '<span class="type-badge type-' + escapeAttr(v) + '">' + escapeHtml(v) + '</span>'; } },
+                { key: 'folder', label: 'Folder', value: function(r) { return r.folder; } },
+                { key: 'user', label: 'User', value: function(r) { return r.user; } }
+            ],
+            onChange: function() { recPage = 1; renderRecordings(filterRecordings(recSearchQuery())); }
+        });
         function filterRecordings(q) {
-            if (!q) return allRecordings;
-            return allRecordings.filter(function(r) {
+            recFilters.update(allRecordings);
+            var list = recFilters.apply(allRecordings);
+            if (!q) return list;
+            return list.filter(function(r) {
                 return (r.name || '').toLowerCase().indexOf(q) >= 0 ||
                        (r.user || '').toLowerCase().indexOf(q) >= 0 ||
                        (r.entry_display_name || '').toLowerCase().indexOf(q) >= 0 ||
@@ -398,7 +439,86 @@
 
         function renderRecordings(recordings) {
             recView = sortRecordings(recordings, recSortCol, recSortAsc);
+            // The server lists an `mp4` state per recording only when it can
+            // convert them (#241). A state this page is tracking (a
+            // conversion it started) wins over a stale listing.
+            mp4Available = recordings.some(function(r) { return 'mp4' in r; });
+            recordings.forEach(function(r) {
+                if ('mp4' in r && !mp4Polling[r.name]) mp4State[r.name] = r.mp4;
+            });
             renderRecPage();
+        }
+
+        // ── MP4 downloads (#241) ──
+        // Start a conversion, show its progress on the button by polling the
+        // status, and download the file as soon as it is ready. Downloads go
+        // through fetch so API-key sessions send their header, and are saved
+        // with a.download, never opened as a page.
+        var mp4Available = false;
+        var mp4State = {};      // recording name -> none|running|ready|failed
+        var mp4Polling = {};    // recording name -> true while this page polls
+        var MP4_LABELS = { running: 'converting\u2026', ready: 'mp4 \u2193', failed: 'mp4 (retry)' };
+
+        function mp4Button(name) {
+            var st = mp4State[name] || 'none';
+            return '<button class="btn-small btn-mp4" data-mp4="' + escapeAttr(name) + '"' +
+                (st === 'running' ? ' disabled' : '') +
+                ' title="Download as an MP4 video that plays anywhere">' +
+                (MP4_LABELS[st] || 'mp4') + '</button>';
+        }
+
+        function setMp4State(name, st) {
+            mp4State[name] = st;
+            var btn = document.querySelector('[data-mp4="' + CSS.escape(name) + '"]');
+            if (btn) btn.outerHTML = mp4Button(name);
+        }
+
+        function mp4Url(name, suffix) {
+            return '/api/recordings/' + encodeURIComponent(name) + '/mp4' + (suffix || '');
+        }
+
+        function downloadMp4(name) {
+            fetch(mp4Url(name), { headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) {
+                if (!res.ok) throw new Error('The MP4 is no longer available; convert it again.');
+                return res.blob();
+            })
+            .then(function(blob) {
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = name.replace(/\.guac$/, '') + '.mp4';
+                a.click();
+                setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+            })
+            .catch(function(err) { setMp4State(name, 'none'); rgAlert(err.message); });
+        }
+
+        function pollMp4(name) {
+            mp4Polling[name] = true;
+            fetch(mp4Url(name, '/status'), { headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (data.state === 'running') { setTimeout(function() { pollMp4(name); }, 2000); return; }
+                delete mp4Polling[name];
+                setMp4State(name, data.state);
+                if (data.state === 'ready') downloadMp4(name);
+                else if (data.state === 'failed') rgAlert('MP4 conversion failed: ' + (data.error || 'unknown error'));
+            })
+            .catch(function() { setTimeout(function() { pollMp4(name); }, 5000); });
+        }
+
+        function startMp4(name) {
+            if (mp4State[name] === 'ready') { downloadMp4(name); return; }
+            setMp4State(name, 'running');
+            fetch(mp4Url(name), { method: 'POST', headers: apiHeaders(), credentials: 'same-origin' })
+            .then(function(res) { return res.json().then(function(data) { return { res: res, data: data }; }); })
+            .then(function(r) {
+                if (r.res.status === 200 && r.data.state === 'ready') { setMp4State(name, 'ready'); downloadMp4(name); return; }
+                if (r.res.status === 202) { pollMp4(name); return; }
+                setMp4State(name, 'none');
+                rgAlert(r.data.error || 'Could not start the MP4 conversion.');
+            })
+            .catch(function() { setMp4State(name, 'none'); rgAlert('Could not start the MP4 conversion.'); });
         }
 
         function renderRecPage() {
@@ -424,14 +544,14 @@
                 sortHeader('Folder', 'folder') +
                 sortHeader('Size', 'size_bytes') +
                 sortHeader('Date', 'modified') +
-                '<th></th><th></th><th></th>' +
+                '<th></th><th></th>' + (mp4Available ? '<th></th>' : '') + '<th></th>' +
                 '</tr></thead><tbody>';
             slice.forEach(function(r) {
                 var date = r.modified ? new Date(r.modified).toLocaleString() : (r.created_at ? new Date(r.created_at).toLocaleString() : '');
                 var entryName = r.entry_display_name || r.address_book_entry || r.name;
-                var typeBadge = r.session_type ? '<span style="color:var(--type-' + r.session_type + '-fg)">' + r.session_type + '</span>' : '';
+                var typeBadge = r.session_type ? '<span class="type-badge type-' + escapeAttr(r.session_type) + '">' + escapeHtml(r.session_type) + '</span>' : '';
                 html += '<tr>' +
-                    '<td title="' + escapeAttr(r.name) + '">' + escapeHtml(entryName) + '</td>' +
+                    '<td title="' + escapeAttr(r.name) + '">' + entryNameHtml(entryName) + '</td>' +
                     '<td>' + escapeHtml(r.user || '') + '</td>' +
                     '<td>' + typeBadge + '</td>' +
                     '<td>' + escapeHtml(r.folder || '') + '</td>' +
@@ -439,6 +559,7 @@
                     '<td>' + date + '</td>' +
                     '<td><button class="btn-small" data-play="' + escapeAttr(r.name) + '">play</button></td>' +
                     '<td><a class="btn-small" href="/api/recordings/' + encodeURIComponent(r.name) + '" download="' + escapeAttr(r.name) + '">download</a></td>' +
+                    (mp4Available ? '<td>' + mp4Button(r.name) + '</td>' : '') +
                     '<td><button class="btn-small btn-delete" data-delete-rec="' + escapeAttr(r.name) + '">delete</button></td>' +
                     '</tr>';
             });
@@ -465,19 +586,25 @@
                 playRecording(playName);
                 return;
             }
+            var mp4Name = e.target.getAttribute('data-mp4');
+            if (mp4Name) {
+                startMp4(mp4Name);
+                return;
+            }
             var deleteName = e.target.getAttribute('data-delete-rec');
             if (deleteName) {
-                if (!confirm('Delete recording ' + deleteName + '?')) return;
-                fetch('/api/recordings/' + encodeURIComponent(deleteName), {
-                    method: 'DELETE',
-                    headers: apiHeaders(),
-                    credentials: 'same-origin'
-                }).then(function() {
-                    refreshRecordings();
-                    // Close player if this recording is playing
-                    if (document.getElementById('player-title').textContent === deleteName) {
-                        closePlayer();
-                    }
+                rgConfirm('Delete recording ' + deleteName + '?', { danger: true, confirmText: 'Delete' }).then(function(ok) {
+                    if (!ok) return;
+                    fetch('/api/recordings/' + encodeURIComponent(deleteName), {
+                        method: 'DELETE',
+                        headers: apiHeaders(),
+                        credentials: 'same-origin'
+                    }).then(function() {
+                        refreshRecordings();
+                        if (document.getElementById('player-title').textContent === deleteName) {
+                            closePlayer();
+                        }
+                    });
                 });
             }
         });
@@ -642,5 +769,7 @@
         setInterval(refreshRecordings, 15000);
         setInterval(refreshTypescripts, 15000);
     </script>
+    <script src="/search.js"></script>
+    <script src="/ui.js"></script>
 </body>
 </html>

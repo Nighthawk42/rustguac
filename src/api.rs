@@ -3,7 +3,7 @@
 use crate::auth::{self, client_ip, role_level, AuthIdentity, TrustedProxies};
 use crate::db::{self, Db};
 use crate::session::{CreateSessionRequest, SessionManager, SessionType};
-use crate::vault::{AddressBookEntry, FolderConfig, VaultClient, VaultError};
+use crate::vault::{AddressBookEntry, DefaultsSource, FolderConfig, VaultClient, VaultError};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Path, Query, State},
@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Extension, Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,8 +30,13 @@ pub async fn create_session(
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     let identity = identity.map(|Extension(id)| id);
-    // Ad-hoc targets from anyone below admin get every network fence.
-    req.fence_all_targets = !identity.as_ref().is_some_and(|id| id.has_role("admin"));
+    // Ad-hoc targets from anyone below admin get every network fence, and
+    // none of the fields only a saved entry may set.
+    let is_admin = identity.as_ref().is_some_and(|id| id.has_role("admin"));
+    req.fence_all_targets = !is_admin;
+    if !is_admin {
+        req.clear_entry_only_fields();
+    }
     let caller_name = identity
         .as_ref()
         .map(|id| id.display_name().to_string())
@@ -822,12 +827,30 @@ pub async fn system_status(
 /// GET /api/auth/status — Returns whether OIDC is enabled. No auth required.
 pub async fn auth_status(
     Extension(oidc_enabled): Extension<OidcEnabled>,
+    Extension(oidc): Extension<OidcHandle>,
     Extension(site_title): Extension<SiteTitle>,
     Extension(theme): Extension<ThemeData>,
     Extension(drive_configured): Extension<DriveConfigured>,
 ) -> impl IntoResponse {
+    // Live provider availability: true once metadata has been discovered and
+    // cached. If OIDC is enabled but not yet ready (provider was down at
+    // startup and nobody has logged in since), kick off a background discovery
+    // so the cache warms and a subsequent poll flips availability — no user
+    // click required for recovery.
+    let oidc_available = match oidc.0 {
+        Some(state) => {
+            let ready = state.is_ready().await;
+            if !ready {
+                state.warm_in_background();
+            }
+            ready
+        }
+        None => false,
+    };
+
     let mut resp = json!({
         "oidc_enabled": oidc_enabled.0,
+        "oidc_available": oidc_available,
         "site_title": site_title.0,
         "drive_configured": drive_configured.0,
     });
@@ -863,6 +886,12 @@ pub struct ThemeData {
 #[derive(Clone)]
 pub struct OidcEnabled(pub bool);
 
+/// Handle to the live OIDC state (`None` when OIDC is not configured). Lets the
+/// status endpoint report current provider *availability* (metadata discovered)
+/// distinct from whether OIDC is merely configured.
+#[derive(Clone)]
+pub struct OidcHandle(pub Option<crate::oidc::OidcState>);
+
 /// Marker for whether Vault is configured (has [vault] in config).
 /// Distinct from VaultState which tracks whether it's currently connected.
 #[derive(Clone)]
@@ -882,6 +911,7 @@ pub struct CredentialDefaultScope(pub String);
 pub async fn list_recordings(
     State(manager): State<AppState>,
     identity: Option<Extension<AuthIdentity>>,
+    mp4: Option<Extension<Arc<crate::recording_mp4::Mp4Converter>>>,
 ) -> impl IntoResponse {
     match &identity {
         Some(Extension(id)) if id.has_role("poweruser") => {}
@@ -894,6 +924,9 @@ pub async fn list_recordings(
         }
     }
     let recording_path = manager.recording_path().to_path_buf();
+    // Each recording's MP4 state (#241), when conversion is available here;
+    // the field is left out otherwise, which is how the page knows.
+    let mp4 = mp4.map(|Extension(c)| c).filter(|c| c.enabled());
 
     match tokio::task::spawn_blocking(move || {
         let mut recordings = Vec::new();
@@ -945,6 +978,9 @@ pub async fn list_recordings(
                 if let Some(ref t) = sidecar.session_type {
                     rec["session_type"] = json!(t);
                 }
+            }
+            if let Some(ref conv) = mp4 {
+                rec["mp4"] = mp4_state_json(&conv.state(&name))["state"].clone();
             }
             recordings.push(rec);
         }
@@ -1072,8 +1108,77 @@ pub struct ReportQuery {
     pub session_type: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// The caller's `Date.getTimezoneOffset()`: minutes to add to local time to
+    /// reach UTC. Makes a zoneless `from`/`to` mean a *local* day, matching the
+    /// local times the Reports page displays. Absent (the scripted case) means
+    /// UTC, so existing callers are unaffected.
+    pub tz_offset: Option<i32>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// Normalize a report date filter into the shape `session_history` stores
+/// ("YYYY-MM-DD HH:MM:SS", UTC), so the string comparison in SQL means what the
+/// caller intended. Returns `Err` with the offending value if it can't be read.
+///
+/// A bare "YYYY-MM-DD" is a whole day: its first second for the lower bound,
+/// its last for the upper, so `to=2026-09-04` includes the 4th rather than
+/// excluding it (the DB values sort after a bare date, so they used to fall
+/// outside). Zoneless values are shifted by `tz_offset_mins`; a value carrying
+/// its own zone is converted from that and ignores the offset.
+fn normalize_report_bound(
+    value: &str,
+    tz_offset_mins: i32,
+    end_of_day: bool,
+) -> Result<String, String> {
+    const STORED: &str = "%Y-%m-%d %H:%M:%S";
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(value.to_string());
+    }
+
+    // Zoned: RFC 3339 / ISO 8601 with Z or an explicit offset.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+        return Ok(dt.with_timezone(&chrono::Utc).format(STORED).to_string());
+    }
+
+    let local: chrono::NaiveDateTime =
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+            let time = if end_of_day {
+                chrono::NaiveTime::from_hms_opt(23, 59, 59)
+            } else {
+                chrono::NaiveTime::from_hms_opt(0, 0, 0)
+            };
+            d.and_time(time.expect("literal time is valid"))
+        } else if let Some(dt) = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"]
+            .iter()
+            .find_map(|f| chrono::NaiveDateTime::parse_from_str(v, f).ok())
+        {
+            dt
+        } else {
+            return Err(value.to_string());
+        };
+
+    // A local wall clock plus its offset-to-UTC is the UTC instant.
+    let utc = local + chrono::Duration::minutes(tz_offset_mins as i64);
+    Ok(utc.format(STORED).to_string())
+}
+
+/// Read `from`/`to` off a report query as stored-format UTC bounds, or name the
+/// parameter that could not be parsed.
+fn report_bounds(q: &ReportQuery) -> Result<(Option<String>, Option<String>), String> {
+    // Beyond any real zone (UTC-12..UTC+14), so a junk value can't shift a
+    // filter into a different year.
+    let tz = q.tz_offset.unwrap_or(0).clamp(-840, 840);
+    let from = match q.from.as_deref() {
+        Some(v) => Some(normalize_report_bound(v, tz, false).map_err(|v| format!("from={}", v))?),
+        None => None,
+    };
+    let to = match q.to.as_deref() {
+        Some(v) => Some(normalize_report_bound(v, tz, true).map_err(|v| format!("to={}", v))?),
+        None => None,
+    };
+    Ok((from, to))
 }
 
 /// GET /api/reports/sessions — Paginated session history with filters. Poweruser+ only.
@@ -1095,13 +1200,23 @@ pub async fn report_sessions(
     }
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.offset.unwrap_or(0);
+    let (from, to) = match report_bounds(&q) {
+        Ok(b) => b,
+        Err(bad) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unparseable date filter: {}", bad)})),
+            )
+                .into_response();
+        }
+    };
     match db::query_session_history(
         &database,
         q.user.as_deref(),
         q.entry.as_deref(),
         q.session_type.as_deref(),
-        q.from.as_deref(),
-        q.to.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         limit,
         offset,
     ) {
@@ -1160,18 +1275,28 @@ pub async fn report_sessions_csv(
         )
             .into_response();
     }
+    let (from, to) = match report_bounds(&q) {
+        Ok(b) => b,
+        Err(bad) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unparseable date filter: {}", bad)})),
+            )
+                .into_response();
+        }
+    };
     match db::query_session_history(
         &database,
         q.user.as_deref(),
         q.entry.as_deref(),
         q.session_type.as_deref(),
-        q.from.as_deref(),
-        q.to.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         100_000,
         0,
     ) {
         Ok((rows, _total)) => {
-            let mut csv = String::from("Session ID,Type,Hostname,Username,User,Entry,Folder,Started,Ended,Duration (secs),Status,Recording\n");
+            let mut csv = String::from("Session ID,Type,Hostname,Username,User,Entry,Folder,Started (UTC),Ended (UTC),Duration (secs),Status,Recording\n");
             for row in &rows {
                 let fields = [
                     row["session_id"].as_str().unwrap_or(""),
@@ -1184,14 +1309,18 @@ pub async fn report_sessions_csv(
                         .or_else(|| row["address_book_entry"].as_str())
                         .unwrap_or(""),
                     row["address_book_folder"].as_str().unwrap_or(""),
-                    row["started_at"].as_str().unwrap_or(""),
-                    row["ended_at"].as_str().unwrap_or(""),
                 ];
                 for (i, f) in fields.iter().enumerate() {
                     if i > 0 {
                         csv.push(',');
                     }
                     csv_escape_into(&mut csv, f);
+                }
+                // Timestamps, marked as UTC. The DB stores them zoneless, which
+                // a spreadsheet reads as local time and silently shifts.
+                for key in ["started_at", "ended_at"] {
+                    csv.push(',');
+                    csv_escape_into(&mut csv, &mark_utc(row[key].as_str().unwrap_or("")));
                 }
                 // duration_secs (numeric)
                 csv.push(',');
@@ -1226,6 +1355,18 @@ pub async fn report_sessions_csv(
 }
 
 /// Escape a field for CSV output: wrap in double quotes if it contains commas, quotes, or newlines.
+/// Tag a zoneless SQLite timestamp ("YYYY-MM-DD HH:MM:SS", always UTC via
+/// `datetime('now')`) as RFC 3339 UTC. Values that already carry a zone, and
+/// anything that doesn't match the expected shape, pass through unchanged.
+fn mark_utc(ts: &str) -> String {
+    let bytes = ts.as_bytes();
+    if bytes.len() == 19 && bytes[10] == b' ' {
+        format!("{}T{}Z", &ts[..10], &ts[11..])
+    } else {
+        ts.to_string()
+    }
+}
+
 fn csv_escape_into(buf: &mut String, field: &str) {
     if field.contains(',') || field.contains('"') || field.contains('\n') {
         buf.push('"');
@@ -1374,6 +1515,144 @@ pub async fn serve_recording(
         .into_response()
 }
 
+/// The check every recording read makes (download, MP4): poweruser or
+/// admin, and a plain `.guac` name inside the recording directory.
+#[allow(clippy::result_large_err)]
+fn check_recording_read(
+    identity: &Option<Extension<AuthIdentity>>,
+    name: &str,
+    recording_dir: &std::path::Path,
+) -> Result<(), Response> {
+    match identity {
+        Some(Extension(id)) if id.has_role("poweruser") => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "requires poweruser or admin role"})),
+            )
+                .into_response())
+        }
+    }
+    if !is_safe_recording_name(name, recording_dir) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid recording name"})),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+fn mp4_state_json(state: &crate::recording_mp4::Mp4State) -> serde_json::Value {
+    use crate::recording_mp4::Mp4State;
+    match state {
+        Mp4State::Unavailable => json!({"state": "unavailable"}),
+        Mp4State::None => json!({"state": "none"}),
+        Mp4State::Running => json!({"state": "running"}),
+        Mp4State::Ready { size_bytes } => json!({"state": "ready", "size_bytes": size_bytes}),
+        Mp4State::Failed(why) => json!({"state": "failed", "error": why}),
+    }
+}
+
+/// POST /api/recordings/{name}/mp4: Start converting a recording to MP4
+/// (#241). Same access as downloading the recording. 202 while it converts,
+/// 200 when a converted copy is already there, 409 while the recording's
+/// session is still live, 503 when conversion is not available here.
+pub async fn start_recording_mp4(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    use crate::recording_mp4::StartOutcome;
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    let who = identity
+        .as_ref()
+        .map(|Extension(id)| id.display_name().to_string())
+        .unwrap_or_default();
+    let live = manager
+        .active_recording_paths()
+        .await
+        .contains(&manager.recording_path().join(&name));
+    match mp4.start(&name, live, &who) {
+        StartOutcome::Started | StartOutcome::AlreadyRunning => {
+            (StatusCode::ACCEPTED, Json(json!({"state": "running"}))).into_response()
+        }
+        StartOutcome::AlreadyReady { size_bytes } => {
+            Json(json!({"state": "ready", "size_bytes": size_bytes})).into_response()
+        }
+        StartOutcome::Live => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "this session is still being recorded; try again once it has ended"})),
+        )
+            .into_response(),
+        StartOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "recording not found"})),
+        )
+            .into_response(),
+        StartOutcome::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "MP4 conversion is not available on this server"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/recordings/{name}/mp4/status: Where a recording's MP4 stands:
+/// `none`, `running`, `ready` (with `size_bytes`), `failed` (with `error`)
+/// or `unavailable`.
+pub async fn recording_mp4_status(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    Json(mp4_state_json(&mp4.state(&name))).into_response()
+}
+
+/// GET /api/recordings/{name}/mp4: Download the converted MP4, once ready.
+pub async fn serve_recording_mp4(
+    State(manager): State<AppState>,
+    Extension(mp4): Extension<Arc<crate::recording_mp4::Mp4Converter>>,
+    identity: Option<Extension<AuthIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    use crate::recording_mp4::Mp4State;
+    if let Err(resp) = check_recording_read(&identity, &name, manager.recording_path()) {
+        return resp;
+    }
+    let not_yet = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no MP4 yet; start one with POST"})),
+        )
+            .into_response()
+    };
+    if !matches!(mp4.state(&name), Mp4State::Ready { .. }) {
+        return not_yet();
+    }
+    let file = match tokio::fs::File::open(mp4.mp4_path(&name)).await {
+        Ok(f) => f,
+        Err(_) => return not_yet(),
+    };
+    let stem = name.strip_suffix(".guac").unwrap_or(&name);
+    axum::response::Response::builder()
+        .header("content-type", "video/mp4")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{}.mp4\"", stem),
+        )
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap()
+        .into_response()
+}
+
 /// DELETE /api/recordings/{name} — Delete a recording file. Requires admin.
 pub async fn delete_recording(
     State(manager): State<AppState>,
@@ -1461,6 +1740,73 @@ pub async fn list_users(
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to list users"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    pub role: String,
+}
+
+/// POST /api/users — Pre-provision a user for OIDC login (needed when
+/// `auto_create_users = false`). Admin only.
+pub async fn create_user(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(database): Extension<Db>,
+    Json(req): Json<CreateUserRequest>,
+) -> impl IntoResponse {
+    if !identity
+        .as_ref()
+        .map(|Extension(id)| id.has_role("admin"))
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin role required"})),
+        )
+            .into_response();
+    }
+
+    let email = req.email.trim().to_string();
+    let name = req.name.trim().to_string();
+    if let Err(msg) = db::check_user_email(&email).and_then(|_| db::check_user_name(&name)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+    if !["admin", "poweruser", "operator", "viewer"].contains(&req.role.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "role must be admin, poweruser, operator, or viewer"})),
+        )
+            .into_response();
+    }
+
+    let db_clone = database.clone();
+    let role = req.role.clone();
+    let admin = identity
+        .as_ref()
+        .map(|Extension(id)| id.display_name().to_string())
+        .unwrap_or_default();
+    let (log_email, log_role) = (email.clone(), role.clone());
+    match tokio::task::spawn_blocking(move || db::create_user(&db_clone, &email, &name, &role))
+        .await
+    {
+        Ok(Ok(user)) => {
+            tracing::info!(admin = %admin, email = %log_email, role = %log_role, "user added");
+            (StatusCode::CREATED, Json(json!(user))).into_response()
+        }
+        Ok(Err(db::CreateUserError::Exists)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "a user with that email already exists (emails match ignoring case)"})),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to create user"})),
         )
             .into_response(),
     }
@@ -2042,6 +2388,19 @@ impl VaultBackends {
             .await
     }
 
+    pub async fn put_entry_if_absent(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<bool, VaultError> {
+        self.scoped(scope)
+            .await?
+            .put_entry_if_absent(scope, folder, entry, data)
+            .await
+    }
+
     pub async fn delete_entry(
         &self,
         scope: &str,
@@ -2077,6 +2436,51 @@ impl VaultBackends {
             .await
     }
 
+    pub async fn get_folder_defaults(
+        &self,
+        scope: &str,
+        folder: &str,
+    ) -> Result<crate::vault::FolderDefaults, VaultError> {
+        self.scoped(scope)
+            .await?
+            .get_folder_defaults(scope, folder)
+            .await
+    }
+
+    pub async fn put_folder_defaults(
+        &self,
+        scope: &str,
+        folder: &str,
+        defaults: &crate::vault::FolderDefaults,
+    ) -> Result<(), VaultError> {
+        self.scoped(scope)
+            .await?
+            .put_folder_defaults(scope, folder, defaults)
+            .await
+    }
+
+    pub async fn delete_folder_defaults(
+        &self,
+        scope: &str,
+        folder: &str,
+    ) -> Result<(), VaultError> {
+        self.scoped(scope)
+            .await?
+            .delete_folder_defaults(scope, folder)
+            .await
+    }
+
+    pub async fn effective_folder_defaults(
+        &self,
+        scope: &str,
+        folder: &str,
+    ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
+        self.scoped(scope)
+            .await?
+            .effective_folder_defaults(scope, folder)
+            .await
+    }
+
     pub async fn delete_folder(
         &self,
         scope: &str,
@@ -2089,11 +2493,11 @@ impl VaultBackends {
         &self,
         scope: &str,
         folder: &str,
-        user_groups: &[String],
+        who: crate::vault::FolderSubject<'_>,
     ) -> Result<bool, VaultError> {
         self.scoped(scope)
             .await?
-            .resolve_folder_access(scope, folder, user_groups)
+            .resolve_folder_access(scope, folder, who)
             .await
     }
 
@@ -2207,6 +2611,28 @@ impl VaultBackends {
     }
 }
 
+/// The defaults walk over the multi-backend router: each read goes to the
+/// backend that serves the scope, like every other folder read here.
+impl DefaultsSource for VaultBackends {
+    async fn folder_defaults(
+        &self,
+        scope: &str,
+        folder: &str,
+    ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
+        self.scoped(scope)
+            .await?
+            .folder_defaults(scope, folder)
+            .await
+    }
+
+    async fn takes_parent_defaults(&self, scope: &str, folder: &str) -> Result<bool, VaultError> {
+        self.scoped(scope)
+            .await?
+            .takes_parent_defaults(scope, folder)
+            .await
+    }
+}
+
 pub type VaultState = Arc<VaultBackends>;
 
 // ── Docs endpoint ──
@@ -2239,11 +2665,8 @@ async fn check_folder_access(
         return Ok(());
     }
 
-    let user_groups = identity.groups();
-    match vault
-        .resolve_folder_access(scope, folder, user_groups)
-        .await
-    {
+    let who = identity.folder_subject();
+    match vault.resolve_folder_access(scope, folder, who).await {
         Ok(true) => Ok(()),
         Ok(false) => Err((
             StatusCode::FORBIDDEN,
@@ -2276,11 +2699,11 @@ fn folder_or_descendant_accessible<'a>(
     vault: &'a VaultBackends,
     scope: &'a str,
     path: &'a str,
-    user_groups: &'a [String],
+    who: crate::vault::FolderSubject<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
         if vault
-            .resolve_folder_access(scope, path, user_groups)
+            .resolve_folder_access(scope, path, who)
             .await
             .unwrap_or(false)
         {
@@ -2290,7 +2713,7 @@ fn folder_or_descendant_accessible<'a>(
         if let Ok(subs) = vault.list_subfolders(scope, path).await {
             for sub in subs {
                 let child = sub.path.unwrap_or(sub.name);
-                if folder_or_descendant_accessible(vault, scope, &child, user_groups).await {
+                if folder_or_descendant_accessible(vault, scope, &child, who).await {
                     return true;
                 }
             }
@@ -2326,18 +2749,15 @@ pub async fn ab_list_folders(
         }
     };
 
-    // Filter by group access (admins see all).
-    // Top-level folders have no parent so the resolver's inheritance walk is
-    // effectively a single-folder check here, but we go through the resolver
-    // to keep access logic in one place.
-    let user_groups = id.groups();
+    // Filter by access (admins see all). A top-level folder is shown if the
+    // user can open it OR it is on the path to a subfolder they can: access
+    // granted only to `users/jsmith` must still be reachable from the tree.
+    // The folder's own entries stay refused by the per-folder check.
+    let who = id.folder_subject();
     let mut visible = Vec::new();
     for folder in folders {
         if id.has_role("admin")
-            || vault
-                .resolve_folder_access(&folder.scope, &folder.name, user_groups)
-                .await
-                .unwrap_or(false)
+            || folder_or_descendant_accessible(&vault, &folder.scope, &folder.name, who).await
         {
             visible.push(folder);
         }
@@ -2363,8 +2783,18 @@ pub async fn ab_list_subfolders(
         }
     };
 
-    if let Err(resp) = check_folder_access(&vault, &scope, &folder, id).await {
-        return resp;
+    // Listing children only needs the folder to be on the user's path, not
+    // openable: that is how a grant on a deeper folder is reached. The
+    // children are filtered the same way below, so nothing off the path is
+    // named, and the folder's own entries are still refused elsewhere.
+    if !id.has_role("admin")
+        && !folder_or_descendant_accessible(&vault, &scope, &folder, id.folder_subject()).await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "no access to this folder"})),
+        )
+            .into_response();
     }
 
     match vault.list_subfolders(&scope, &folder).await {
@@ -2378,11 +2808,11 @@ pub async fn ab_list_subfolders(
             if id.has_role("admin") {
                 return Json(json!(subfolders)).into_response();
             }
-            let user_groups = id.groups();
+            let who = id.folder_subject();
             let mut visible = Vec::with_capacity(subfolders.len());
             for sf in subfolders {
                 let path = sf.path.clone().unwrap_or_else(|| sf.name.clone());
-                if folder_or_descendant_accessible(&vault, &scope, &path, user_groups).await {
+                if folder_or_descendant_accessible(&vault, &scope, &path, who).await {
                     visible.push(sf);
                 }
             }
@@ -2395,6 +2825,712 @@ pub async fn ab_list_subfolders(
         )
             .into_response(),
     }
+}
+
+// ── Folder default credentials ──
+
+/// Which default credentials a folder lends, without the secrets.
+fn folder_defaults_summary(d: &crate::vault::FolderDefaults) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (session_type, c) in d {
+        out.insert(
+            session_type.clone(),
+            json!({
+                "username": c.username,
+                "domain": c.domain,
+                "has_password": c.password.as_deref().is_some_and(|p| !p.is_empty()),
+                "has_private_key": c.private_key.as_deref().is_some_and(|k| !k.is_empty()),
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// GET /api/addressbook/folders/:scope/:folder/defaults — admin only. The
+/// folder's own `.defaults` (not what it inherits), secrets stripped.
+pub async fn ab_get_folder_defaults(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !matches!(identity, Some(Extension(ref id)) if id.has_role("admin")) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin role required"})),
+        )
+            .into_response();
+    }
+    match vault.get_folder_defaults(&scope, &folder).await {
+        Ok(d) => Json(json!({ "defaults": folder_defaults_summary(&d) })).into_response(),
+        Err(VaultError::NotFound) => Json(json!({ "defaults": {} })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// One session type's part of a `PUT .../defaults` body. An omitted field
+/// keeps what is stored, an empty string clears it; the same rule as entry
+/// PUTs use for their secrets.
+#[derive(Deserialize, Default)]
+pub struct DefaultCredentialsPatch {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// PUT /api/addressbook/folders/:scope/:folder/defaults — admin only.
+///
+/// Body: `{ "<session type>": { username?, password?, private_key?, domain? } | null, ... }`.
+/// Types not mentioned keep what is stored; `null` removes a type. Within a
+/// type an omitted secret keeps the stored one and `""` clears it. A type
+/// left with nothing in it is dropped; a folder left with no types loses its
+/// `.defaults` key.
+#[allow(clippy::too_many_arguments)]
+pub async fn ab_put_folder_defaults(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder)): Path<(String, String)>,
+    Json(patch): Json<std::collections::BTreeMap<String, Option<DefaultCredentialsPatch>>>,
+) -> impl IntoResponse {
+    let admin_email = match identity.as_ref() {
+        Some(Extension(id)) if id.has_role("admin") => id.display_name().to_string(),
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )
+                .into_response()
+        }
+    };
+
+    for session_type in patch.keys() {
+        let ok = !session_type.is_empty()
+            && session_type.len() <= 32
+            && session_type
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !ok {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid session type key {:?}", session_type)})),
+            )
+                .into_response();
+        }
+    }
+
+    // Only on a folder that exists: writing <path>/.defaults on its own would
+    // make a folder with no .config, which nobody but an admin can see.
+    match vault.get_folder_config(&scope, &folder).await {
+        Ok(_) => {}
+        Err(VaultError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "folder not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+
+    let mut current = match vault.get_folder_defaults(&scope, &folder).await {
+        Ok(d) => d,
+        Err(VaultError::NotFound) => crate::vault::FolderDefaults::new(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    fn non_empty(v: String) -> Option<String> {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    for (session_type, part) in patch {
+        match part {
+            None => {
+                current.remove(&session_type);
+            }
+            Some(p) => {
+                let c = current.entry(session_type).or_default();
+                if let Some(u) = p.username {
+                    c.username = non_empty(u);
+                }
+                if let Some(d) = p.domain {
+                    c.domain = non_empty(d);
+                }
+                if let Some(pw) = p.password {
+                    c.password = non_empty(pw);
+                }
+                if let Some(k) = p.private_key {
+                    c.private_key = non_empty(k);
+                }
+            }
+        }
+    }
+    current.retain(|_, c| c.username.is_some() || c.domain.is_some() || c.has_secret());
+
+    match vault.put_folder_defaults(&scope, &folder, &current).await {
+        Ok(()) => {
+            let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+            let details = json!({ "types": current.keys().collect::<Vec<_>>() }).to_string();
+            log_ab_event(
+                &database,
+                &admin_email,
+                "update_folder_defaults",
+                &scope,
+                &folder,
+                None,
+                &ip,
+                Some(&details),
+            )
+            .await;
+            Json(json!({ "ok": true, "defaults": folder_defaults_summary(&current) }))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/addressbook/folders/:scope/:folder/defaults — admin only.
+pub async fn ab_delete_folder_defaults(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let admin_email = match identity.as_ref() {
+        Some(Extension(id)) if id.has_role("admin") => id.display_name().to_string(),
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )
+                .into_response()
+        }
+    };
+    match vault.delete_folder_defaults(&scope, &folder).await {
+        Ok(()) => {
+            let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+            log_ab_event(
+                &database,
+                &admin_email,
+                "delete_folder_defaults",
+                &scope,
+                &folder,
+                None,
+                &ip,
+                None,
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Lend an entry without credentials of its own the folder defaults for its
+/// session type: the nearest folder on the path wins per type, and the walk
+/// stops at a folder with `inherit_from_parent: false` (see
+/// `crate::vault::resolve_effective_defaults`). This is the one place the
+/// Connections connect endpoint and `/api/connect` quick links resolve
+/// defaults, so an entry behaves the same from either. An entry with its own
+/// secret, or set to prompt, is returned untouched; a Vault error leaves it
+/// as it was, and the caller then prompts as it did before defaults existed.
+async fn lend_folder_defaults<S: DefaultsSource>(
+    src: &S,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    mut ab_entry: AddressBookEntry,
+) -> AddressBookEntry {
+    if !crate::vault::entry_takes_folder_defaults(&ab_entry) {
+        return ab_entry;
+    }
+    match crate::vault::resolve_effective_defaults(src, scope, folder).await {
+        Ok(Some(d)) => {
+            if crate::vault::apply_folder_defaults(&mut ab_entry, &d) {
+                tracing::debug!(
+                    scope,
+                    folder,
+                    entry,
+                    "entry using folder default credentials"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("Failed to read folder defaults from Vault: {}", err),
+    }
+    ab_entry
+}
+
+// ── Address book change log ──
+//
+// The Connections page keeps itself current by polling
+// `GET /api/addressbook/version?since=N` every few seconds. The answer comes
+// from this in-memory log and names the folders that changed since the
+// version the page last saw, so a page re-reads only what it shows: the
+// open folder when its entries changed, the folder list when a folder came
+// or went. The search index is never rebuilt on a poll; the page marks it
+// stale and walks the book again only when the box is next used. Per
+// change, an open tab therefore costs Vault at most one folder's entries
+// plus one folder-list listing, however many tabs are open; a poll costs
+// nothing.
+//
+// Changes are attributed from the request path (`ab_changes_for_request`).
+// Routes whose folders only the body knows (create folder, move, copy, bulk)
+// report them through an `AbChanged` response extension; should one not,
+// the change is logged as `all` and the page refreshes what it shows.
+//
+// Per-user credential variables (`/api/me/credentials`) are not address-book
+// changes and never touch this log: the tab that saved them reloads its own
+// credential status, and no other tab needs to know.
+//
+// The log is per process. A second rustguac on the same Vault, or a direct
+// Vault write, is not seen; those take a page reload, as they always did.
+
+/// What changed, as the Connections page needs to know it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AbChange {
+    /// "shared" or "instance"; "*" for `All`.
+    pub scope: String,
+    /// Folder path, `a/b` for a subfolder; empty for `All`.
+    pub folder: String,
+    pub kind: AbChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AbChangeKind {
+    /// Entries in the folder were created, updated, deleted, moved or copied.
+    Entries,
+    /// The folder itself: created, deleted, or its config changed.
+    Tree,
+    /// Could not be attributed: the page refreshes everything it shows.
+    All,
+}
+
+impl AbChange {
+    pub fn entries(scope: &str, folder: &str) -> Self {
+        AbChange {
+            scope: scope.to_string(),
+            folder: folder.to_string(),
+            kind: AbChangeKind::Entries,
+        }
+    }
+    pub fn tree(scope: &str, folder: &str) -> Self {
+        AbChange {
+            scope: scope.to_string(),
+            folder: folder.to_string(),
+            kind: AbChangeKind::Tree,
+        }
+    }
+    pub fn all() -> Self {
+        AbChange {
+            scope: "*".to_string(),
+            folder: String::new(),
+            kind: AbChangeKind::All,
+        }
+    }
+    /// A folder changed somewhere, without saying which: what a caller who
+    /// may not see every folder is told about folder-level changes, so a
+    /// poll never names a folder they cannot access.
+    pub fn tree_anywhere() -> Self {
+        AbChange {
+            scope: "*".to_string(),
+            folder: String::new(),
+            kind: AbChangeKind::Tree,
+        }
+    }
+}
+
+/// Response extension a handler sets to name the folders it changed when
+/// the request path alone does not say (the target of a move, the folder a
+/// POST created, every folder a bulk request touched).
+#[derive(Clone, Debug)]
+pub struct AbChanged(pub Vec<AbChange>);
+
+/// Attach the folders a handler changed to its response, for `ab_change_track`.
+fn with_ab_changes(mut response: Response, changes: Vec<AbChange>) -> Response {
+    response.extensions_mut().insert(AbChanged(changes));
+    response
+}
+
+/// How many individual changes the log keeps. A page that has not polled
+/// for longer than it takes to make this many changes gets `changes: null`
+/// and refreshes what it shows, so the bound on reads holds either way.
+const AB_CHANGE_LOG_LEN: usize = 512;
+
+/// The change log: a version counter and the recent changes behind it.
+#[derive(Clone)]
+pub struct AddressBookChanges {
+    inner: Arc<std::sync::Mutex<AbChangeLog>>,
+    /// Identifies this process's log. The version counter starts again at
+    /// 0 on a restart, so a page that saw version 5 before the restart and
+    /// polls once the new process has also reached 5 or more would be
+    /// answered from a different log; a new epoch tells it to refresh what
+    /// it shows instead.
+    epoch: u64,
+}
+
+impl Default for AddressBookChanges {
+    fn default() -> Self {
+        AddressBookChanges {
+            inner: Default::default(),
+            epoch: new_ab_epoch(),
+        }
+    }
+}
+
+/// A fresh log id: random, so two processes never share one, and below
+/// 2^53 so the page's JavaScript compares it exactly.
+fn new_ab_epoch() -> u64 {
+    use rand::RngExt;
+    (rand::rng().random::<u64>() >> 11).max(1)
+}
+
+#[derive(Default)]
+struct AbChangeLog {
+    version: u64,
+    changed_at_ms: u64,
+    /// `(version, change)`, oldest first. One `record` call may push several
+    /// changes under the same version.
+    recent: std::collections::VecDeque<(u64, AbChange)>,
+    /// Lowest version every change of which is still in `recent`. Eviction
+    /// moves it past the version it evicted from, so a partially evicted
+    /// version is never reported as complete.
+    oldest_complete: u64,
+}
+
+/// Answer to `since`.
+pub struct AbChangesSince {
+    pub version: u64,
+    pub changed_at_ms: u64,
+    /// `None` when the log no longer reaches back to `since`.
+    pub changes: Option<Vec<AbChange>>,
+}
+
+impl AddressBookChanges {
+    /// This process's log id, sent with every version answer.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Log a change set under one new version; returns that version.
+    pub fn record(&self, changes: Vec<AbChange>) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut log = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        log.version += 1;
+        log.changed_at_ms = now_ms;
+        let version = log.version;
+        if log.recent.is_empty() {
+            log.oldest_complete = version;
+        }
+        for change in changes {
+            if log.recent.len() >= AB_CHANGE_LOG_LEN {
+                if let Some((evicted, _)) = log.recent.pop_front() {
+                    log.oldest_complete = log.oldest_complete.max(evicted + 1);
+                }
+            }
+            log.recent.push_back((version, change));
+        }
+        version
+    }
+
+    /// Current version and timestamp (unix ms, 0 before the first change).
+    pub fn snapshot(&self) -> (u64, u64) {
+        let log = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (log.version, log.changed_at_ms)
+    }
+
+    /// Everything logged after version `since`, deduplicated, or `None` if
+    /// the log has already dropped part of that range. `All` swallows the
+    /// rest: the page refreshes what it shows once.
+    pub fn since(&self, since: u64) -> AbChangesSince {
+        let log = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (version, changed_at_ms) = (log.version, log.changed_at_ms);
+        if since == version {
+            return AbChangesSince {
+                version,
+                changed_at_ms,
+                changes: Some(Vec::new()),
+            };
+        }
+        // Everything in (since, version] must still be in the log. A page
+        // ahead of the log saw a previous process: it refreshes too. With an
+        // empty log the only reachable case is `since == version`, above.
+        if since > version || log.recent.is_empty() || since + 1 < log.oldest_complete {
+            return AbChangesSince {
+                version,
+                changed_at_ms,
+                changes: None,
+            };
+        }
+        let mut out: Vec<AbChange> = Vec::new();
+        for (v, change) in log.recent.iter() {
+            if *v <= since {
+                continue;
+            }
+            if change.kind == AbChangeKind::All {
+                return AbChangesSince {
+                    version,
+                    changed_at_ms,
+                    changes: Some(vec![AbChange::all()]),
+                };
+            }
+            if !out.contains(change) {
+                out.push(change.clone());
+            }
+        }
+        AbChangesSince {
+            version,
+            changed_at_ms,
+            changes: Some(out),
+        }
+    }
+}
+
+/// The address-book changes a request implies, from its method and path.
+///
+/// `None`: not an address-book change (reads, connects, and everything
+/// outside `/api/addressbook`, `/api/me/credentials` included). Otherwise
+/// the changes the path names and whether that is all of them; when it is
+/// not, the handler reports the rest (`AbChanged`) or the change is logged
+/// as `All`. Folder segments arrive percent-encoded (`a%2Fb`) and are
+/// decoded here, as the routes would.
+pub fn ab_changes_for_request(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<(Vec<AbChange>, bool)> {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return None;
+    }
+    let rest = path.strip_prefix("/api/addressbook")?;
+    let segs: Vec<String> = rest
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            urlencoding::decode(s)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| s.to_string())
+        })
+        .collect();
+    let seg = |i: usize| segs.get(i).map(String::as_str);
+    match (seg(0), seg(1), seg(2), seg(3), seg(4), seg(5)) {
+        // POST /folders: the folder is in the body.
+        (Some("folders"), None, ..) => Some((Vec::new(), false)),
+        // POST /bulk: the folders are in the body.
+        (Some("bulk"), None, ..) => Some((Vec::new(), false)),
+        // PUT|DELETE /folders/{scope}/{folder}
+        (Some("folders"), Some(scope), Some(folder), None, ..) => {
+            Some((vec![AbChange::tree(scope, folder)], true))
+        }
+        // POST /folders/{scope}/{folder}/entries
+        (Some("folders"), Some(scope), Some(folder), Some("entries"), None, _) => {
+            Some((vec![AbChange::entries(scope, folder)], true))
+        }
+        // PUT|DELETE /folders/{scope}/{folder}/entries/{entry}
+        (Some("folders"), Some(scope), Some(folder), Some("entries"), Some(_), None) => {
+            Some((vec![AbChange::entries(scope, folder)], true))
+        }
+        // POST .../entries/{entry}/connect starts a session, changes nothing.
+        (Some("folders"), Some(_), Some(_), Some("entries"), Some(_), Some("connect")) => None,
+        // POST .../entries/{entry}/move|copy: the target is in the body.
+        (Some("folders"), Some(scope), Some(folder), Some("entries"), Some(_), Some(_)) => {
+            Some((vec![AbChange::entries(scope, folder)], false))
+        }
+        // PUT|DELETE /folders/{scope}/{folder}/defaults: the folder's default
+        // credentials also decide what every subfolder that shares its
+        // audience lends, so nothing narrower than everything is right. The
+        // handler reports nothing, which is logged as All.
+        (Some("folders"), Some(_), Some(_), Some("defaults"), None, _) => Some((Vec::new(), false)),
+        // Anything else that writes under the prefix: refresh everything
+        // rather than miss it.
+        _ => Some((Vec::new(), false)),
+    }
+}
+
+/// Middleware: log the address-book changes of every successful mutating
+/// request. It runs outside `require_auth`, so it also sees requests that
+/// were refused; those fail and are not logged. A failed request is logged
+/// only when its handler reported what it changed anyway (`AbChanged`), as
+/// a move that copied the entry but could not remove the original does.
+pub async fn ab_change_track(
+    changes: Option<Extension<AddressBookChanges>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let implied = ab_changes_for_request(request.method(), request.uri().path());
+    let response = next.run(request).await;
+    if let Some((mut found, mut complete)) = implied {
+        let reported = response.extensions().get::<AbChanged>();
+        if response.status().is_success() {
+            if let Some(AbChanged(reported)) = reported {
+                found.extend(reported.iter().cloned());
+                complete = true;
+            }
+            if !complete {
+                found.push(AbChange::all());
+            }
+            if let Some(Extension(log)) = changes {
+                log.record(found);
+            }
+        } else if let (Some(AbChanged(reported)), Some(Extension(log))) = (reported, changes) {
+            if !reported.is_empty() {
+                log.record(reported.clone());
+            }
+        }
+    }
+    response
+}
+
+#[derive(Deserialize, Default)]
+pub struct AbVersionQuery {
+    pub since: Option<u64>,
+}
+
+/// Most change rows a non-admin's poll checks one by one. Past this (a big
+/// bulk change) the rows are replaced by one path-less tree marker and the
+/// page refreshes what it shows, so a burst costs each tab a bounded number
+/// of folder-config reads.
+const AB_VERSION_MAX_CHECKED_ROWS: usize = 32;
+
+/// The changes a caller who is not an admin may be told about. An entries
+/// row is kept only for a folder the caller can open directly (the
+/// `check_folder_access` rule); folder-level rows never name the folder,
+/// since a folder that was created, deleted or had its access changed may
+/// be one the caller cannot see. `can_access` is only consulted when there
+/// are rows to answer, so an empty poll still costs no Vault read.
+async fn ab_changes_visible_to<F, Fut>(changes: Vec<AbChange>, can_access: F) -> Vec<AbChange>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, VaultError>>,
+{
+    if changes.iter().any(|c| c.kind == AbChangeKind::All) {
+        return vec![AbChange::all()];
+    }
+    if changes.len() > AB_VERSION_MAX_CHECKED_ROWS {
+        return vec![AbChange::tree_anywhere()];
+    }
+    let mut out = Vec::new();
+    let mut tree = false;
+    for c in changes {
+        match c.kind {
+            AbChangeKind::Tree => tree = true,
+            AbChangeKind::Entries => match can_access(c.scope.clone(), c.folder.clone()).await {
+                Ok(true) => out.push(c),
+                // No access, or the folder has gone: nothing to say.
+                Ok(false) | Err(VaultError::NotFound) => {}
+                // Can't tell: have the page refresh rather than miss it,
+                // without naming the folder.
+                Err(_) => tree = true,
+            },
+            AbChangeKind::All => unreachable!("handled above"),
+        }
+    }
+    if tree {
+        out.push(AbChange::tree_anywhere());
+    }
+    out
+}
+
+/// GET /api/addressbook/version?since=N — the change log since version N,
+/// answered from memory. Requires operator. `epoch` identifies this
+/// process's log: a page that sees it change refreshes what it shows.
+pub async fn ab_version(
+    identity: Option<Extension<AuthIdentity>>,
+    changes: Option<Extension<AddressBookChanges>>,
+    vault: Option<Extension<VaultState>>,
+    Query(q): Query<AbVersionQuery>,
+) -> impl IntoResponse {
+    let id = match identity {
+        Some(Extension(id)) if id.has_role("operator") => id,
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "operator role required"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(Extension(log)) = changes else {
+        return Json(json!({ "version": 0, "changed_at": 0, "epoch": 0, "changes": null }))
+            .into_response();
+    };
+    let answer = match q.since {
+        Some(since) => log.since(since),
+        None => {
+            let (version, changed_at_ms) = log.snapshot();
+            AbChangesSince {
+                version,
+                changed_at_ms,
+                changes: None,
+            }
+        }
+    };
+    let changes = match answer.changes {
+        Some(rows) if !rows.is_empty() && !id.has_role("admin") => {
+            let who = id.folder_subject();
+            Some(match vault {
+                Some(Extension(vault)) => {
+                    ab_changes_visible_to(rows, |scope, folder| {
+                        let vault = vault.clone();
+                        async move { vault.resolve_folder_access(&scope, &folder, who).await }
+                    })
+                    .await
+                }
+                // No Vault to check against: say only that something changed.
+                None => vec![AbChange::tree_anywhere()],
+            })
+        }
+        other => other,
+    };
+    Json(json!({
+        "version": answer.version,
+        "changed_at": answer.changed_at_ms,
+        "epoch": log.epoch(),
+        "changes": changes,
+    }))
+    .into_response()
 }
 
 /// GET /api/addressbook — Batch endpoint returning all visible folders with entries.
@@ -2426,15 +3562,30 @@ pub async fn ab_list_all(
     };
 
     let mut result = Vec::new();
-    let user_groups = id.groups();
+    let who = id.folder_subject();
     for folder in folders {
-        // Group access check (admins see all); inherits via resolver walk-up.
+        // Access check (admins see all); inherits via resolver walk-up. A
+        // folder the user cannot open is still listed, without its entries,
+        // when it leads to a subfolder they can: that is how the tree reaches
+        // a grant made only on `users/jsmith`.
         if !id.has_role("admin")
             && !vault
-                .resolve_folder_access(&folder.scope, &folder.name, user_groups)
+                .resolve_folder_access(&folder.scope, &folder.name, who)
                 .await
                 .unwrap_or(false)
         {
+            if folder_or_descendant_accessible(&vault, &folder.scope, &folder.name, who).await {
+                result.push(json!({
+                    "name": folder.name,
+                    "scope": folder.scope,
+                    "path": folder.path,
+                    "has_children": folder.has_children,
+                    "description": folder.description,
+                    "display_name": folder.display_name,
+                    "path_only": true,
+                    "entries": [],
+                }));
+            }
             continue;
         }
 
@@ -2449,10 +3600,17 @@ pub async fn ab_list_all(
             .list_entries(&folder.scope, &folder.name)
             .await
             .unwrap_or_default();
+        let defaults = vault
+            .effective_folder_defaults(&folder.scope, &folder.name)
+            .await
+            .ok()
+            .flatten();
         let mut entries = Vec::new();
         for name in &entry_names {
             if let Ok(entry) = vault.get_entry(&folder.scope, &folder.name, name).await {
-                entries.push(crate::vault::EntryInfo::from((name.as_str(), &entry)));
+                let mut info = crate::vault::EntryInfo::from((name.as_str(), &entry));
+                info.apply_inherited(&entry, defaults.as_ref());
+                entries.push(info);
             }
         }
 
@@ -2462,7 +3620,11 @@ pub async fn ab_list_all(
             "path": folder.path,
             "has_children": folder.has_children,
             "description": folder.description,
+            "display_name": folder.display_name,
             "allowed_groups": config.as_ref().map(|c| &c.allowed_groups),
+            // allowed_users is deliberately not listed: operators see this,
+            // and a user who can open a folder should not learn who else can.
+            // Admins read it from GET .../config.
             "entries": entries,
         }));
     }
@@ -2496,7 +3658,7 @@ pub async fn ab_search_index(
         }
     };
 
-    let user_groups = id.groups();
+    let who = id.folder_subject();
     let is_admin = id.has_role("admin");
 
     let top = match vault.list_all_folders().await {
@@ -2526,7 +3688,7 @@ pub async fn ab_search_index(
 
         let allowed = is_admin
             || vault
-                .resolve_folder_access(&scope, &path, user_groups)
+                .resolve_folder_access(&scope, &path, who)
                 .await
                 .unwrap_or(false);
         if !allowed {
@@ -2537,12 +3699,28 @@ pub async fn ab_search_index(
             Ok(n) => n,
             Err(_) => continue,
         };
+        let defaults = vault
+            .effective_folder_defaults(&scope, &path)
+            .await
+            .ok()
+            .flatten();
+        // The folder's human title (e.g. the NetBox tenant name), so the
+        // search results can show it over the folder key like the folder view.
+        let folder_display = vault
+            .get_folder_config(&scope, &path)
+            .await
+            .ok()
+            .map(|c| c.display_name)
+            .filter(|s| !s.is_empty());
         for name in &names {
             if let Ok(entry) = vault.get_entry(&scope, &path, name).await {
+                let mut info = crate::vault::EntryInfo::from((name.as_str(), &entry));
+                info.apply_inherited(&entry, defaults.as_ref());
                 emitted.push(json!({
                     "scope": scope,
                     "folder_path": path,
-                    "entry": crate::vault::EntryInfo::from((name.as_str(), &entry)),
+                    "folder_display_name": folder_display,
+                    "entry": info,
                 }));
             }
         }
@@ -2585,10 +3763,17 @@ pub async fn ab_list_entries(
     };
 
     // Fetch each entry and strip credentials
+    let defaults = vault
+        .effective_folder_defaults(&scope, &folder)
+        .await
+        .ok()
+        .flatten();
     let mut entries = Vec::new();
     for name in &entry_names {
         if let Ok(entry) = vault.get_entry(&scope, &folder, name).await {
-            entries.push(crate::vault::EntryInfo::from((name.as_str(), &entry)));
+            let mut info = crate::vault::EntryInfo::from((name.as_str(), &entry));
+            info.apply_inherited(&entry, defaults.as_ref());
+            entries.push(info);
         }
     }
 
@@ -2601,6 +3786,13 @@ pub struct ConnectRequest {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// The screen's size in CSS pixels. An entry that opens fullscreen on
+    /// connect is created at this size instead of the window's, so nothing
+    /// has to be resized once the fullscreen transition lands.
+    #[serde(default)]
+    pub screen_width: Option<u32>,
+    #[serde(default)]
+    pub screen_height: Option<u32>,
     #[serde(default)]
     pub dpi: Option<u32>,
     #[serde(default)]
@@ -2646,7 +3838,9 @@ pub async fn ssh_probe_host_key(
             &body.hostname,
             port,
             &manager.config().ssh_allowed_networks,
-        ) {
+        )
+        .await
+        {
             Ok(ip) => crate::session::dial_host(ip),
             Err(e) => {
                 return (
@@ -2688,6 +3882,62 @@ pub async fn ssh_probe_host_key(
 pub struct ProbeHostKeyRequest {
     pub hostname: String,
     pub port: Option<u16>,
+}
+
+/// The size a new session is created at.
+///
+/// A bitmap (RDP/VNC) entry that opens fullscreen on connect is created at
+/// the screen's size, which is the size it will have once fullscreen lands.
+/// Until the client's fullscreen gesture fires it scales that picture to fit
+/// the window, so the desktop is painted once at its final size and the
+/// fullscreen transition brings no resize, no decoder rebuild and no second
+/// repaint (#257). Everything else keeps the window's size: a terminal
+/// reflows to fullscreen instantly.
+///
+/// Both sizes are CSS pixels, which is what the client's post-connect size
+/// send uses today, so creation and that send agree. When #238 lands
+/// (native/HiDPI resolution, `display_scale`), that send becomes the
+/// device-pixel size, and the mod-16 rounding below must then be applied to
+/// the final size after the devicePixelRatio multiply, not to the CSS size.
+pub fn initial_session_size(
+    session_type: &str,
+    fullscreen_on_connect: bool,
+    window: (Option<u32>, Option<u32>),
+    screen: (Option<u32>, Option<u32>),
+) -> (Option<u32>, Option<u32>) {
+    let bitmap = matches!(session_type, "rdp" | "vnc");
+    let (w, h) = match (bitmap && fullscreen_on_connect, screen) {
+        (true, (Some(w), Some(h))) if w > 0 && h > 0 => (Some(w), Some(h)),
+        _ => window,
+    };
+    // RDP's display channel rounds every requested size down to a multiple
+    // of 16 (patches/007, which prevents the H.264 green band), so the
+    // client's first post-connect size send always lands on that grid.
+    // Create the session there already, fullscreen or windowed, so the two
+    // match: guacd coalesces them and there is no resize, the H.264 decoder
+    // is not rebuilt and the picture never flashes on connect (#257). VNC
+    // has no such rounding, so it keeps the exact size.
+    //
+    // #238 (not merged at the time of writing): once the session is created
+    // at the device-pixel size, round that size, i.e. apply round_down_mod16
+    // after multiplying by devicePixelRatio, since rounding the CSS size and
+    // then scaling it would leave the grid again.
+    if session_type == "rdp" {
+        (w.map(round_down_mod16), h.map(round_down_mod16))
+    } else {
+        (w, h)
+    }
+}
+
+/// Round a dimension down to a multiple of 16, with a 16px floor so a tiny
+/// screen never rounds to zero. Mirrors guacd's RDP display-channel rounding.
+fn round_down_mod16(v: u32) -> u32 {
+    let r = v - (v % 16);
+    if r < 16 {
+        16
+    } else {
+        r
+    }
 }
 
 /// POST /api/addressbook/folders/:scope/:folder/entries/:entry/connect — Create session from entry.
@@ -2735,6 +3985,8 @@ pub async fn ab_connect_entry(
                 .into_response()
         }
     };
+
+    let ab_entry = lend_folder_defaults(vault.as_ref(), &scope, &folder, &entry, ab_entry).await;
 
     // Resolve credential variable references ($domain_user, $domain_password, etc.)
     let ab_entry = if !crate::vault::entry_credential_variables(&ab_entry).is_empty() {
@@ -2792,6 +4044,12 @@ pub async fn ab_connect_entry(
     // Build CreateSessionRequest from the Vault entry + connect request display params.
     // ConnectRequest credentials override address book values (for prompted credentials).
     let ab_entry_key = format!("{}/{}/{}", scope, folder, entry);
+    let (initial_width, initial_height) = initial_session_size(
+        &ab_entry.session_type,
+        ab_entry.fullscreen_on_connect.unwrap_or(false),
+        (req.width, req.height),
+        (req.screen_width, req.screen_height),
+    );
     let create_req = CreateSessionRequest {
         session_type,
         hostname: ab_entry.hostname,
@@ -2815,8 +4073,8 @@ pub async fn ab_connect_entry(
         jump_username: None,
         jump_password: None,
         jump_private_key: None,
-        width: req.width,
-        height: req.height,
+        width: initial_width,
+        height: initial_height,
         dpi: req.dpi,
         banner: req.banner.or(ab_entry.banner),
         enable_drive: ab_entry.enable_drive,
@@ -2825,7 +4083,7 @@ pub async fn ab_connect_entry(
         remote_app_args: ab_entry.remote_app_args,
         enable_recording: ab_entry.enable_recording,
         record_typescript: ab_entry.record_typescript,
-        address_book_entry: Some(ab_entry_key),
+        address_book_entry: Some(ab_entry_key.clone()),
         address_book_folder: Some(folder.to_string()),
         entry_display_name: ab_entry.display_name.clone(),
         max_recordings: ab_entry.max_recordings,
@@ -2865,6 +4123,12 @@ pub async fn ab_connect_entry(
         max_monitors: ab_entry.max_monitors,
         owner: None,
         fence_all_targets: false,
+        ssh_font_size: ab_entry.ssh_font_size,
+        wol_send_packet: ab_entry.wol_send_packet,
+        wol_mac_addr: ab_entry.wol_mac_addr,
+        wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+        wol_udp_port: ab_entry.wol_udp_port,
+        wol_wait_time: ab_entry.wol_wait_time,
     };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
@@ -2879,6 +4143,24 @@ pub async fn ab_connect_entry(
         scope = %scope,
         "Address book connect requested"
     );
+
+    // Reuse a Pending session this user already opened for this entry rather
+    // than spawning a duplicate (e.g. a repeat Connect click). Matched on the
+    // fully built request above, credentials included: a retry with a
+    // different password, key or domain (a mistyped prompt) must not get
+    // the old Pending session, which still holds the old credentials. The
+    // fingerprint is a hash, compared only, never logged.
+    if let Some(existing) = manager
+        .find_reusable_session(&admin_name, &ab_entry_key, &create_req.reuse_fingerprint())
+        .await
+    {
+        tracing::info!(
+            user = %admin_name,
+            session_id = %existing.session_id,
+            "Reusing existing address book session"
+        );
+        return (StatusCode::CREATED, Json(json!(existing))).into_response();
+    }
 
     match manager.create_session(create_req, admin_name.clone()).await {
         Ok(info) => {
@@ -2907,8 +4189,13 @@ pub async fn ab_connect_entry(
 pub struct CreateFolderRequest {
     pub name: String,
     pub allowed_groups: Vec<String>,
+    /// Login emails granted access in addition to `allowed_groups`.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub display_name: String,
     /// "shared" or "instance" (default: "shared")
     #[serde(default = "default_scope")]
     pub scope: String,
@@ -2918,6 +4205,33 @@ pub struct CreateFolderRequest {
 
 fn default_scope() -> String {
     "shared".into()
+}
+
+/// Most users one folder may list in `allowed_users`.
+const MAX_ALLOWED_USERS: usize = 500;
+
+/// Tidy a folder's `allowed_users`: trim, drop blanks and case-insensitive
+/// repeats, and refuse anything that cannot be a login identity. Usually an
+/// email, but not required to contain `@`: rustguac falls back to the OIDC
+/// subject when a provider sends no email claim.
+fn normalize_allowed_users(users: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in users {
+        let u = raw.trim();
+        if u.is_empty() {
+            continue;
+        }
+        if u.len() > 320 || u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(format!("not a valid user identity: {u:?}"));
+        }
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(u)) {
+            out.push(u.to_string());
+        }
+    }
+    if out.len() > MAX_ALLOWED_USERS {
+        return Err(format!("at most {MAX_ALLOWED_USERS} users per folder"));
+    }
+    Ok(out)
 }
 
 /// Resolve the caller's client IP (honouring trusted proxies) into a string
@@ -2991,11 +4305,18 @@ pub async fn ab_create_folder(
         }
     };
 
+    let allowed_users = match normalize_allowed_users(req.allowed_users) {
+        Ok(u) => u,
+        Err(msg) => return ab_error(StatusCode::BAD_REQUEST, msg),
+    };
     let allowed_count = req.allowed_groups.len();
+    let users_count = allowed_users.len();
     let inherit = req.inherit_from_parent;
     let config = FolderConfig {
         allowed_groups: req.allowed_groups,
+        allowed_users,
         description: req.description,
+        display_name: req.display_name.trim().to_string(),
         inherit_from_parent: req.inherit_from_parent,
     };
 
@@ -3007,6 +4328,7 @@ pub async fn ab_create_folder(
             let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
             let details = json!({
                 "allowed_groups_count": allowed_count,
+                "allowed_users_count": users_count,
                 "inherit_from_parent": inherit,
             })
             .to_string();
@@ -3021,7 +4343,10 @@ pub async fn ab_create_folder(
                 Some(&details),
             )
             .await;
-            (StatusCode::CREATED, Json(json!({"ok": true}))).into_response()
+            with_ab_changes(
+                (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+                vec![AbChange::tree(&req.scope, &req.name)],
+            )
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -3034,8 +4359,17 @@ pub async fn ab_create_folder(
 #[derive(Deserialize)]
 pub struct UpdateFolderRequest {
     pub allowed_groups: Vec<String>,
+    /// Login emails granted access. Omitted means "leave as is", so a client
+    /// that predates this field cannot wipe the list by saving the folder.
+    #[serde(default)]
+    pub allowed_users: Option<Vec<String>>,
     #[serde(default)]
     pub description: String,
+    /// Title shown over the folder key. Omitted means "leave as is", like
+    /// `allowed_users`, so a client or script that predates the field cannot
+    /// wipe it by saving the folder; `""` clears it.
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub inherit_from_parent: bool,
 }
@@ -3063,11 +4397,39 @@ pub async fn ab_update_folder(
         }
     };
 
+    // Fields the request may leave out keep their stored values, so the
+    // stored config is read once when any of them is missing.
+    let existing = if req.allowed_users.is_none() || req.display_name.is_none() {
+        match vault.get_folder_config(&scope, &folder).await {
+            Ok(existing) => Some(existing),
+            Err(VaultError::NotFound) => None,
+            Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
+        }
+    } else {
+        None
+    };
+    let allowed_users = match req.allowed_users {
+        Some(users) => match normalize_allowed_users(users) {
+            Ok(u) => u,
+            Err(msg) => return ab_error(StatusCode::BAD_REQUEST, msg),
+        },
+        None => existing
+            .as_ref()
+            .map(|c| c.allowed_users.clone())
+            .unwrap_or_default(),
+    };
+    let display_name = match req.display_name {
+        Some(d) => d.trim().to_string(),
+        None => existing.map(|c| c.display_name).unwrap_or_default(),
+    };
     let allowed_count = req.allowed_groups.len();
+    let users_count = allowed_users.len();
     let inherit = req.inherit_from_parent;
     let config = FolderConfig {
         allowed_groups: req.allowed_groups,
+        allowed_users,
         description: req.description,
+        display_name,
         inherit_from_parent: req.inherit_from_parent,
     };
 
@@ -3076,6 +4438,7 @@ pub async fn ab_update_folder(
             let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
             let details = json!({
                 "allowed_groups_count": allowed_count,
+                "allowed_users_count": users_count,
                 "inherit_from_parent": inherit,
             })
             .to_string();
@@ -3123,12 +4486,15 @@ pub async fn ab_get_folder_config(
     match vault.get_folder_config(&scope, &folder).await {
         Ok(cfg) => Json(json!({
             "allowed_groups": cfg.allowed_groups,
+            "allowed_users": cfg.allowed_users,
             "description": cfg.description,
+            "display_name": cfg.display_name,
             "inherit_from_parent": cfg.inherit_from_parent,
         }))
         .into_response(),
         Err(crate::vault::VaultError::NotFound) => Json(json!({
             "allowed_groups": Vec::<String>::new(),
+            "allowed_users": Vec::<String>::new(),
             "description": "",
             "inherit_from_parent": false,
         }))
@@ -3255,10 +4621,360 @@ pub async fn ab_create_entry(
     }
 }
 
-/// PUT /api/addressbook/folders/:scope/:folder/entries/:entry — Update an entry. Admin only.
-/// Performs a read-modify-write: reads the existing entry from Vault first, then merges
-/// incoming fields on top. This preserves credentials (password, private_key) that the
-/// frontend deliberately omits from edit forms.
+/// Query string of `PUT .../entries/:entry`.
+#[derive(Deserialize, Default)]
+pub struct EntryPutQuery {
+    /// `?move=true`: before the update, find the entry whose `external_id`
+    /// matches the body's anywhere in the scope and move it here, secrets
+    /// included, so a synced device that changes folder or name is moved
+    /// rather than duplicated. Needs `external_id` in the body; the name is
+    /// never used to match across folders.
+    #[serde(rename = "move", default)]
+    pub move_: bool,
+}
+
+/// The entry storage the update and move paths work on. A trait, like
+/// `FolderSource`, so the locate / move / merge sequence of
+/// `PUT ...?move=true` is unit-testable without a live Vault.
+#[allow(async_fn_in_trait)]
+trait EntryStore {
+    /// Every folder path in `scope`, top level and below.
+    async fn folder_paths(&self, scope: &str) -> Result<Vec<String>, VaultError>;
+    /// Entry names in one folder, subfolders excluded.
+    async fn entry_names(&self, scope: &str, folder: &str) -> Result<Vec<String>, VaultError>;
+    /// The full entry, secrets included.
+    async fn get_entry(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+    ) -> Result<AddressBookEntry, VaultError>;
+    async fn put_entry(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<(), VaultError>;
+    /// Write only if nothing is stored there; `Ok(false)` when something is.
+    async fn put_entry_if_absent(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<bool, VaultError>;
+    async fn delete_entry(&self, scope: &str, folder: &str, entry: &str) -> Result<(), VaultError>;
+}
+
+impl EntryStore for VaultBackends {
+    async fn folder_paths(&self, scope: &str) -> Result<Vec<String>, VaultError> {
+        let client = self.scoped(scope).await?;
+        let mut queue: Vec<String> = client
+            .list_folders_in_scope(scope)
+            .await?
+            .into_iter()
+            .map(|f| f.path.unwrap_or(f.name))
+            .collect();
+        let mut out = Vec::new();
+        while let Some(path) = queue.pop() {
+            match client.list_subfolders(scope, &path).await {
+                Ok(subs) => {
+                    for s in subs {
+                        queue.push(s.path.unwrap_or_else(|| format!("{path}/{}", s.name)));
+                    }
+                }
+                // Emptied since it was listed.
+                Err(VaultError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            out.push(path);
+        }
+        Ok(out)
+    }
+
+    async fn entry_names(&self, scope: &str, folder: &str) -> Result<Vec<String>, VaultError> {
+        // The KV listing also returns subfolders, as `name/`.
+        match VaultBackends::list_entries(self, scope, folder).await {
+            Ok(names) => Ok(names.into_iter().filter(|n| !n.ends_with('/')).collect()),
+            Err(VaultError::NotFound) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn get_entry(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+    ) -> Result<AddressBookEntry, VaultError> {
+        VaultBackends::get_entry(self, scope, folder, entry).await
+    }
+
+    async fn put_entry(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<(), VaultError> {
+        VaultBackends::put_entry(self, scope, folder, entry, data).await
+    }
+
+    async fn put_entry_if_absent(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<bool, VaultError> {
+        VaultBackends::put_entry_if_absent(self, scope, folder, entry, data).await
+    }
+
+    async fn delete_entry(&self, scope: &str, folder: &str, entry: &str) -> Result<(), VaultError> {
+        VaultBackends::delete_entry(self, scope, folder, entry).await
+    }
+}
+
+/// An update merged onto the stored entry: anything the request carries
+/// wins, and every secret it omits is kept, because neither the edit form
+/// (which never receives secrets) nor a sync source such as the NetBox
+/// webhook (which has none) can send them back. Jump host credentials are
+/// kept per hop by index; `external_id` is kept the same way so an edit
+/// from the form does not cut a synced entry loose from its source.
+fn merge_entry_update(data: AddressBookEntry, existing: AddressBookEntry) -> AddressBookEntry {
+    let merged_jump_hosts = if let Some(ref new_hops) = data.jump_hosts {
+        let old_hops = existing.jump_hosts.as_deref().unwrap_or(&[]);
+        let merged: Vec<_> = new_hops
+            .iter()
+            .enumerate()
+            .map(|(i, hop)| {
+                let old = old_hops.get(i);
+                crate::tunnel::JumpHost {
+                    hostname: hop.hostname.clone(),
+                    port: hop.port,
+                    username: hop.username.clone(),
+                    password: hop
+                        .password
+                        .clone()
+                        .or_else(|| old.and_then(|o| o.password.clone())),
+                    private_key: hop
+                        .private_key
+                        .clone()
+                        .or_else(|| old.and_then(|o| o.private_key.clone())),
+                    host_key: hop
+                        .host_key
+                        .clone()
+                        .or_else(|| old.and_then(|o| o.host_key.clone())),
+                }
+            })
+            .collect();
+        Some(merged)
+    } else {
+        data.jump_hosts.clone()
+    };
+
+    AddressBookEntry {
+        password: data.password.or(existing.password),
+        private_key: data.private_key.or(existing.private_key),
+        container_password: data.container_password.or(existing.container_password),
+        proxmox_token_secret: data.proxmox_token_secret.or(existing.proxmox_token_secret),
+        external_id: data.external_id.or(existing.external_id),
+        jump_hosts: merged_jump_hosts,
+        // Clear legacy flat fields — they've been migrated
+        jump_password: None,
+        jump_private_key: None,
+        ..data
+    }
+}
+
+/// Where `PUT ...?move=true` found the entry before bringing it to the
+/// requested folder and name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MovedFrom {
+    folder: String,
+    name: String,
+}
+
+/// Why an upsert did not complete.
+#[derive(Debug)]
+enum UpsertError {
+    /// Nothing was changed.
+    Rejected(StatusCode, String),
+    /// The entry was copied to the requested folder but the original could
+    /// not be removed, so it now exists in both; the update was not applied.
+    MoveIncomplete { from: MovedFrom, error: VaultError },
+    /// The write of the update failed, after the move if there was one.
+    UpdateFailed {
+        moved_from: Option<MovedFrom>,
+        error: VaultError,
+    },
+}
+
+/// `?move=true`: find the entry stored under `external_id` in `scope` and
+/// bring it to `folder`/`entry`, with everything stored in it, before the
+/// update is applied. Returns where it came from, or `None` when nothing
+/// had to move (it is already there, or there is no such entry yet).
+///
+/// Matching is on `external_id` only. Entries elsewhere in the scope that
+/// merely share the name are not the same device (two tenants can each
+/// have a `fw01`) and are never touched.
+async fn relocate_by_external_id<S: EntryStore>(
+    store: &S,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    external_id: &str,
+) -> Result<Option<MovedFrom>, UpsertError> {
+    let reject = |e: VaultError| {
+        let (status, msg) = ab_vault_error(e);
+        UpsertError::Rejected(status, msg)
+    };
+
+    // Already here: the steady state of a sync, and the only case that
+    // needs no scan.
+    let adopting = match store.get_entry(scope, folder, entry).await {
+        Ok(existing) => match existing.external_id.as_deref() {
+            Some(other) if other != external_id => {
+                return Err(UpsertError::Rejected(
+                    StatusCode::CONFLICT,
+                    format!("{folder}/{entry} belongs to another device (external_id {other})"),
+                ))
+            }
+            Some(_) => return Ok(None),
+            // An entry made by hand before syncing began: it is updated in
+            // place and adopts the id, but only once the scan below shows no
+            // other entry already carries it, or the id would end up on two.
+            None => true,
+        },
+        Err(VaultError::NotFound) => false,
+        Err(e) => return Err(reject(e)),
+    };
+
+    let mut found = Vec::new();
+    for other_folder in store.folder_paths(scope).await.map_err(reject)? {
+        for name in store
+            .entry_names(scope, &other_folder)
+            .await
+            .map_err(reject)?
+        {
+            if other_folder == folder && name == entry {
+                continue;
+            }
+            let stored = match store.get_entry(scope, &other_folder, &name).await {
+                Ok(e) => e,
+                Err(VaultError::NotFound) => continue, // deleted since it was listed
+                Err(e) => return Err(reject(e)),
+            };
+            if stored.external_id.as_deref() == Some(external_id) {
+                found.push(MovedFrom {
+                    folder: other_folder.clone(),
+                    name,
+                });
+            }
+        }
+    }
+
+    if adopting && !found.is_empty() {
+        let where_ = found
+            .iter()
+            .map(|f| format!("{}/{}", f.folder, f.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(UpsertError::Rejected(
+            StatusCode::CONFLICT,
+            format!(
+                "{folder}/{entry} is an entry without an external_id, and external_id {external_id} \
+                 is already stored on {where_}; nothing was changed"
+            ),
+        ));
+    }
+
+    match found.len() {
+        0 => Ok(None),
+        1 => {
+            let from = found.remove(0);
+            match move_stored_entry(store, scope, &from.folder, &from.name, scope, folder, entry)
+                .await
+            {
+                Ok(_) => Ok(Some(from)),
+                Err(MoveError::Copy(status, msg)) => Err(UpsertError::Rejected(status, msg)),
+                Err(MoveError::Incomplete(error)) => {
+                    Err(UpsertError::MoveIncomplete { from, error })
+                }
+            }
+        }
+        n => {
+            let where_ = found
+                .iter()
+                .map(|f| format!("{}/{}", f.folder, f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(UpsertError::Rejected(
+                StatusCode::CONFLICT,
+                format!("external_id {external_id} is stored on {n} entries ({where_}); nothing was changed"),
+            ))
+        }
+    }
+}
+
+/// What a completed upsert wrote, and where the entry came from if
+/// `?move=true` moved it.
+#[derive(Debug)]
+struct UpsertOutcome {
+    moved_from: Option<MovedFrom>,
+    entry: AddressBookEntry,
+}
+
+/// `PUT .../entries/:entry` without the HTTP: locate (and move) by
+/// `external_id` when asked, then read-modify-write so the request's fields
+/// land on top of everything stored, secrets included.
+async fn upsert_entry<S: EntryStore>(
+    store: &S,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    data: AddressBookEntry,
+    move_: bool,
+) -> Result<UpsertOutcome, UpsertError> {
+    let moved_from = if move_ {
+        let Some(external_id) = data.external_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Err(UpsertError::Rejected(
+                StatusCode::BAD_REQUEST,
+                "move=true needs external_id in the body: the entry is matched on it, not on its name"
+                    .into(),
+            ));
+        };
+        relocate_by_external_id(store, scope, folder, entry, external_id).await?
+    } else {
+        None
+    };
+
+    let merged = match store.get_entry(scope, folder, entry).await {
+        Ok(existing) => merge_entry_update(data, existing),
+        Err(VaultError::NotFound) => data,
+        // Writing the request as-is here would replace a stored entry with
+        // one that has no secrets, so a failed read is an error, not a create.
+        Err(error) => return Err(UpsertError::UpdateFailed { moved_from, error }),
+    };
+
+    match store.put_entry(scope, folder, entry, &merged).await {
+        Ok(()) => Ok(UpsertOutcome {
+            moved_from,
+            entry: merged,
+        }),
+        Err(error) => Err(UpsertError::UpdateFailed { moved_from, error }),
+    }
+}
+
+/// PUT /api/addressbook/folders/:scope/:folder/entries/:entry — Update an entry,
+/// creating it if there is none. Admin only.
+///
+/// Read-modify-write: the stored entry is read first and the request's
+/// fields are merged on top, so credentials the request omits are kept (see
+/// `merge_entry_update`). With `?move=true` the entry is first located by
+/// `external_id` anywhere in the scope and moved here, credentials included,
+/// by the same path as `POST .../move` (see `relocate_by_external_id`).
 #[allow(clippy::too_many_arguments)]
 pub async fn ab_update_entry(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -3268,6 +4984,7 @@ pub async fn ab_update_entry(
     Extension(database): Extension<Db>,
     Extension(vault): Extension<VaultState>,
     Path((scope, folder, entry)): Path<(String, String, String)>,
+    Query(query): Query<EntryPutQuery>,
     Json(data): Json<AddressBookEntry>,
 ) -> impl IntoResponse {
     let admin_email = match identity.as_ref() {
@@ -3280,63 +4997,57 @@ pub async fn ab_update_entry(
                 .into_response()
         }
     };
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    let external_id = data.external_id.clone();
 
-    // Read existing entry to preserve credentials the frontend never sends back
-    let merged = match vault.get_entry(&scope, &folder, &entry).await {
-        Ok(existing) => {
-            // Per-hop credential merge: for each hop in the new data, if credentials
-            // are None and the same-index hop exists in the old data, preserve them.
-            let merged_jump_hosts = if let Some(ref new_hops) = data.jump_hosts {
-                let old_hops = existing.jump_hosts.as_deref().unwrap_or(&[]);
-                let merged: Vec<_> = new_hops
-                    .iter()
-                    .enumerate()
-                    .map(|(i, hop)| {
-                        let old = old_hops.get(i);
-                        crate::tunnel::JumpHost {
-                            hostname: hop.hostname.clone(),
-                            port: hop.port,
-                            username: hop.username.clone(),
-                            password: hop
-                                .password
-                                .clone()
-                                .or_else(|| old.and_then(|o| o.password.clone())),
-                            private_key: hop
-                                .private_key
-                                .clone()
-                                .or_else(|| old.and_then(|o| o.private_key.clone())),
-                            host_key: hop
-                                .host_key
-                                .clone()
-                                .or_else(|| old.and_then(|o| o.host_key.clone())),
-                        }
-                    })
-                    .collect();
-                Some(merged)
-            } else {
-                data.jump_hosts.clone()
-            };
+    let result = upsert_entry(vault.as_ref(), &scope, &folder, &entry, data, query.move_).await;
 
-            AddressBookEntry {
-                password: data.password.or(existing.password),
-                private_key: data.private_key.or(existing.private_key),
-                container_password: data.container_password.or(existing.container_password),
-                proxmox_token_secret: data.proxmox_token_secret.or(existing.proxmox_token_secret),
-                jump_hosts: merged_jump_hosts,
-                // Clear legacy flat fields — they've been migrated
-                jump_password: None,
-                jump_private_key: None,
-                ..data
-            }
-        }
-        Err(_) => data, // New entry or Vault error — just write what we have
+    // A move that happened is recorded whatever came after it, as the move
+    // endpoint records it, so the audit log says where the entry went.
+    let (moved_from, incomplete) = match &result {
+        Ok(outcome) => (outcome.moved_from.as_ref(), false),
+        Err(UpsertError::UpdateFailed { moved_from, .. }) => (moved_from.as_ref(), false),
+        Err(UpsertError::MoveIncomplete { from, .. }) => (Some(from), true),
+        Err(UpsertError::Rejected(..)) => (None, false),
     };
+    if let Some(from) = moved_from {
+        let details = json!({
+            "to_scope": scope,
+            "to_folder": folder,
+            "to_name": entry,
+            "external_id": external_id,
+        })
+        .to_string();
+        log_ab_event(
+            &database,
+            &admin_email,
+            if incomplete {
+                "move_entry_incomplete"
+            } else {
+                "move_entry"
+            },
+            &scope,
+            &from.folder,
+            Some(&from.name),
+            &ip,
+            Some(&details),
+        )
+        .await;
+    }
+    // The live refresh hears about the target folder from the request path;
+    // a move also changed the folder the entry came from, and did so even
+    // when what came after it failed.
+    let moved_changes = moved_from
+        .map(|from| upsert_move_changes(&scope, &from.folder, &folder))
+        .unwrap_or_default();
 
-    let session_type = merged.session_type.clone();
-    match vault.put_entry(&scope, &folder, &entry, &merged).await {
-        Ok(()) => {
-            let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
-            let details = json!({ "type": session_type }).to_string();
+    let response = match result {
+        Ok(outcome) => {
+            let details = json!({
+                "type": outcome.entry.session_type,
+                "moved_from": outcome.moved_from,
+            })
+            .to_string();
             log_ab_event(
                 &database,
                 &admin_email,
@@ -3348,14 +5059,709 @@ pub async fn ab_update_entry(
                 Some(&details),
             )
             .await;
-            Json(json!({"ok": true})).into_response()
+            match outcome.moved_from {
+                Some(from) => Json(json!({"ok": true, "moved_from": from})).into_response(),
+                None => Json(json!({"ok": true})).into_response(),
+            }
         }
-        Err(e) => (
+        Err(UpsertError::Rejected(status, msg)) => ab_error(status, msg),
+        Err(UpsertError::MoveIncomplete { error, .. }) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": e.to_string()})),
+            Json(json!({
+                "error": format!(
+                    "entry was copied to the target folder but the original could not be removed: {error}"
+                ),
+                "copied": true,
+            })),
         )
             .into_response(),
+        Err(UpsertError::UpdateFailed { error, .. }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    };
+    if moved_changes.is_empty() {
+        response
+    } else {
+        with_ab_changes(response, moved_changes)
     }
+}
+
+/// The folders a `PUT ...?move=true` that moved an entry changed: the one
+/// it came from and the one it went to (both in the request's scope).
+fn upsert_move_changes(scope: &str, from_folder: &str, to_folder: &str) -> Vec<AbChange> {
+    let mut changes = vec![AbChange::entries(scope, from_folder)];
+    if from_folder != to_folder {
+        changes.push(AbChange::entries(scope, to_folder));
+    }
+    changes
+}
+
+/// Body for `POST .../entries/{entry}/move` and `.../copy`.
+#[derive(Deserialize)]
+pub struct MoveEntryRequest {
+    pub target_scope: String,
+    pub target_folder: String,
+    /// Copy only: the name of the new entry. Defaults to the source name.
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
+fn ab_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// Copy an entry as stored in Vault, secrets included, to a target that
+/// must not already exist. Returns what was copied.
+///
+/// The browser cannot do this itself: it never receives an entry's secrets
+/// (password, private key, jump host credentials, tokens, or a `$variable`
+/// reference held in the password field), so a copy built from the edit
+/// form silently dropped all of them (#232).
+///
+/// Every endpoint that uses this is admin-only, like every other change to
+/// connection entries. If editing is ever delegated per folder (#231), they
+/// must require edit rights on the source AND the target: copying moves
+/// working credentials, so rights on the target alone would let an editor
+/// pull them out of a folder they cannot reach into one they can, and
+/// connect with them there.
+async fn copy_stored_entry<S: EntryStore>(
+    store: &S,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    target_scope: &str,
+    target_folder: &str,
+    target_name: &str,
+) -> Result<AddressBookEntry, (StatusCode, String)> {
+    let full = store
+        .get_entry(scope, folder, entry)
+        .await
+        .map_err(ab_vault_error)?;
+    // Vault refuses the write if anything already exists at the target, so
+    // an entry is never overwritten even by a concurrent writer.
+    match store
+        .put_entry_if_absent(target_scope, target_folder, target_name, &full)
+        .await
+    {
+        Ok(true) => Ok(full),
+        Ok(false) => Err((
+            StatusCode::CONFLICT,
+            "an entry with that name already exists in the target folder".into(),
+        )),
+        Err(e) => Err(ab_vault_error(e)),
+    }
+}
+
+/// Why a move did not complete.
+#[derive(Debug)]
+enum MoveError {
+    /// Nothing was changed: the copy to the target was refused.
+    Copy(StatusCode, String),
+    /// The copy is in place but the original could not be removed, so the
+    /// entry now exists in both folders.
+    Incomplete(VaultError),
+}
+
+/// Move an entry with everything stored in it: the full entry is copied to
+/// the target and only then is the original removed, so a failure leaves it
+/// in both folders rather than in neither. This is the server-side move
+/// behind `POST .../move`; `PUT ...?move=true` goes through it too.
+#[allow(clippy::too_many_arguments)]
+async fn move_stored_entry<S: EntryStore>(
+    store: &S,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    target_scope: &str,
+    target_folder: &str,
+    target_name: &str,
+) -> Result<AddressBookEntry, MoveError> {
+    let full = copy_stored_entry(
+        store,
+        scope,
+        folder,
+        entry,
+        target_scope,
+        target_folder,
+        target_name,
+    )
+    .await
+    .map_err(|(status, msg)| MoveError::Copy(status, msg))?;
+    store
+        .delete_entry(scope, folder, entry)
+        .await
+        .map_err(MoveError::Incomplete)?;
+    Ok(full)
+}
+
+/// Status for a Vault error on the move/copy path: a rejected name or
+/// scope is the caller's mistake, not the backend's.
+fn ab_vault_error(e: VaultError) -> (StatusCode, String) {
+    match e {
+        VaultError::NotFound => (StatusCode::NOT_FOUND, "entry not found".into()),
+        VaultError::BadName(msg) => (StatusCode::BAD_REQUEST, msg),
+        other => (StatusCode::BAD_GATEWAY, other.to_string()),
+    }
+}
+
+fn require_ab_admin(
+    identity: &Option<Extension<AuthIdentity>>,
+) -> Result<String, (StatusCode, String)> {
+    match identity {
+        Some(Extension(id)) if id.has_role("admin") => Ok(id.display_name().to_string()),
+        _ => Err((StatusCode::FORBIDDEN, "admin role required".into())),
+    }
+}
+
+/// POST /api/addressbook/folders/:scope/:folder/entries/:entry/move
+///
+/// Moves an entry with everything stored in it: the full entry is copied to
+/// the target and only then is the original removed. An existing entry of
+/// the same name in the target is never overwritten.
+#[allow(clippy::too_many_arguments)]
+pub async fn ab_move_entry(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder, entry)): Path<(String, String, String)>,
+    Json(req): Json<MoveEntryRequest>,
+) -> impl IntoResponse {
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    if req.target_scope == scope && req.target_folder == folder {
+        return ab_error(StatusCode::BAD_REQUEST, "entry is already in that folder");
+    }
+
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    let details = json!({
+        "to_scope": req.target_scope,
+        "to_folder": req.target_folder,
+    })
+    .to_string();
+
+    match move_stored_entry(
+        vault.as_ref(),
+        &scope,
+        &folder,
+        &entry,
+        &req.target_scope,
+        &req.target_folder,
+        &entry,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(MoveError::Copy(status, msg)) => return ab_error(status, msg),
+        // The copy is in place, so the entry is in both folders rather than
+        // in neither. Say so instead of reporting a plain error the caller
+        // might answer by retrying.
+        Err(MoveError::Incomplete(e)) => {
+            log_ab_event(
+                &database,
+                &admin_email,
+                "move_entry_incomplete",
+                &scope,
+                &folder,
+                Some(&entry),
+                &ip,
+                Some(&details),
+            )
+            .await;
+            // The target folder did change: tell the live refresh, though
+            // the request failed.
+            return with_ab_changes(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!(
+                            "entry was copied to the target folder but the original could not be removed: {e}"
+                        ),
+                        "copied": true,
+                    })),
+                )
+                    .into_response(),
+                vec![
+                    AbChange::entries(&scope, &folder),
+                    AbChange::entries(&req.target_scope, &req.target_folder),
+                ],
+            );
+        }
+    }
+
+    log_ab_event(
+        &database,
+        &admin_email,
+        "move_entry",
+        &scope,
+        &folder,
+        Some(&entry),
+        &ip,
+        Some(&details),
+    )
+    .await;
+    with_ab_changes(
+        (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        vec![
+            AbChange::entries(&scope, &folder),
+            AbChange::entries(&req.target_scope, &req.target_folder),
+        ],
+    )
+}
+
+/// Most entries one bulk request may name.
+const BULK_MAX_ITEMS: usize = 1000;
+/// Entries processed at once within a bulk request.
+const BULK_CONCURRENCY: usize = 8;
+/// Highest suffix tried when renaming around a clash (`name-2` .. `name-N`).
+const BULK_MAX_RENAME: u32 = 99;
+
+#[derive(Deserialize, Clone, PartialEq, Eq, Hash)]
+pub struct BulkItem {
+    pub scope: String,
+    pub folder: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct BulkTarget {
+    pub scope: String,
+    pub folder: String,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkAction {
+    Move,
+    Copy,
+    Delete,
+}
+
+/// What to do when the target already has an entry of the same name.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum OnConflict {
+    /// Leave that entry where it is and report it as skipped.
+    #[default]
+    Skip,
+    /// Use the first free `name-2`, `name-3`, ... instead.
+    Rename,
+}
+
+#[derive(Deserialize)]
+pub struct BulkRequest {
+    pub action: BulkAction,
+    pub items: Vec<BulkItem>,
+    #[serde(default)]
+    pub target: Option<BulkTarget>,
+    #[serde(default)]
+    pub on_conflict: OnConflict,
+}
+
+/// Names to try for an entry copied around a clash: the name itself, then
+/// `name-2` .. `name-99`, trimming the base so every candidate stays within
+/// Vault's 64-character name limit.
+fn rename_candidates(name: &str, rename: bool) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if rename {
+        for n in 2..=BULK_MAX_RENAME {
+            let suffix = format!("-{n}");
+            let keep = 64usize.saturating_sub(suffix.len()).min(name.len());
+            // Names are validated ASCII, so a byte cut is a char boundary.
+            out.push(format!("{}{}", &name[..keep], suffix));
+        }
+    }
+    out
+}
+
+/// Copy a stored entry, secrets included, into the target folder under the
+/// first free name allowed by `on_conflict`. Returns the name used, or
+/// `None` when the name was taken and the policy is to skip.
+async fn copy_entry_into(
+    vault: &VaultState,
+    item: &BulkItem,
+    target: &BulkTarget,
+    on_conflict: OnConflict,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let full = vault
+        .get_entry(&item.scope, &item.folder, &item.name)
+        .await
+        .map_err(ab_vault_error)?;
+    for candidate in rename_candidates(&item.name, on_conflict == OnConflict::Rename) {
+        // Vault refuses the write if anything exists there, so a clash is
+        // detected atomically and nothing is ever overwritten.
+        match vault
+            .put_entry_if_absent(&target.scope, &target.folder, &candidate, &full)
+            .await
+        {
+            Ok(true) => return Ok(Some(candidate)),
+            Ok(false) => continue,
+            Err(e) => return Err(ab_vault_error(e)),
+        }
+    }
+    if on_conflict == OnConflict::Rename {
+        Err((
+            StatusCode::CONFLICT,
+            "no free name found for the copy".into(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// One entry of a bulk request, handled on its own so a failure never
+/// affects the others. Audits what it did.
+async fn bulk_one(
+    vault: &VaultState,
+    database: &Db,
+    admin_email: &str,
+    ip: &str,
+    req: &BulkRequest,
+    item: &BulkItem,
+) -> serde_json::Value {
+    let mut result = json!({
+        "scope": item.scope,
+        "folder": item.folder,
+        "name": item.name,
+    });
+    let set = |r: &mut serde_json::Value, k: &str, v: serde_json::Value| {
+        r[k] = v;
+    };
+
+    if req.action == BulkAction::Delete {
+        // Vault reports success for deleting a path that does not exist, so
+        // look first: otherwise a missing entry would be reported (and
+        // audited) as deleted.
+        if let Err(e) = vault.get_entry(&item.scope, &item.folder, &item.name).await {
+            let (_, msg) = ab_vault_error(e);
+            set(&mut result, "status", json!("failed"));
+            set(&mut result, "error", json!(msg));
+            return result;
+        }
+        match vault
+            .delete_entry(&item.scope, &item.folder, &item.name)
+            .await
+        {
+            Ok(()) => {
+                log_ab_event(
+                    database,
+                    admin_email,
+                    "delete_entry",
+                    &item.scope,
+                    &item.folder,
+                    Some(&item.name),
+                    ip,
+                    Some(r#"{"bulk":true}"#),
+                )
+                .await;
+                set(&mut result, "status", json!("deleted"));
+            }
+            Err(e) => {
+                let (_, msg) = ab_vault_error(e);
+                set(&mut result, "status", json!("failed"));
+                set(&mut result, "error", json!(msg));
+            }
+        }
+        return result;
+    }
+
+    // Move and copy both have a target (checked by the caller).
+    let target = req.target.as_ref().expect("target checked");
+    if req.action == BulkAction::Move && item.scope == target.scope && item.folder == target.folder
+    {
+        set(&mut result, "status", json!("skipped"));
+        set(&mut result, "error", json!("already in that folder"));
+        return result;
+    }
+
+    let used = match copy_entry_into(vault, item, target, req.on_conflict).await {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            set(&mut result, "status", json!("skipped"));
+            set(
+                &mut result,
+                "error",
+                json!("an entry with that name already exists in the target folder"),
+            );
+            return result;
+        }
+        Err((_, msg)) => {
+            set(&mut result, "status", json!("failed"));
+            set(&mut result, "error", json!(msg));
+            return result;
+        }
+    };
+    if used != item.name {
+        set(&mut result, "new_name", json!(used));
+    }
+    let details = json!({
+        "bulk": true,
+        "to_scope": target.scope,
+        "to_folder": target.folder,
+        "to_name": used,
+    })
+    .to_string();
+
+    if req.action == BulkAction::Copy {
+        log_ab_event(
+            database,
+            admin_email,
+            "copy_entry",
+            &item.scope,
+            &item.folder,
+            Some(&item.name),
+            ip,
+            Some(&details),
+        )
+        .await;
+        set(&mut result, "status", json!("copied"));
+        return result;
+    }
+
+    // Move: the copy is in place, so a failed removal leaves the entry in
+    // both folders, never in neither. Report that distinctly.
+    match vault
+        .delete_entry(&item.scope, &item.folder, &item.name)
+        .await
+    {
+        Ok(()) => {
+            log_ab_event(
+                database,
+                admin_email,
+                "move_entry",
+                &item.scope,
+                &item.folder,
+                Some(&item.name),
+                ip,
+                Some(&details),
+            )
+            .await;
+            set(&mut result, "status", json!("moved"));
+        }
+        Err(e) => {
+            log_ab_event(
+                database,
+                admin_email,
+                "move_entry_incomplete",
+                &item.scope,
+                &item.folder,
+                Some(&item.name),
+                ip,
+                Some(&details),
+            )
+            .await;
+            set(&mut result, "status", json!("copied_not_removed"));
+            set(
+                &mut result,
+                "error",
+                json!(format!(
+                    "copied, but the original could not be removed: {}",
+                    ab_vault_error(e).1
+                )),
+            );
+        }
+    }
+    result
+}
+
+/// POST /api/addressbook/bulk
+///
+/// Move, copy or delete many entries in one request. Each entry is handled
+/// on its own, through the same stored-entry copy as the single-entry
+/// endpoints (credentials included, never overwriting), and the response
+/// reports what happened to each. Admin only. See `copy_stored_entry` for
+/// the rule any future per-folder delegation must follow.
+pub async fn ab_bulk(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Json(req): Json<BulkRequest>,
+) -> impl IntoResponse {
+    use futures_util::StreamExt;
+
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    if req.items.is_empty() {
+        return ab_error(StatusCode::BAD_REQUEST, "no entries given");
+    }
+    if req.items.len() > BULK_MAX_ITEMS {
+        return ab_error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {BULK_MAX_ITEMS} entries per request"),
+        );
+    }
+    if req.action != BulkAction::Delete && req.target.is_none() {
+        return ab_error(StatusCode::BAD_REQUEST, "move and copy need a target");
+    }
+
+    // The same entry named twice would race itself (a move whose source is
+    // gone by the second pass), so act on each once.
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<BulkItem> = req
+        .items
+        .iter()
+        .filter(|i| seen.insert((*i).clone()))
+        .cloned()
+        .collect();
+
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    // Each future owns what it uses: borrowing into a buffered stream does
+    // not satisfy the handler's Send bound.
+    let req = Arc::new(req);
+    let results: Vec<serde_json::Value> = futures_util::stream::iter(items)
+        .map(|item| {
+            let (vault, database, admin_email, ip, req) = (
+                vault.clone(),
+                database.clone(),
+                admin_email.clone(),
+                ip.clone(),
+                req.clone(),
+            );
+            async move { bulk_one(&vault, &database, &admin_email, &ip, &req, &item).await }
+        })
+        .buffered(BULK_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut summary = std::collections::BTreeMap::<String, usize>::new();
+    for r in &results {
+        if let Some(s) = r["status"].as_str() {
+            *summary.entry(s.to_string()).or_default() += 1;
+        }
+    }
+    // Every source folder and the target, for the change log; which of them
+    // actually changed is not worth a per-item account.
+    let mut touched: Vec<AbChange> = Vec::new();
+    for item in &req.items {
+        let c = AbChange::entries(&item.scope, &item.folder);
+        if !touched.contains(&c) {
+            touched.push(c);
+        }
+    }
+    if let Some(t) = &req.target {
+        let c = AbChange::entries(&t.scope, &t.folder);
+        if !touched.contains(&c) {
+            touched.push(c);
+        }
+    }
+    with_ab_changes(
+        (
+            StatusCode::OK,
+            Json(json!({ "results": results, "summary": summary })),
+        )
+            .into_response(),
+        touched,
+    )
+}
+
+/// GET /api/addressbook/folder-paths
+///
+/// Every folder in both scopes, for the bulk move/copy picker. Admin only,
+/// as it is only used to choose where entries go. The tree view loads
+/// subfolders lazily, so it cannot supply this itself.
+pub async fn ab_folder_paths(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(vault): Extension<VaultState>,
+) -> impl IntoResponse {
+    if let Err((status, msg)) = require_ab_admin(&identity) {
+        return ab_error(status, msg);
+    }
+    let (top, unavailable) = match vault.list_all_folders().await {
+        Ok(t) => t,
+        Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+    let mut queue: Vec<(String, String)> = top
+        .into_iter()
+        .map(|f| (f.scope, f.path.unwrap_or(f.name)))
+        .collect();
+    let mut folders = Vec::new();
+    while let Some((scope, path)) = queue.pop() {
+        if let Ok(subs) = vault.list_subfolders(&scope, &path).await {
+            for s in subs {
+                queue.push((scope.clone(), s.path.unwrap_or_else(|| s.name.clone())));
+            }
+        }
+        folders.push(json!({ "scope": scope, "path": path }));
+    }
+    folders.sort_by(|a, b| {
+        (a["scope"].as_str(), a["path"].as_str()).cmp(&(b["scope"].as_str(), b["path"].as_str()))
+    });
+    Json(json!({ "folders": folders, "unavailable": unavailable })).into_response()
+}
+
+/// POST /api/addressbook/folders/:scope/:folder/entries/:entry/copy
+///
+/// Copies an entry with everything stored in it, under `new_name` in the
+/// target folder. Used by Clone, which then applies the form's edits with
+/// an ordinary update (which keeps stored secrets it is not given).
+#[allow(clippy::too_many_arguments)]
+pub async fn ab_copy_entry(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder, entry)): Path<(String, String, String)>,
+    Json(req): Json<MoveEntryRequest>,
+) -> impl IntoResponse {
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    let new_name = req.new_name.clone().unwrap_or_else(|| entry.clone());
+    if req.target_scope == scope && req.target_folder == folder && new_name == entry {
+        return ab_error(StatusCode::BAD_REQUEST, "copy needs a new name or folder");
+    }
+    if let Err((status, msg)) = copy_stored_entry(
+        vault.as_ref(),
+        &scope,
+        &folder,
+        &entry,
+        &req.target_scope,
+        &req.target_folder,
+        &new_name,
+    )
+    .await
+    {
+        return ab_error(status, msg);
+    }
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    let details = json!({
+        "to_scope": req.target_scope,
+        "to_folder": req.target_folder,
+        "to_name": new_name,
+    })
+    .to_string();
+    log_ab_event(
+        &database,
+        &admin_email,
+        "copy_entry",
+        &scope,
+        &folder,
+        Some(&entry),
+        &ip,
+        Some(&details),
+    )
+    .await;
+    with_ab_changes(
+        (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        vec![
+            AbChange::entries(&scope, &folder),
+            AbChange::entries(&req.target_scope, &req.target_folder),
+        ],
+    )
 }
 
 /// DELETE /api/addressbook/folders/:scope/:folder/entries/:entry — Delete an entry. Admin only.
@@ -3378,6 +5784,26 @@ pub async fn ab_delete_entry(
                 .into_response()
         }
     };
+
+    // Vault reports success for deleting a path that does not exist, so
+    // look first rather than answer (and audit) a delete of nothing.
+    match vault.get_entry(&scope, &folder, &entry).await {
+        Ok(_) => {}
+        Err(VaultError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "entry not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
 
     match vault.delete_entry(&scope, &folder, &entry).await {
         Ok(()) => {
@@ -4626,6 +7052,10 @@ pub async fn quick_connect(
             }
         };
 
+        // Same folder defaults as the Connections connect endpoint, so an
+        // entry that works from the page works from a link too.
+        let ab_entry = lend_folder_defaults(vault.as_ref(), scope, folder, entry, ab_entry).await;
+
         // Resolve credential variable references
         let ab_entry = if !crate::vault::entry_credential_variables(&ab_entry).is_empty() {
             let user_email = match &id {
@@ -4765,6 +7195,12 @@ pub async fn quick_connect(
             max_monitors: None,
             owner: None,
             fence_all_targets: false,
+            ssh_font_size: ab_entry.ssh_font_size,
+            wol_send_packet: ab_entry.wol_send_packet,
+            wol_mac_addr: ab_entry.wol_mac_addr,
+            wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+            wol_udp_port: ab_entry.wol_udp_port,
+            wol_wait_time: ab_entry.wol_wait_time,
         };
 
         tracing::info!(
@@ -4886,6 +7322,12 @@ pub async fn quick_connect(
         max_monitors: None,
         owner: None,
         fence_all_targets: false,
+        ssh_font_size: None,
+        wol_send_packet: None,
+        wol_mac_addr: None,
+        wol_broadcast_addr: None,
+        wol_udp_port: None,
+        wol_wait_time: None,
     };
 
     match manager.create_session(create_req, admin_name).await {
@@ -5037,7 +7479,1104 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_update_leaves_an_omitted_display_name_alone() {
+        // A client or script that predates display names saves a folder
+        // without the field: that must not wipe the stored title. An empty
+        // string is how a title is cleared on purpose.
+        let old: UpdateFolderRequest =
+            serde_json::from_str(r#"{"allowed_groups":["ops"],"description":"x"}"#).unwrap();
+        assert_eq!(old.display_name, None);
+        assert_eq!(old.allowed_users, None);
+        let cleared: UpdateFolderRequest =
+            serde_json::from_str(r#"{"allowed_groups":[],"display_name":""}"#).unwrap();
+        assert_eq!(cleared.display_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn address_book_change_attribution() {
+        use axum::http::Method;
+        let f = ab_changes_for_request;
+        // entries: create, update, delete; the folder segment is decoded
+        assert_eq!(
+            f(&Method::POST, "/api/addressbook/folders/shared/x/entries"),
+            Some((vec![AbChange::entries("shared", "x")], true))
+        );
+        assert_eq!(
+            f(
+                &Method::PUT,
+                "/api/addressbook/folders/shared/a%2Fb/entries/y"
+            ),
+            Some((vec![AbChange::entries("shared", "a/b")], true))
+        );
+        assert_eq!(
+            f(
+                &Method::DELETE,
+                "/api/addressbook/folders/instance/x/entries/y"
+            ),
+            Some((vec![AbChange::entries("instance", "x")], true))
+        );
+        // the folder itself
+        assert_eq!(
+            f(&Method::PUT, "/api/addressbook/folders/shared/a%2Fb"),
+            Some((vec![AbChange::tree("shared", "a/b")], true))
+        );
+        assert_eq!(
+            f(&Method::DELETE, "/api/addressbook/folders/shared/x"),
+            Some((vec![AbChange::tree("shared", "x")], true))
+        );
+        // folder defaults reach subfolders too: everything is refreshed
+        assert_eq!(
+            f(
+                &Method::PUT,
+                "/api/addressbook/folders/shared/a%2Fb/defaults"
+            ),
+            Some((vec![], false))
+        );
+        assert_eq!(
+            f(
+                &Method::DELETE,
+                "/api/addressbook/folders/shared/x/defaults"
+            ),
+            Some((vec![], false))
+        );
+        // the body knows the rest: the handler reports it
+        assert_eq!(
+            f(&Method::POST, "/api/addressbook/folders"),
+            Some((vec![], false))
+        );
+        assert_eq!(
+            f(&Method::POST, "/api/addressbook/bulk"),
+            Some((vec![], false))
+        );
+        assert_eq!(
+            f(
+                &Method::POST,
+                "/api/addressbook/folders/shared/x/entries/y/move"
+            ),
+            Some((vec![AbChange::entries("shared", "x")], false))
+        );
+        assert_eq!(
+            f(
+                &Method::POST,
+                "/api/addressbook/folders/shared/x/entries/y/copy"
+            ),
+            Some((vec![AbChange::entries("shared", "x")], false))
+        );
+        // reads and connects are not changes
+        assert_eq!(f(&Method::GET, "/api/addressbook"), None);
+        assert_eq!(f(&Method::GET, "/api/addressbook/version"), None);
+        assert_eq!(f(&Method::GET, "/api/addressbook/search-index"), None);
+        assert_eq!(
+            f(
+                &Method::POST,
+                "/api/addressbook/folders/shared/x/entries/y/connect"
+            ),
+            None
+        );
+        assert_eq!(f(&Method::POST, "/api/sessions"), None);
+        // a user's own credential variables are not an address-book change:
+        // saving them must not touch every other tab
+        assert_eq!(f(&Method::PUT, "/api/me/credentials"), None);
+        assert_eq!(f(&Method::GET, "/api/me/credentials"), None);
+    }
+
+    #[test]
+    fn address_book_change_log_since() {
+        let log = AddressBookChanges::default();
+        assert_eq!(log.snapshot(), (0, 0));
+        let s = log.since(0);
+        assert_eq!((s.version, s.changes), (0, Some(vec![])));
+
+        assert_eq!(log.record(vec![AbChange::entries("shared", "a")]), 1);
+        assert_eq!(log.record(vec![AbChange::entries("shared", "a")]), 2);
+        assert_eq!(
+            log.record(vec![
+                AbChange::tree("shared", "b"),
+                AbChange::entries("instance", "c"),
+            ]),
+            3
+        );
+        let (v, t) = log.snapshot();
+        assert_eq!(v, 3);
+        assert!(t > 1_600_000_000_000);
+
+        // everything since 0, repeats collapsed, order kept
+        let s = log.since(0);
+        assert_eq!(
+            s.changes,
+            Some(vec![
+                AbChange::entries("shared", "a"),
+                AbChange::tree("shared", "b"),
+                AbChange::entries("instance", "c"),
+            ])
+        );
+        // only what came after the version the page saw
+        assert_eq!(
+            log.since(2).changes,
+            Some(vec![
+                AbChange::tree("shared", "b"),
+                AbChange::entries("instance", "c"),
+            ])
+        );
+        assert_eq!(log.since(3).changes, Some(vec![]));
+        // a page ahead of the log saw a previous process: told to refresh,
+        // not that nothing moved, or it would wait for the count to catch up
+        assert_eq!(log.since(99).changes, None);
+
+        // an unattributed change swallows the rest
+        log.record(vec![AbChange::all()]);
+        assert_eq!(log.since(0).changes, Some(vec![AbChange::all()]));
+        assert_eq!(log.since(3).changes, Some(vec![AbChange::all()]));
+        assert_eq!(
+            log.since(4).changes,
+            Some(vec![]),
+            "the swallow applies only to what the page has not seen"
+        );
+    }
+
+    #[test]
+    fn address_book_change_log_forgets_the_oldest() {
+        let log = AddressBookChanges::default();
+        // Two changes per version: the ring then holds LEN/2 versions.
+        for i in 0..(AB_CHANGE_LOG_LEN as u64) {
+            log.record(vec![
+                AbChange::entries("shared", &format!("f{i}")),
+                AbChange::tree("shared", &format!("f{i}")),
+            ]);
+        }
+        let version = log.snapshot().0;
+        assert_eq!(version, AB_CHANGE_LOG_LEN as u64);
+        let oldest_kept = version - (AB_CHANGE_LOG_LEN as u64 / 2) + 1;
+        // Reachable: every version after `since` is still whole in the log.
+        assert!(log.since(oldest_kept - 1).changes.is_some());
+        assert_eq!(
+            log.since(oldest_kept - 1).changes.unwrap().len(),
+            AB_CHANGE_LOG_LEN
+        );
+        // One further back and part of the range is gone: say so, rather
+        // than hand the page a partial list it would trust.
+        assert!(log.since(oldest_kept - 2).changes.is_none());
+        assert!(log.since(0).changes.is_none());
+        // Still exact at the newest end.
+        assert_eq!(log.since(version - 1).changes.unwrap().len(), 2);
+    }
+
+    /// The middleware, on a router: what reaches the log for each kind of
+    /// request, and that a user's credential variables never do.
+    #[tokio::test]
+    async fn address_book_change_track_middleware() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use axum::routing::{post, put};
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let log = AddressBookChanges::default();
+        let app = Router::new()
+            .route("/api/me/credentials", put(|| async { "ok" }))
+            .route(
+                "/api/addressbook/folders/{scope}/{folder}/entries/{entry}",
+                put(|| async { "ok" }),
+            )
+            .route(
+                "/api/addressbook/folders/{scope}/{folder}/entries",
+                post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "vault down") }),
+            )
+            .route(
+                "/api/addressbook/folders",
+                post(|| async {
+                    with_ab_changes(
+                        (StatusCode::CREATED, "ok").into_response(),
+                        vec![AbChange::tree("instance", "new/sub")],
+                    )
+                }),
+            )
+            .route("/api/addressbook/bulk", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(ab_change_track))
+            .layer(Extension(log.clone()));
+
+        let send = |method: Method, uri: &str| {
+            let app = app.clone();
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+
+        // A user saving their own credential variables: nothing logged.
+        assert!(send(Method::PUT, "/api/me/credentials").await.is_success());
+        assert_eq!(log.snapshot().0, 0);
+
+        // An entry write: logged against its (decoded) folder.
+        assert!(send(
+            Method::PUT,
+            "/api/addressbook/folders/shared/a%2Fb/entries/host1"
+        )
+        .await
+        .is_success());
+        assert_eq!(log.snapshot().0, 1);
+        assert_eq!(
+            log.since(0).changes,
+            Some(vec![AbChange::entries("shared", "a/b")])
+        );
+
+        // A failed write changes nothing, so it is not logged.
+        assert_eq!(
+            send(Method::POST, "/api/addressbook/folders/shared/x/entries").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(log.snapshot().0, 1);
+
+        // A handler that reports its folders: logged precisely, not as `all`.
+        assert!(send(Method::POST, "/api/addressbook/folders")
+            .await
+            .is_success());
+        assert_eq!(
+            log.since(1).changes,
+            Some(vec![AbChange::tree("instance", "new/sub")])
+        );
+
+        // A body-dependent route whose handler reports nothing: `all`, so
+        // the page refreshes rather than misses it.
+        assert!(send(Method::POST, "/api/addressbook/bulk")
+            .await
+            .is_success());
+        assert_eq!(log.since(2).changes, Some(vec![AbChange::all()]));
+        assert_eq!(log.snapshot().0, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_move_that_changed_folders_is_still_logged() {
+        // A move that copied the entry but could not remove the original
+        // answers 502, yet both folders changed: the handler reports them
+        // and the log records exactly those, not the request's own path.
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::put;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let log = AddressBookChanges::default();
+        let app = Router::new()
+            .route(
+                "/api/addressbook/folders/{scope}/{folder}/entries/{entry}",
+                put(|| async {
+                    with_ab_changes(
+                        (StatusCode::BAD_GATEWAY, "copied").into_response(),
+                        upsert_move_changes("shared", "tenant-a", "tenant-b"),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(ab_change_track))
+            .layer(Extension(log.clone()));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/addressbook/folders/shared/tenant-b/entries/fw01?move=true")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            log.since(0).changes,
+            Some(vec![
+                AbChange::entries("shared", "tenant-a"),
+                AbChange::entries("shared", "tenant-b"),
+            ])
+        );
+    }
+
+    #[test]
+    fn upsert_move_changes_names_both_folders_once() {
+        assert_eq!(
+            upsert_move_changes("shared", "a", "b"),
+            vec![
+                AbChange::entries("shared", "a"),
+                AbChange::entries("shared", "b")
+            ]
+        );
+        // A rename within the folder changed one folder.
+        assert_eq!(
+            upsert_move_changes("shared", "a", "a"),
+            vec![AbChange::entries("shared", "a")]
+        );
+    }
+
+    #[test]
+    fn address_book_change_log_epochs_differ_and_fit_javascript() {
+        // The page compares epochs as JavaScript numbers, so they must be
+        // exact below 2^53, and two processes must not share one.
+        let a = AddressBookChanges::default();
+        let b = AddressBookChanges::default();
+        assert_ne!(a.epoch(), b.epoch());
+        for e in [a.epoch(), b.epoch()] {
+            assert!(e > 0 && e < (1u64 << 53), "{e}");
+        }
+        // A clone is the same log.
+        assert_eq!(a.clone().epoch(), a.epoch());
+    }
+
+    #[tokio::test]
+    async fn version_rows_never_name_a_folder_the_caller_cannot_open() {
+        // An operator granted only teamA polls while an admin works in
+        // secretco and creates a folder there. The answer may say that
+        // teamA's entries changed and that the tree changed somewhere, and
+        // nothing else: no secretco path, not even in a tree row.
+        let can_open = |scope: String, folder: String| async move {
+            Ok::<_, VaultError>(scope == "shared" && folder == "teamA")
+        };
+        let rows = vec![
+            AbChange::entries("shared", "teamA"),
+            AbChange::entries("shared", "customers/secretco"),
+            AbChange::tree("shared", "customers/secretco/new"),
+            AbChange::tree("shared", "teamA"),
+        ];
+        let out = ab_changes_visible_to(rows, can_open).await;
+        assert_eq!(
+            out,
+            vec![
+                AbChange::entries("shared", "teamA"),
+                AbChange::tree_anywhere()
+            ]
+        );
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("secretco"), "{text}");
+
+        // Only a change the caller can't see: just "the tree changed" if a
+        // folder moved, otherwise nothing at all.
+        let out = ab_changes_visible_to(
+            vec![AbChange::entries("shared", "customers/secretco")],
+            can_open,
+        )
+        .await;
+        assert!(out.is_empty(), "{out:?}");
+
+        // A folder that has gone, or an access check that fails, never
+        // names the folder; a failure still makes the page refresh.
+        let out = ab_changes_visible_to(
+            vec![
+                AbChange::entries("shared", "gone"),
+                AbChange::entries("shared", "flaky"),
+            ],
+            |_scope: String, folder: String| async move {
+                if folder == "gone" {
+                    Err(VaultError::NotFound)
+                } else {
+                    Err(VaultError::Parse("vault down".into()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(out, vec![AbChange::tree_anywhere()]);
+
+        // `all` names nothing and passes through as is.
+        let out = ab_changes_visible_to(
+            vec![AbChange::entries("shared", "teamA"), AbChange::all()],
+            can_open,
+        )
+        .await;
+        assert_eq!(out, vec![AbChange::all()]);
+
+        // A burst is not checked row by row: one path-less marker, and no
+        // access check at all.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let many: Vec<AbChange> = (0..=AB_VERSION_MAX_CHECKED_ROWS)
+            .map(|i| AbChange::entries("shared", &format!("f{i}")))
+            .collect();
+        let out = ab_changes_visible_to(many, |_s: String, _f: String| {
+            checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok::<_, VaultError>(true) }
+        })
+        .await;
+        assert_eq!(out, vec![AbChange::tree_anywhere()]);
+        assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
     use std::path::Path;
+
+    #[test]
+    fn entry_put_query_parses_the_move_flag() {
+        // `PUT .../entries/:entry?move=true` is what the NetBox upsert sends;
+        // the flag must default to off and accept only an explicit true.
+        let q: EntryPutQuery = serde_urlencoded::from_str("move=true").unwrap();
+        assert!(q.move_);
+        let q: EntryPutQuery = serde_urlencoded::from_str("move=false").unwrap();
+        assert!(!q.move_);
+        let q: EntryPutQuery = serde_urlencoded::from_str("").unwrap();
+        assert!(!q.move_, "move defaults to off");
+        assert!(
+            serde_urlencoded::from_str::<EntryPutQuery>("move=yes").is_err(),
+            "a non-boolean value is rejected rather than treated as true"
+        );
+    }
+
+    // ── `PUT .../entries/:entry?move=true`: the entry is matched on its
+    // stored external_id, never on its name across folders; a match
+    // elsewhere is moved whole by the server-side move and only then
+    // updated, so no secret the payload lacks is ever lost. ──
+
+    /// In-memory stand-in for the Vault entry store, keyed by folder + name.
+    #[derive(Default)]
+    struct FakeStore {
+        entries: std::sync::Mutex<std::collections::BTreeMap<(String, String), AddressBookEntry>>,
+        /// Make every delete fail, for the incomplete-move path.
+        fail_delete: bool,
+    }
+
+    impl FakeStore {
+        fn with(entries: &[(&str, &str, AddressBookEntry)]) -> Self {
+            let store = FakeStore::default();
+            for (folder, name, e) in entries {
+                store
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .insert((folder.to_string(), name.to_string()), e.clone());
+            }
+            store
+        }
+        fn stored(&self, folder: &str, name: &str) -> Option<AddressBookEntry> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(&(folder.to_string(), name.to_string()))
+                .cloned()
+        }
+        /// Every `folder/name` held, sorted.
+        fn keys(&self) -> Vec<String> {
+            self.entries
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|(f, n)| format!("{f}/{n}"))
+                .collect()
+        }
+    }
+
+    impl EntryStore for FakeStore {
+        async fn folder_paths(&self, _scope: &str) -> Result<Vec<String>, VaultError> {
+            let mut folders: Vec<String> = self
+                .entries
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|(f, _)| f.clone())
+                .collect();
+            folders.dedup();
+            Ok(folders)
+        }
+        async fn entry_names(&self, _scope: &str, folder: &str) -> Result<Vec<String>, VaultError> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(f, _)| f == folder)
+                .map(|(_, n)| n.clone())
+                .collect())
+        }
+        async fn get_entry(
+            &self,
+            _scope: &str,
+            folder: &str,
+            entry: &str,
+        ) -> Result<AddressBookEntry, VaultError> {
+            self.stored(folder, entry).ok_or(VaultError::NotFound)
+        }
+        async fn put_entry(
+            &self,
+            _scope: &str,
+            folder: &str,
+            entry: &str,
+            data: &AddressBookEntry,
+        ) -> Result<(), VaultError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((folder.to_string(), entry.to_string()), data.clone());
+            Ok(())
+        }
+        async fn put_entry_if_absent(
+            &self,
+            _scope: &str,
+            folder: &str,
+            entry: &str,
+            data: &AddressBookEntry,
+        ) -> Result<bool, VaultError> {
+            let mut entries = self.entries.lock().unwrap();
+            let key = (folder.to_string(), entry.to_string());
+            if entries.contains_key(&key) {
+                return Ok(false);
+            }
+            entries.insert(key, data.clone());
+            Ok(true)
+        }
+        async fn delete_entry(
+            &self,
+            _scope: &str,
+            folder: &str,
+            entry: &str,
+        ) -> Result<(), VaultError> {
+            if self.fail_delete {
+                return Err(VaultError::Parse("delete refused".into()));
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(&(folder.to_string(), entry.to_string()))
+                .map(|_| ())
+                .ok_or(VaultError::NotFound)
+        }
+    }
+
+    /// An entry from JSON, as the webhook or the edit form sends it.
+    fn entry(v: serde_json::Value) -> AddressBookEntry {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Device 1 as stored, with every kind of credential someone adds by
+    /// hand: a password holding a `$variable` reference, a private key and
+    /// a jump host password.
+    fn fw01_stored() -> AddressBookEntry {
+        entry(json!({
+            "type": "ssh", "hostname": "10.0.0.1", "port": 22, "username": "admin",
+            "password": "$tenant_a_password", "private_key": "-----BEGIN KEY-----",
+            "jump_hosts": [{"hostname": "bastion", "port": 22, "username": "jump", "password": "jump-pw"}],
+            "external_id": "netbox:device:1"
+        }))
+    }
+
+    /// What the NetBox webhook sends for device 1: no secrets at all.
+    fn fw01_webhook(hostname: &str) -> AddressBookEntry {
+        entry(json!({
+            "type": "ssh", "hostname": hostname, "port": 22, "username": "admin",
+            "jump_hosts": [{"hostname": "bastion", "port": 22, "username": "jump"}],
+            "external_id": "netbox:device:1"
+        }))
+    }
+
+    fn from(folder: &str, name: &str) -> MovedFrom {
+        MovedFrom {
+            folder: folder.into(),
+            name: name.into(),
+        }
+    }
+
+    fn rejected(err: UpsertError) -> (StatusCode, String) {
+        match err {
+            UpsertError::Rejected(status, msg) => (status, msg),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn move_upsert_leaves_a_same_named_entry_in_another_folder_alone() {
+        // Names are not unique across folders: tenant A and tenant B each
+        // have a fw01. A's webhook must never touch B's, credentials and all.
+        let store = FakeStore::with(&[
+            ("tenant-a", "fw01", fw01_stored()),
+            (
+                "tenant-b",
+                "fw01",
+                entry(
+                    json!({"type": "ssh", "hostname": "10.0.1.1", "password": "b-secret",
+                             "external_id": "netbox:device:2"}),
+                ),
+            ),
+        ]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-a",
+            "fw01",
+            fw01_webhook("10.0.0.9"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, None);
+        assert_eq!(store.keys(), ["tenant-a/fw01", "tenant-b/fw01"]);
+        let b = store.stored("tenant-b", "fw01").unwrap();
+        assert_eq!(b.password.as_deref(), Some("b-secret"));
+        assert_eq!(b.hostname.as_deref(), Some("10.0.1.1"));
+        let a = store.stored("tenant-a", "fw01").unwrap();
+        assert_eq!(a.hostname.as_deref(), Some("10.0.0.9"));
+
+        // A third tenant's own fw01 is created there; the other two are as
+        // they were.
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-c",
+            "fw01",
+            entry(json!({"type": "ssh", "hostname": "10.0.2.1", "external_id": "netbox:device:3"})),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, None);
+        assert_eq!(
+            store.keys(),
+            ["tenant-a/fw01", "tenant-b/fw01", "tenant-c/fw01"]
+        );
+        assert_eq!(
+            store
+                .stored("tenant-a", "fw01")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("$tenant_a_password")
+        );
+        assert_eq!(
+            store
+                .stored("tenant-b", "fw01")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("b-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn move_upsert_moves_the_matched_entry_with_its_credentials() {
+        // The device changed tenant, so the webhook now writes to tenant B's
+        // (nested) folder, and it carries no secrets. The stored entry is
+        // moved whole first (#232: the $variable reference, the key and the
+        // jump host password come along), and the update lands on top.
+        let store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenants/tenant-b",
+            "fw01",
+            fw01_webhook("10.0.1.9"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, Some(from("tenant-a", "fw01")));
+        assert_eq!(
+            store.keys(),
+            ["tenants/tenant-b/fw01"],
+            "the original is gone and nothing else appeared"
+        );
+        let moved = store.stored("tenants/tenant-b", "fw01").unwrap();
+        assert_eq!(
+            moved.hostname.as_deref(),
+            Some("10.0.1.9"),
+            "update applied"
+        );
+        assert_eq!(moved.password.as_deref(), Some("$tenant_a_password"));
+        assert_eq!(moved.private_key.as_deref(), Some("-----BEGIN KEY-----"));
+        assert_eq!(
+            moved.jump_hosts.as_ref().unwrap()[0].password.as_deref(),
+            Some("jump-pw")
+        );
+        assert_eq!(moved.external_id.as_deref(), Some("netbox:device:1"));
+    }
+
+    #[tokio::test]
+    async fn move_upsert_follows_a_rename_within_the_folder() {
+        // Same tenant, new device name: matched on the id, so it is a move
+        // (with its secrets), not a second entry beside an orphan.
+        let store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-a",
+            "fw01-core",
+            fw01_webhook("10.0.0.1"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, Some(from("tenant-a", "fw01")));
+        assert_eq!(store.keys(), ["tenant-a/fw01-core"]);
+        assert_eq!(
+            store
+                .stored("tenant-a", "fw01-core")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("$tenant_a_password")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_without_secrets_keeps_the_stored_ones() {
+        // The steady state: the device is where the webhook says. A payload
+        // without secrets keeps every stored one, and a form edit that also
+        // omits external_id keeps that.
+        let store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-a",
+            "fw01",
+            fw01_webhook("10.0.0.2"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, None, "already there: nothing to move");
+        let e = store.stored("tenant-a", "fw01").unwrap();
+        assert_eq!(e.hostname.as_deref(), Some("10.0.0.2"));
+        assert_eq!(e.password.as_deref(), Some("$tenant_a_password"));
+        assert_eq!(e.private_key.as_deref(), Some("-----BEGIN KEY-----"));
+        assert_eq!(
+            e.jump_hosts.as_ref().unwrap()[0].password.as_deref(),
+            Some("jump-pw")
+        );
+
+        // The edit form: no secrets, no external_id, no move flag.
+        let form = entry(
+            json!({"type": "ssh", "hostname": "10.0.0.3", "port": 2222, "username": "admin"}),
+        );
+        upsert_entry(&store, "shared", "tenant-a", "fw01", form, false)
+            .await
+            .unwrap();
+        let e = store.stored("tenant-a", "fw01").unwrap();
+        assert_eq!(e.port, Some(2222));
+        assert_eq!(e.password.as_deref(), Some("$tenant_a_password"));
+        assert_eq!(
+            e.external_id.as_deref(),
+            Some("netbox:device:1"),
+            "a form edit does not cut the entry loose from its source"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_upsert_adopts_a_hand_made_entry_of_that_name() {
+        // Made by hand before syncing began: same folder and name, no id.
+        // Updated in place, password kept, and it takes the id.
+        let store = FakeStore::with(&[(
+            "tenant-a",
+            "fw01",
+            entry(json!({"type": "ssh", "hostname": "10.0.0.1", "password": "typed-in"})),
+        )]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-a",
+            "fw01",
+            fw01_webhook("10.0.0.1"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, None);
+        let e = store.stored("tenant-a", "fw01").unwrap();
+        assert_eq!(e.password.as_deref(), Some("typed-in"));
+        assert_eq!(e.external_id.as_deref(), Some("netbox:device:1"));
+    }
+
+    #[tokio::test]
+    async fn move_upsert_does_not_adopt_when_the_id_is_already_elsewhere() {
+        // Device 1 moves to tenant B, where someone had made an fw01 by
+        // hand. Adopting it would leave device 1's id on two entries and
+        // every later sync of the device refused as ambiguous, so it is
+        // refused now with both entries as they were.
+        let store = FakeStore::with(&[
+            ("tenant-a", "fw01", fw01_stored()),
+            (
+                "tenant-b",
+                "fw01",
+                entry(json!({"type": "ssh", "hostname": "10.0.1.1", "password": "typed-in"})),
+            ),
+        ]);
+        let (status, msg) = rejected(
+            upsert_entry(
+                &store,
+                "shared",
+                "tenant-b",
+                "fw01",
+                fw01_webhook("10.0.1.9"),
+                true,
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.contains("tenant-a/fw01"), "{msg}");
+        let b = store.stored("tenant-b", "fw01").unwrap();
+        assert_eq!(
+            b.external_id, None,
+            "the hand-made entry did not take the id"
+        );
+        assert_eq!(b.hostname.as_deref(), Some("10.0.1.1"));
+        assert_eq!(b.password.as_deref(), Some("typed-in"));
+        assert_eq!(
+            store
+                .stored("tenant-a", "fw01")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("$tenant_a_password")
+        );
+    }
+
+    #[tokio::test]
+    async fn move_upsert_needs_an_external_id() {
+        // Without an id there is nothing to match on but the name, which is
+        // exactly what must not happen: refused, and nothing is touched.
+        let store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        let payload = entry(json!({"type": "ssh", "hostname": "10.0.0.1"}));
+        let (status, msg) = rejected(
+            upsert_entry(&store, "shared", "tenant-b", "fw01", payload, true)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("external_id"), "{msg}");
+        assert_eq!(store.keys(), ["tenant-a/fw01"]);
+    }
+
+    #[tokio::test]
+    async fn move_upsert_refuses_a_name_held_by_another_device() {
+        // Device 1 moves to tenant B, where a different device is already
+        // fw01. Neither entry is overwritten or removed.
+        let store = FakeStore::with(&[
+            ("tenant-a", "fw01", fw01_stored()),
+            (
+                "tenant-b",
+                "fw01",
+                entry(
+                    json!({"type": "ssh", "hostname": "10.0.1.1", "password": "b-secret",
+                             "external_id": "netbox:device:2"}),
+                ),
+            ),
+        ]);
+        let (status, _) = rejected(
+            upsert_entry(
+                &store,
+                "shared",
+                "tenant-b",
+                "fw01",
+                fw01_webhook("10.0.1.9"),
+                true,
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(store.keys(), ["tenant-a/fw01", "tenant-b/fw01"]);
+        let b = store.stored("tenant-b", "fw01").unwrap();
+        assert_eq!(b.password.as_deref(), Some("b-secret"));
+        assert_eq!(b.hostname.as_deref(), Some("10.0.1.1"));
+        assert_eq!(
+            store
+                .stored("tenant-a", "fw01")
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("$tenant_a_password")
+        );
+    }
+
+    #[tokio::test]
+    async fn move_upsert_refuses_an_ambiguous_external_id() {
+        // The same id on two entries is a mess to sort out by hand, not
+        // something to guess at.
+        let store = FakeStore::with(&[
+            ("tenant-a", "fw01", fw01_stored()),
+            ("tenant-c", "fw01-old", fw01_stored()),
+        ]);
+        let (status, msg) = rejected(
+            upsert_entry(
+                &store,
+                "shared",
+                "tenant-b",
+                "fw01",
+                fw01_webhook("10.0.1.9"),
+                true,
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            msg.contains("tenant-a/fw01") && msg.contains("tenant-c/fw01-old"),
+            "{msg}"
+        );
+        assert_eq!(store.keys(), ["tenant-a/fw01", "tenant-c/fw01-old"]);
+    }
+
+    #[tokio::test]
+    async fn move_upsert_reports_a_move_it_could_not_finish() {
+        // Copied to the target but the original could not be removed: the
+        // entry is in both folders, the update is not applied, and the
+        // caller is told so rather than given an error it would retry.
+        let mut store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        store.fail_delete = true;
+        match upsert_entry(
+            &store,
+            "shared",
+            "tenant-b",
+            "fw01",
+            fw01_webhook("10.0.1.9"),
+            true,
+        )
+        .await
+        .unwrap_err()
+        {
+            UpsertError::MoveIncomplete { from: at, .. } => {
+                assert_eq!(at, from("tenant-a", "fw01"))
+            }
+            other => panic!("expected MoveIncomplete, got {other:?}"),
+        }
+        assert_eq!(store.keys(), ["tenant-a/fw01", "tenant-b/fw01"]);
+        assert_eq!(
+            store
+                .stored("tenant-b", "fw01")
+                .unwrap()
+                .hostname
+                .as_deref(),
+            Some("10.0.0.1"),
+            "the copy is the stored entry, not the update"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_upsert_never_moves() {
+        // Without ?move=true the same payload is the plain name upsert it
+        // always was: created here, the entry elsewhere left alone.
+        let store = FakeStore::with(&[("tenant-a", "fw01", fw01_stored())]);
+        let out = upsert_entry(
+            &store,
+            "shared",
+            "tenant-b",
+            "fw01",
+            fw01_webhook("10.0.1.9"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.moved_from, None);
+        assert_eq!(store.keys(), ["tenant-a/fw01", "tenant-b/fw01"]);
+        assert_eq!(
+            store.stored("tenant-b", "fw01").unwrap().password,
+            None,
+            "a plain create has only what the payload carried"
+        );
+    }
+
+    #[test]
+    fn fullscreen_sizing_applies_to_bitmap_sessions_only() {
+        let win = (Some(1710), Some(954));
+        let scr = (Some(1710), Some(1112));
+        // RDP opening fullscreen: created at the screen size rounded down to
+        // a multiple of 16, matching guacd's display-channel rounding so there
+        // is no post-connect resize (#257). VNC is not mod-16 rounded.
+        assert_eq!(
+            initial_session_size("rdp", true, win, scr),
+            (Some(1696), Some(1104))
+        );
+        assert_eq!(initial_session_size("vnc", true, win, scr), scr);
+        // A screen that is already mod-16 is created at its exact size.
+        assert_eq!(
+            initial_session_size("rdp", true, win, (Some(1920), Some(1088))),
+            (Some(1920), Some(1088))
+        );
+        // a terminal reflows instantly: window size, fullscreen or not
+        assert_eq!(initial_session_size("ssh", true, win, scr), win);
+        assert_eq!(initial_session_size("telnet", true, win, scr), win);
+        assert_eq!(initial_session_size("web", true, win, scr), win);
+        // not fullscreen, or no screen size offered: window size, still on
+        // the mod-16 grid for RDP, since the client's first size send is
+        // rounded to it by guacd either way (no resize on connect).
+        let win16 = (Some(1696), Some(944));
+        assert_eq!(initial_session_size("rdp", false, win, scr), win16);
+        assert_eq!(initial_session_size("rdp", true, win, (None, None)), win16);
+        assert_eq!(
+            initial_session_size("rdp", true, win, (Some(0), Some(0))),
+            win16
+        );
+        assert_eq!(initial_session_size("vnc", false, win, scr), win);
+        assert_eq!(
+            initial_session_size("rdp", false, (None, None), scr),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn round_down_mod16_floors_at_sixteen() {
+        assert_eq!(round_down_mod16(1710), 1696);
+        assert_eq!(round_down_mod16(1696), 1696);
+        assert_eq!(round_down_mod16(16), 16);
+        assert_eq!(round_down_mod16(15), 16);
+        assert_eq!(round_down_mod16(0), 16);
+    }
+
+    #[test]
+    fn report_bounds_read_a_bare_date_as_a_whole_local_day() {
+        // Sydney in September: UTC+10, so getTimezoneOffset() is -600.
+        let tz = -600;
+        assert_eq!(
+            normalize_report_bound("2026-09-04", tz, false).unwrap(),
+            "2026-09-03 14:00:00"
+        );
+        assert_eq!(
+            normalize_report_bound("2026-09-04", tz, true).unwrap(),
+            "2026-09-04 13:59:59"
+        );
+        // No offset given (the scripted case) means UTC, unchanged behaviour.
+        assert_eq!(
+            normalize_report_bound("2026-09-04", 0, false).unwrap(),
+            "2026-09-04 00:00:00"
+        );
+    }
+
+    #[test]
+    fn report_bounds_convert_zoned_values_and_reject_junk() {
+        // A value carrying its own zone is converted from it, offset ignored.
+        assert_eq!(
+            normalize_report_bound("2026-09-04T02:14:07Z", -600, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        assert_eq!(
+            normalize_report_bound("2026-09-04T12:14:07+10:00", 0, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        // Zoneless datetimes are shifted like a bare date.
+        assert_eq!(
+            normalize_report_bound("2026-09-04T12:14:07", -600, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        assert!(normalize_report_bound("last tuesday", 0, false).is_err());
+        assert!(normalize_report_bound("", 0, false).is_err());
+    }
+
+    #[test]
+    fn report_bounds_clamp_a_nonsense_offset() {
+        let q = ReportQuery {
+            user: None,
+            entry: None,
+            session_type: None,
+            from: Some("2026-09-04".into()),
+            to: None,
+            tz_offset: Some(999_999),
+            limit: None,
+            offset: None,
+        };
+        // Clamped to +840, not applied verbatim.
+        assert_eq!(report_bounds(&q).unwrap().0.unwrap(), "2026-09-04 14:00:00");
+    }
+
+    #[test]
+    fn mark_utc_tags_zoneless_sqlite_timestamps() {
+        assert_eq!(mark_utc("2026-09-04 02:14:07"), "2026-09-04T02:14:07Z");
+        // Already zoned, or not the SQLite shape at all: left alone.
+        assert_eq!(mark_utc("2026-09-04T02:14:07Z"), "2026-09-04T02:14:07Z");
+        assert_eq!(
+            mark_utc("2026-09-04T02:14:07+00:00"),
+            "2026-09-04T02:14:07+00:00"
+        );
+        assert_eq!(mark_utc(""), "");
+    }
 
     // ── Regression: credential-variable gathering must reach a folder the user
     // can access even when it is nested under an inaccessible ancestor
@@ -5067,6 +8606,111 @@ mod tests {
 
     fn sp(a: &str, b: &str) -> (String, String) {
         (a.to_string(), b.to_string())
+    }
+
+    // ── Folder default credentials: the one resolver both connect paths use
+    // (the Connections endpoint and /api/connect quick links). ──
+    struct FakeDefaultsSource {
+        defaults: std::collections::HashMap<String, crate::vault::FolderDefaults>,
+        inherit: std::collections::HashSet<String>,
+    }
+    impl DefaultsSource for FakeDefaultsSource {
+        async fn folder_defaults(
+            &self,
+            _scope: &str,
+            folder: &str,
+        ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
+            Ok(self.defaults.get(folder).cloned())
+        }
+        async fn takes_parent_defaults(
+            &self,
+            _scope: &str,
+            folder: &str,
+        ) -> Result<bool, VaultError> {
+            Ok(self.inherit.contains(folder))
+        }
+    }
+
+    fn defaults_with_ssh_key(key: &str) -> crate::vault::FolderDefaults {
+        let mut d = crate::vault::FolderDefaults::new();
+        d.insert(
+            "ssh".into(),
+            crate::vault::DefaultCredentials {
+                username: Some("root".into()),
+                private_key: Some(key.into()),
+                ..Default::default()
+            },
+        );
+        d
+    }
+
+    #[tokio::test]
+    async fn lend_folder_defaults_fills_a_bare_entry_and_respects_the_boundary() {
+        let src = FakeDefaultsSource {
+            defaults: [("corp".to_string(), defaults_with_ssh_key("corp-key"))]
+                .into_iter()
+                .collect(),
+            inherit: ["corp/linux"].into_iter().map(String::from).collect(),
+        };
+        let bare = || AddressBookEntry {
+            session_type: "ssh".into(),
+            hostname: Some("10.0.0.1".into()),
+            ..Default::default()
+        };
+
+        // a subfolder that inherits gets corp's key and username
+        let e = lend_folder_defaults(&src, "shared", "corp/linux", "box", bare()).await;
+        assert_eq!(e.private_key.as_deref(), Some("corp-key"));
+        assert_eq!(e.username.as_deref(), Some("root"));
+
+        // an isolated subfolder (inherit_from_parent: false) does not
+        let e = lend_folder_defaults(&src, "shared", "corp/guests", "box", bare()).await;
+        assert!(e.private_key.is_none() && e.username.is_none());
+
+        // the entry's own secret and username win
+        let own = AddressBookEntry {
+            password: Some("own".into()),
+            username: Some("admin".into()),
+            ..bare()
+        };
+        let e = lend_folder_defaults(&src, "shared", "corp/linux", "box", own).await;
+        assert_eq!(e.password.as_deref(), Some("own"));
+        assert_eq!(e.username.as_deref(), Some("admin"));
+        assert!(e.private_key.is_none());
+
+        // an entry set to prompt is left to prompt
+        let prompting = AddressBookEntry {
+            prompt_credentials: Some(true),
+            ..bare()
+        };
+        let e = lend_folder_defaults(&src, "shared", "corp/linux", "box", prompting).await;
+        assert!(e.private_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn lend_folder_defaults_leaves_the_entry_alone_when_vault_fails() {
+        struct Down;
+        impl DefaultsSource for Down {
+            async fn folder_defaults(
+                &self,
+                _s: &str,
+                _f: &str,
+            ) -> Result<Option<crate::vault::FolderDefaults>, VaultError> {
+                Err(VaultError::Forbidden)
+            }
+            async fn takes_parent_defaults(&self, _s: &str, _f: &str) -> Result<bool, VaultError> {
+                Err(VaultError::Forbidden)
+            }
+        }
+        let e = AddressBookEntry {
+            session_type: "ssh".into(),
+            username: Some("admin".into()),
+            ..Default::default()
+        };
+        let out = lend_folder_defaults(&Down, "shared", "corp/linux", "box", e).await;
+        // a failed read must not change the entry
+        assert_eq!(out.username.as_deref(), Some("admin"));
+        assert!(out.password.is_none() && out.private_key.is_none());
     }
 
     #[tokio::test]
@@ -5292,6 +8936,50 @@ mod tests {
     }
 
     #[test]
+    fn recording_mp4_access_matches_recording_download() {
+        // The MP4 endpoints (#241) share the download's check: poweruser or
+        // admin, and a plain .guac name inside the recording directory.
+        let dir = std::env::temp_dir().join(format!("rustguac-rec-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.guac"), "x").unwrap();
+        let user = |role: &str| {
+            Some(Extension(AuthIdentity::User {
+                email: "u@example.com".into(),
+                role: role.into(),
+                groups: vec![],
+            }))
+        };
+        let status = |id: &Option<Extension<AuthIdentity>>, name: &str| {
+            check_recording_read(id, name, &dir)
+                .err()
+                .map(|r| r.status())
+        };
+        assert_eq!(status(&user("poweruser"), "s.guac"), None);
+        assert_eq!(status(&user("admin"), "s.guac"), None);
+        assert_eq!(
+            status(&Some(Extension(AuthIdentity::ApiKey("k".into()))), "s.guac"),
+            None
+        );
+        assert_eq!(
+            status(&user("operator"), "s.guac"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(&user("viewer"), "s.guac"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(status(&None, "s.guac"), Some(StatusCode::FORBIDDEN));
+        for bad in ["../s.guac", "a/s.guac", "s.mp4", "..guac", "s.guac\0"] {
+            assert_eq!(
+                status(&user("admin"), bad),
+                Some(StatusCode::BAD_REQUEST),
+                "{bad}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_safe_recording_name_extension_case_sensitive() {
         // Rustguac writes lower-case .guac only; allowing .GUAC creates a
         // second naming space that bypasses admin tools expecting lowercase.
@@ -5344,5 +9032,105 @@ mod tests {
         assert!(validate_session_owner("alice @example.com").is_err());
         assert!(validate_session_owner("alice\u{7}@example.com").is_err());
         assert!(validate_session_owner(&"a".repeat(321)).is_err());
+    }
+
+    /// #232: moving and copying entries carries working credentials, so it
+    /// stays admin-only like every other entry change.
+    #[test]
+    fn entry_move_and_copy_are_admin_only() {
+        let user = |role: &str| {
+            Some(Extension(AuthIdentity::User {
+                email: "u@example.com".into(),
+                role: role.into(),
+                groups: vec![],
+            }))
+        };
+        for role in ["viewer", "operator", "poweruser"] {
+            let (status, _) = super::require_ab_admin(&user(role)).unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{role}");
+        }
+        assert!(super::require_ab_admin(&None).is_err());
+        assert_eq!(
+            super::require_ab_admin(&user("admin")).unwrap(),
+            "u@example.com"
+        );
+    }
+
+    #[test]
+    fn vault_name_errors_are_client_errors() {
+        let (status, _) = super::ab_vault_error(VaultError::BadName("reserved name".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = super::ab_vault_error(VaultError::NotFound);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn rename_candidates_skip_policy_is_just_the_name() {
+        assert_eq!(super::rename_candidates("web01", false), vec!["web01"]);
+    }
+
+    #[test]
+    fn rename_candidates_suffix_and_stay_within_name_limit() {
+        let c = super::rename_candidates("web01", true);
+        assert_eq!(c[0], "web01");
+        assert_eq!(c[1], "web01-2");
+        assert_eq!(c.last().unwrap(), "web01-99");
+        let long = "a".repeat(64);
+        for cand in super::rename_candidates(&long, true) {
+            assert!(cand.len() <= 64, "{cand}");
+        }
+        assert_eq!(
+            super::rename_candidates(&long, true)[1],
+            format!("{}-2", "a".repeat(62))
+        );
+    }
+
+    #[test]
+    fn bulk_request_defaults_to_skip_and_rejects_unknown_actions() {
+        let req: super::BulkRequest = serde_json::from_value(json!({
+            "action": "move",
+            "items": [{"scope": "shared", "folder": "a", "name": "x"}],
+            "target": {"scope": "shared", "folder": "b"},
+        }))
+        .unwrap();
+        assert_eq!(req.action, super::BulkAction::Move);
+        assert_eq!(req.on_conflict, super::OnConflict::Skip);
+        assert!(serde_json::from_value::<super::BulkRequest>(json!({
+            "action": "chmod",
+            "items": [],
+        }))
+        .is_err());
+        assert!(
+            serde_json::from_value::<super::BulkRequest>(json!({
+                "action": "copy",
+                "items": [],
+                "on_conflict": "overwrite",
+            }))
+            .is_err(),
+            "there is no overwrite policy"
+        );
+    }
+
+    #[test]
+    fn allowed_users_are_tidied() {
+        let got = super::normalize_allowed_users(vec![
+            " jsmith@example.com ".into(),
+            "".into(),
+            "JSmith@Example.com".into(),
+            "sub-1234".into(),
+        ])
+        .unwrap();
+        assert_eq!(got, vec!["jsmith@example.com", "sub-1234"]);
+    }
+
+    #[test]
+    fn allowed_users_reject_junk_and_cap_size() {
+        assert!(super::normalize_allowed_users(vec!["a b@example.com".into()]).is_err());
+        assert!(super::normalize_allowed_users(vec!["a\u{7}@example.com".into()]).is_err());
+        assert!(super::normalize_allowed_users(vec!["x".repeat(321)]).is_err());
+        let many: Vec<String> = (0..=super::MAX_ALLOWED_USERS)
+            .map(|i| format!("u{i}@example.com"))
+            .collect();
+        assert!(super::normalize_allowed_users(many).is_err());
     }
 }

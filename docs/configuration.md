@@ -110,6 +110,7 @@ Enables OpenID Connect authentication. When configured, the web UI shows a login
 | `client_secret` | — | OIDC client secret (or use `OIDC_CLIENT_SECRET` env var) |
 | `redirect_uri` | — | Redirect URI: `https://your-host/auth/callback` (required) |
 | `default_role` | `operator` | Role assigned to new users on first login |
+| `auto_create_users` | `true` | Create an account on first OIDC login. When `false`, only users already in the database can log in; add them with `rustguac add-user`, `POST /api/users` or the Admin page. See [Only users you have added](roles-and-access-control.md#only-users-you-have-added) |
 | `groups_claim` | `groups` | JWT claim name containing group memberships |
 | `extra_scopes` | `[]` | Additional OIDC scopes to request |
 | `ca_cert` | — | Path to CA certificate (PEM) for verifying the OIDC provider |
@@ -119,12 +120,14 @@ Enables OpenID Connect authentication. When configured, the web UI shows a login
 
 ## `[vault]` section
 
-Enables the Vault-backed connections. Requires `VAULT_SECRET_ID` environment variable.
+Enables the Vault-backed connections. Uses AppRole by default, requiring the
+`VAULT_SECRET_ID` environment variable. Configure `[vault.jwt_auth]` to use a
+workload JWT instead; JWT mode does not require an AppRole role ID or SecretID.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `addr` | — | Vault server address (required) |
-| `role_id` | — | AppRole role ID (required) |
+| `role_id` | — | AppRole role ID (required unless `jwt_auth` is configured) |
 | `mount` | `secret` | KV v2 mount path |
 | `base_path` | `rustguac` | Base path under the mount |
 | `namespace` | — | Vault Enterprise / OpenBao namespace |
@@ -133,6 +136,41 @@ Enables the Vault-backed connections. Requires `VAULT_SECRET_ID` environment var
 | `ca_cert` | — | Path to custom CA certificate (PEM) for verifying the Vault server |
 | `client_cert` | — | Path to client certificate (PEM) for mTLS |
 | `client_key` | — | Path to client private key (PEM) for mTLS (required if `client_cert` is set) |
+
+### Workload JWT authentication
+
+```toml
+[vault]
+addr = "https://vault.example.com:8200"
+mount = "secret"
+base_path = "rustguac"
+
+[vault.jwt_auth]
+mount = "workload-jwt"
+role = "rustguac"
+path = "/var/run/secrets/vault/token"
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mount` | (required) | The JWT auth method's mount, not the KV mount, e.g. `jwt` or `auth-k8s/jwt` |
+| `role` | (required) | The role on that mount |
+| `path` | | A file holding the JWT |
+| `token_command` | | A program and its arguments that print the JWT, and nothing else, on stdout. Run directly, never through a shell; its output is never logged |
+| `token_command_timeout_secs` | `10` | How long `token_command` may run before it is killed |
+
+Give exactly one of `path` and `token_command`. The token is fetched again on
+every login and reauthentication, so a rotated token is always the one used.
+JWT mode takes precedence over AppRole and never falls back to it when the token
+is missing, empty or rejected. The `import-guacamole` and `vault-migrate`
+commands log in the same way.
+Use this with Vault/OpenBao JWT auth configured to verify the token issuer,
+audience and exact workload identity. This is separate from users' OIDC login.
+
+The same nested block works as `[vault_shared.jwt_auth]` and
+`[vault_local.jwt_auth]`; only AppRole-mode backends need their SecretID env var.
+See [Integrations](integrations.md#workload-jwt-authentication) for Kubernetes,
+Nomad, SPIRE and cloud VM setups.
 
 ### Multiple Vault backends (disaster recovery)
 
@@ -227,6 +265,14 @@ Controls session recording behaviour and disk management.
 | `typescript_path` | string | (unset) | Directory for SSH typescript (raw terminal text) files. Unset = disabled. See below. |
 | `typescript_name` | string | `{connection}-{user}-{date}-{time}` | Filename template for typescripts. Tokens listed below. |
 | `create_typescript_path` | bool | `false` | Ask guacd to create `typescript_path` if it does not exist. |
+| `mp4_enabled` | bool | `true` | Offer recordings as MP4 downloads (see below). Off by itself when guacenc is not installed. |
+| `guacenc_path` | string | `/opt/rustguac/bin/guacenc` | The guacenc binary that converts recordings. |
+| `mp4_cache_path` | string | `<path>/mp4-cache` | Where converted MP4s are kept. |
+| `mp4_cache_hours` | integer | `24` | Remove a converted MP4 this many hours after it was made. |
+| `mp4_max_jobs` | integer | `1` | Conversions that run at once; more wait their turn. |
+| `mp4_timeout_secs` | integer | `1800` | Give up on a conversion after this many seconds. |
+| `mp4_bitrate` | integer | `2000000` | Video bitrate, in bits per second. |
+| `mp4_max_width`, `mp4_max_height` | integer | `1920`, `1080` | Largest video size. Bigger recordings are scaled down to fit, keeping their shape. |
 
 ```toml
 [recording]
@@ -303,6 +349,42 @@ Keystroke logging in the *graphical* recording (guacd's
 that depends on guacd-driven graphical recording, which rustguac does not
 use (it records the proxied stream itself). It is therefore not wired up;
 the typescript is the supported text-audit path.
+
+### MP4 downloads
+
+A `.guac` recording only plays in rustguac's own player. The Recordings page
+can also give you an MP4 that plays anywhere (VLC, a browser, a video
+editor): click **mp4** next to a recording. rustguac converts it in the
+background with `guacenc`, which comes with guacamole-server, and the file
+downloads when it is ready. Converting a long session takes a while, so the
+button shows **converting...** until then.
+
+- The same people can get the MP4 as can download the recording (poweruser
+  and admin).
+- A recording whose session is still running is not converted, since the
+  file is not finished.
+- Converted files are kept in `mp4_cache_path` for `mp4_cache_hours`, so a
+  second download is instant, and removed when their recording is. When
+  rotation needs disk space it removes them all before touching any
+  recording.
+- The video is the recording's own size, scaled down to fit
+  `mp4_max_width` x `mp4_max_height`.
+- The button only appears when guacenc is installed. It is part of the
+  `.deb`, the Docker image and `install.sh` from 1.11.1; on a build without
+  it the button is not shown.
+
+To convert recordings yourself, for example a batch for an audit, run
+guacenc on the rustguac host. It writes `<recording>.m4v` (an MP4 file)
+next to the input, so copy recordings somewhere writable first:
+
+```bash
+cp /opt/rustguac/recordings/<id>.guac /tmp/
+/opt/rustguac/bin/guacenc -s 1920x1080 -r 2000000 /tmp/<id>.guac
+# -> /tmp/<id>.guac.m4v
+```
+
+guacenc reports failures in its output but exits 0 either way, so check
+that the `.m4v` file exists.
 
 #### Encryption at rest (LUKS)
 

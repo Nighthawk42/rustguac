@@ -9,7 +9,6 @@ use ipnetwork::IpNetwork;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
@@ -34,7 +33,11 @@ pub enum SessionType {
 }
 
 /// Parameters for creating a new session.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` exists only so `reuse_fingerprint()` can hash the whole
+/// request. Never send a serialised request anywhere or log it: it carries
+/// every secret the session connects with.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     #[serde(default)]
     pub session_type: SessionType,
@@ -192,6 +195,87 @@ pub struct CreateSessionRequest {
     /// own bastions and clusters. Never read from the request body.
     #[serde(skip)]
     pub fence_all_targets: bool,
+    /// SSH terminal font size in points (SSH only; default 12).
+    pub ssh_font_size: Option<u32>,
+    /// Wake-on-LAN: send a magic packet before connecting (SSH/RDP/VNC).
+    pub wol_send_packet: Option<bool>,
+    /// Wake-on-LAN: target MAC address.
+    pub wol_mac_addr: Option<String>,
+    /// Wake-on-LAN: broadcast address.
+    pub wol_broadcast_addr: Option<String>,
+    /// Wake-on-LAN: UDP port.
+    pub wol_udp_port: Option<u16>,
+    /// Wake-on-LAN: wait time in seconds after sending the packet.
+    pub wol_wait_time: Option<u32>,
+}
+
+impl CreateSessionRequest {
+    /// Forget every field that only a saved Connections entry may set, for an
+    /// ad-hoc request from anyone below admin. These name the entry the
+    /// session belongs to and carry its admin's policy:
+    ///
+    /// - `address_book_entry` / `address_book_folder` / `entry_display_name`
+    ///   attribute the session and its recording to an entry. Claimed by an
+    ///   ad-hoc caller together with `max_recordings`, per-entry rotation
+    ///   would delete that entry's older recordings when the session ended.
+    /// - `max_recordings` is that rotation limit.
+    /// - `record_typescript` writes a plaintext terminal log; it is an
+    ///   admin's choice per entry, not the caller's.
+    pub fn clear_entry_only_fields(&mut self) {
+        self.address_book_entry = None;
+        self.address_book_folder = None;
+        self.entry_display_name = None;
+        self.max_recordings = None;
+        self.record_typescript = None;
+    }
+
+    /// Fields that only say how the session is drawn in this browser, not
+    /// what it connects to or how. Two requests that differ only in these
+    /// would open the same session, so they are left out of
+    /// `reuse_fingerprint()`: a second click from a resized window, or a
+    /// different devicePixelRatio, still reuses the Pending session.
+    /// - `width`, `height`: the client's window or screen size.
+    /// - `dpi`: the client's pixel density.
+    /// - `banner`: the label shown over the session in the client.
+    const DISPLAY_ONLY_FIELDS: &'static [&'static str] = &["width", "height", "dpi", "banner"];
+
+    /// SHA-256, as hex, over the whole request except the display-only
+    /// fields above. Two requests with the same fingerprint would open the
+    /// same connection, as the same principal, with the same settings, so a
+    /// fresh Pending session made from one can stand in for the other
+    /// (`SessionManager::find_reusable_session`).
+    ///
+    /// Everything else counts, including fields added later: a retry with a
+    /// different password, key, domain or jump credential, or an entry whose
+    /// admin has since turned recording on, changed the security mode or
+    /// enabled the drive, gets a new session. The hash is never logged or
+    /// returned to a client, and a secret cannot be recovered from it.
+    pub fn reuse_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        // serde_json is built without `preserve_order`, so every object,
+        // including the `container_env` map, is written with sorted keys
+        // and the encoding is canonical. JSON also keeps an absent field
+        // (null) apart from an empty one ("") and cannot confuse a value
+        // boundary.
+        let mut value = match serde_json::to_value(self) {
+            Ok(v) => v,
+            // Never expected. If it ever happens, return a fingerprint no
+            // other request can match, so nothing is reused on a guess.
+            Err(_) => return Uuid::new_v4().to_string(),
+        };
+        if let Some(obj) = value.as_object_mut() {
+            for f in Self::DISPLAY_ONLY_FIELDS {
+                obj.remove(*f);
+            }
+            // Set by the API, not the body, so serde skips it. It changes
+            // which targets are fenced, so it counts.
+            obj.insert(
+                "fence_all_targets".into(),
+                serde_json::Value::Bool(self.fence_all_targets),
+            );
+        }
+        hex::encode(Sha256::digest(value.to_string().as_bytes()))
+    }
 }
 
 /// Session status in the lifecycle.
@@ -314,6 +398,10 @@ pub struct Session {
     /// (#154). Surfaced verbatim in `SessionInfo` so client.html can
     /// trigger fullscreen on first user gesture after CONNECTED.
     pub fullscreen_on_connect: bool,
+    /// `CreateSessionRequest::reuse_fingerprint()` of the request this
+    /// session was created from. Compared, never logged or served, when a
+    /// repeat Connect asks to reuse a Pending session.
+    pub reuse_fingerprint: String,
     /// Copied from the source entry's `autohide_side_tabs` flag.
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
@@ -467,14 +555,70 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Sess
     Ok((host, port))
 }
 
+/// Validate the network for the connection rustguac itself will make.
+///
+/// Without jump hosts that is the target host, so the target is checked against
+/// the protocol's allowlist. With a jump-host chain, rustguac only ever dials
+/// hop 0 -- the target's name is resolved by the last hop and need not resolve
+/// here at all, so resolving it locally would reject perfectly valid
+/// bastion-only names, and an address it did resolve to would say nothing
+/// about where the bastion connects. Hop 0 is fenced, for untrusted callers,
+/// where the chain is built (`fence_all_targets`); what lies beyond it is the
+/// bastion's to permit.
+async fn check_session_network(
+    target_host: &str,
+    target_port: u16,
+    allowed: &[String],
+    jump_hops: &[tunnel::JumpHost],
+) -> Result<(), SessionError> {
+    if jump_hops.is_empty() {
+        return check_allowed_network(target_host, target_port, allowed).await;
+    }
+    tracing::debug!(
+        target = %target_host,
+        "Jump chain configured -- target resolved by the bastion, not checked here"
+    );
+    Ok(())
+}
+
 /// Check that a host resolves to an IP within the allowed CIDR networks.
 ///
 /// Passes if ANY resolved address is allowed. Callers that can connect by
 /// address should use [`allowed_address`] and dial the address it returns,
 /// since a hostname re-resolved later (by guacd, say) can give a different
 /// answer than it gave here.
-fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<(), SessionError> {
-    allowed_address(host, port, allowed).map(|_| ())
+async fn check_allowed_network(
+    host: &str,
+    port: u16,
+    allowed: &[String],
+) -> Result<(), SessionError> {
+    allowed_address(host, port, allowed).await.map(|_| ())
+}
+
+/// Longest a target hostname lookup may take before the connect fails.
+const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolve `host:port` without tying up the async runtime.
+///
+/// The system resolver blocks, and with a DNS server that does not answer it
+/// blocks for its whole retry budget (tens of seconds). Called directly from
+/// a request handler, a few of those occupied every tokio worker thread, and
+/// rustguac stopped answering anything, health checks included, until they
+/// gave up. `lookup_host` runs the resolver on the blocking thread pool, and
+/// the timeout fails this one connect promptly instead of holding it open.
+async fn resolve_host(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, SessionError> {
+    match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+        Ok(Err(e)) => Err(SessionError::ValidationError(format!(
+            "failed to resolve host '{}': {}",
+            host, e
+        ))),
+        Err(_) => Err(SessionError::ValidationError(format!(
+            "failed to resolve host '{}': DNS did not answer within {} seconds",
+            host,
+            DNS_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// Resolve `host` and return the first address inside the allowlist.
@@ -485,7 +629,7 @@ fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<()
 /// to an internal one (guacd, Vault, a metadata service) for the connection.
 /// Addresses outside the allowlist are ignored rather than rejected, so a
 /// dual-stack host whose IPv6 address is not listed still works over IPv4.
-pub(crate) fn allowed_address(
+pub(crate) async fn allowed_address(
     host: &str,
     port: u16,
     allowed: &[String],
@@ -513,12 +657,7 @@ pub(crate) fn allowed_address(
     }
 
     // Resolve hostname to IP addresses
-    let addrs: Vec<std::net::SocketAddr> = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .map_err(|e| {
-            SessionError::ValidationError(format!("failed to resolve host '{}': {}", host, e))
-        })?
-        .collect();
+    let addrs = resolve_host(host, port).await?;
 
     if addrs.is_empty() {
         return Err(SessionError::ValidationError(format!(
@@ -537,6 +676,33 @@ pub(crate) fn allowed_address(
                 host
             ))
         })
+}
+
+/// Longest Wake-on-LAN wait rustguac will ask guacd for, in seconds.
+const MAX_WOL_WAIT_SECS: u32 = 600;
+/// Bounds for the SSH terminal font size, in points.
+const MIN_SSH_FONT: u32 = 6;
+const MAX_SSH_FONT: u32 = 72;
+
+/// Wake-on-LAN settings for guacd.
+///
+/// guacd sends the magic packet to whatever broadcast address and UDP port
+/// it is given, then waits the given time before connecting, so for an
+/// ad-hoc request from a non-admin these come from the caller. They are
+/// dropped there: Wake-on-LAN is configured on connection entries. The
+/// wait is capped either way so one session cannot hold a guacd process for
+/// days.
+fn wol_params(req: &CreateSessionRequest, fence_all_targets: bool) -> guacd::WolParams {
+    if fence_all_targets {
+        return guacd::WolParams::default();
+    }
+    guacd::WolParams {
+        send_packet: req.wol_send_packet.unwrap_or(false),
+        mac_addr: req.wol_mac_addr.clone(),
+        broadcast_addr: req.wol_broadcast_addr.clone(),
+        udp_port: req.wol_udp_port,
+        wait_time: req.wol_wait_time.map(|t| t.min(MAX_WOL_WAIT_SECS)),
+    }
 }
 
 /// An address formatted for a `host:port` string (IPv6 in brackets), as
@@ -700,6 +866,9 @@ impl SessionManager {
         req: CreateSessionRequest,
         created_by: String,
     ) -> Result<SessionInfo, SessionError> {
+        // Taken before any field of the request is moved out below.
+        let reuse_fingerprint = req.reuse_fingerprint();
+
         // Enforce session limits (only count active/pending sessions)
         {
             let sessions = self.sessions.read().await;
@@ -756,6 +925,8 @@ impl SessionManager {
         // and the generic tunnel setup after the match uses them for the other
         // session types.
         let fence_all_targets = req.fence_all_targets;
+        // Wake-on-LAN params, applied to SSH/RDP/VNC alike (passed through to guacd).
+        let wol = wol_params(&req, fence_all_targets);
         let jump_hops: Vec<tunnel::JumpHost> = if let Some(hops) = req.jump_hosts {
             hops
         } else if let Some(ref jh) = req.jump_host {
@@ -785,6 +956,7 @@ impl SessionManager {
                 first.port,
                 &self.config.ssh_allowed_networks,
             )
+            .await
             .map_err(|e| SessionError::ValidationError(format!("jump host: {e}")))?;
             first.hostname = dial_host(ip);
         }
@@ -810,11 +982,14 @@ impl SessionManager {
                 let port = req.port.unwrap_or(22);
                 let username = req.username.clone().unwrap_or_default();
 
-                let vetted = allowed_address(&hostname, port, &self.config.ssh_allowed_networks)?;
-                // With jump hosts the bastion resolves the target, so keep
-                // the name; otherwise guacd dials the address checked above.
+                // With jump hosts the bastion resolves the target, so keep the
+                // name, unchecked: resolving it here would refuse a name only
+                // the bastion can see. Otherwise guacd dials the address
+                // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    vetted.to_string()
+                    allowed_address(&hostname, port, &self.config.ssh_allowed_networks)
+                        .await?
+                        .to_string()
                 } else {
                     hostname.clone()
                 };
@@ -823,6 +998,8 @@ impl SessionManager {
                     session_id = %session_id,
                     hostname = %hostname,
                     username = %username,
+                    width,
+                    height,
                     "Creating new SSH session"
                 );
 
@@ -906,7 +1083,12 @@ impl SessionManager {
                     private_key,
                     width,
                     height,
-                    dpi,
+                    // SSH terminal text size is driven by font_size, not device
+                    // DPI. The client sends a devicePixelRatio-scaled DPI (correct
+                    // for RDP/VNC) which would render the terminal font oversized
+                    // on HiDPI displays, so pin SSH to a 96 baseline — the client
+                    // auto-scales the canvas to fit regardless.
+                    dpi: 96,
                     enable_sftp: drive_enabled,
                     sftp_disable_download: !drive_cfg.allow_download,
                     sftp_disable_upload: !drive_cfg.allow_upload,
@@ -918,6 +1100,10 @@ impl SessionManager {
                         .as_ref()
                         .map(|(_, _, c)| *c)
                         .unwrap_or(false),
+                    font_size: req
+                        .ssh_font_size
+                        .map(|s| s.clamp(MIN_SSH_FONT, MAX_SSH_FONT)),
+                    wol: wol.clone(),
                 });
                 (
                     params, hostname, username, None, None, ssh_banner, None, None, None,
@@ -930,7 +1116,13 @@ impl SessionManager {
                 let port = req.port.unwrap_or(3389);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.rdp_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.rdp_allowed_networks,
+                    &jump_hops,
+                )
+                .await?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1012,6 +1204,7 @@ impl SessionManager {
                     force_lossless: req.force_lossless.unwrap_or(false),
                     enable_h264: req.enable_h264.unwrap_or(false),
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
+                    wol: wol.clone(),
                 }));
                 (
                     params,
@@ -1032,9 +1225,14 @@ impl SessionManager {
                 let port = req.port.unwrap_or(5900);
                 let username = req.username.clone().unwrap_or_default();
 
-                let vetted = allowed_address(&hostname, port, &self.config.vnc_allowed_networks)?;
+                // With jump hosts the bastion resolves the target, so keep the
+                // name, unchecked: resolving it here would refuse a name only
+                // the bastion can see. Otherwise guacd dials the address
+                // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    vetted.to_string()
+                    allowed_address(&hostname, port, &self.config.vnc_allowed_networks)
+                        .await?
+                        .to_string()
                 } else {
                     hostname.clone()
                 };
@@ -1049,6 +1247,7 @@ impl SessionManager {
                 let params = guacd::ConnectionParams::Vnc(guacd::VncParams {
                     hostname: connect_host,
                     port,
+                    username: req.username.clone().filter(|u| !u.is_empty()),
                     password: req.password.clone(),
                     color_depth: req.color_depth,
                     width,
@@ -1056,6 +1255,7 @@ impl SessionManager {
                     dpi,
                     disable_copy: req.disable_copy.unwrap_or(false),
                     disable_paste: req.disable_paste.unwrap_or(false),
+                    wol: wol.clone(),
                 });
                 (
                     params, hostname, username, None, None, None, None, None, None,
@@ -1069,7 +1269,13 @@ impl SessionManager {
                     SessionError::ValidationError("hostname is required for SPICE sessions".into())
                 })?;
                 let port = req.port.unwrap_or(5900);
-                check_allowed_network(&hostname, port, &self.config.vnc_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.vnc_allowed_networks,
+                    &jump_hops,
+                )
+                .await?;
 
                 let spice = guacd::SpiceParams {
                     hostname: hostname.clone(),
@@ -1129,6 +1335,7 @@ impl SessionManager {
                 if fence_all_targets && jump_hops.is_empty() {
                     let (api_host, api_port) = parse_host_port(&pve_url, 8006)?;
                     check_allowed_network(&api_host, api_port, &self.config.vnc_allowed_networks)
+                        .await
                         .map_err(|e| SessionError::ValidationError(format!("Proxmox API: {e}")))?;
                 }
 
@@ -1199,6 +1406,7 @@ impl SessionManager {
                         proxy_port,
                         &self.config.vnc_allowed_networks,
                     )
+                    .await
                     .map_err(|e| {
                         SessionError::ValidationError(format!("Proxmox SPICE proxy: {e}"))
                     })?;
@@ -1323,7 +1531,13 @@ impl SessionManager {
                         .port()
                         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
 
-                check_allowed_network(url_host, url_port, &self.config.web_allowed_networks)?;
+                check_session_network(
+                    url_host,
+                    url_port,
+                    &self.config.web_allowed_networks,
+                    &jump_hops,
+                )
+                .await?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1339,6 +1553,7 @@ impl SessionManager {
                 let params = guacd::ConnectionParams::Vnc(guacd::VncParams {
                     hostname: "127.0.0.1".into(),
                     port: 0, // placeholder — updated after browser spawn
+                    username: None,
                     password: None,
                     color_depth: None,
                     width,
@@ -1346,6 +1561,8 @@ impl SessionManager {
                     dpi,
                     disable_copy: req.disable_copy.unwrap_or(false),
                     disable_paste: req.disable_paste.unwrap_or(false),
+                    // Local Xvnc — WoL not applicable.
+                    wol: guacd::WolParams::default(),
                 });
                 (
                     params,
@@ -1393,6 +1610,18 @@ impl SessionManager {
                 // are scoped per-operator. When the override is set the same
                 // container is shared by everyone connecting with that entry,
                 // which is the desired behaviour for shared baked-in accounts.
+                // The username names the container and the home directory
+                // under `home_base`, so an override must be a plain name: a
+                // `../` here would bind-mount any host directory.
+                if let Some(name) = req.container_username.as_deref().filter(|s| !s.is_empty()) {
+                    if !valid_vdi_username(name) {
+                        return Err(SessionError::ValidationError(
+                            "container_username must be 1-32 letters, digits, '.', '_' or '-', \
+                             not starting with '.' or '-'"
+                                .into(),
+                        ));
+                    }
+                }
                 let vdi_username = req
                     .container_username
                     .as_ref()
@@ -1500,6 +1729,8 @@ impl SessionManager {
                     force_lossless: false,
                     enable_h264: true,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
+                    // VDI container on the Docker host — WoL not applicable.
+                    wol: guacd::WolParams::default(),
                 }));
                 (
                     params,
@@ -1559,6 +1790,29 @@ impl SessionManager {
                         p.port = final_addr.port();
                     }
                     guacd::ConnectionParams::Rdp(p) => {
+                        // guacd now dials loopback, so FreeRDP validates the
+                        // server's TLS cert against "127.0.0.1" and derives any
+                        // NLA SPN from it (TERMSRV/127.0.0.1). Neither matches
+                        // the real host, and RDP exposes no cert-name or SPN
+                        // override, so warn rather than fail obscurely later.
+                        if !p.ignore_cert {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                tunnel_addr = %final_addr,
+                                "Tunnelled RDP with certificate checking on — FreeRDP will \
+                                 validate against the tunnel's loopback address, not the real \
+                                 host, and may reject it. Enable \"ignore certificate\" on this \
+                                 entry if the connection fails on a certificate name mismatch."
+                            );
+                        }
+                        if p.auth_pkg.as_deref() == Some("kerberos") {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                "Tunnelled RDP with auth-pkg=kerberos — the SPN is built from \
+                                 the tunnel's loopback address, so Kerberos will not find a \
+                                 matching principal. Use negotiate or ntlm through a jump host."
+                            );
+                        }
                         p.hostname = final_addr.ip().to_string();
                         p.port = final_addr.port();
                     }
@@ -1785,6 +2039,7 @@ impl SessionManager {
             shadow_tokens: Vec::new(),
             share_allowed,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
+            reuse_fingerprint,
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
         };
 
@@ -1847,6 +2102,45 @@ impl SessionManager {
             result.push(session.info());
         }
         result
+    }
+
+    /// How long after creation a Pending session is offered to a repeat
+    /// Connect instead of a fresh one. Short on purpose: an older Pending
+    /// one, whose guacd may since have gone away, is left to the
+    /// pending-timeout reaper.
+    pub const REUSABLE_PENDING_SECS: i64 = 15;
+
+    /// Find a live session this user can be sent back to instead of opening a
+    /// fresh one for the same address-book entry. Reusing a `Pending` session
+    /// (guacd connected, owner never attached) stops repeat Connect clicks from
+    /// piling up orphans; only a Pending session is reusable, since an owner
+    /// connection consumes the guacd stream and cannot be re-owned.
+    ///
+    /// `reuse_fingerprint` is `CreateSessionRequest::reuse_fingerprint()`
+    /// of the fully built request, so a session is only reused by a request
+    /// that would connect to the same target with the same credentials. A
+    /// retry with a different password, key or domain (a mistyped prompt)
+    /// never gets the old session, which still holds the old credentials.
+    pub async fn find_reusable_session(
+        &self,
+        created_by: &str,
+        entry_key: &str,
+        reuse_fingerprint: &str,
+    ) -> Option<SessionInfo> {
+        let sessions = self.sessions.read().await;
+        for session in sessions.values() {
+            let s = session.lock().await;
+            if s.status == SessionStatus::Pending
+                && s.guacd_stream.is_some()
+                && s.created_by == created_by
+                && s.address_book_entry.as_deref() == Some(entry_key)
+                && s.reuse_fingerprint == reuse_fingerprint
+                && (Utc::now() - s.created_at).num_seconds() < Self::REUSABLE_PENDING_SECS
+            {
+                return Some(s.info());
+            }
+        }
+        None
     }
 
     /// Get a specific session's info.
@@ -2441,6 +2735,20 @@ fn drive_cleanup_settings(drive: &Option<DriveConfig>) -> (bool, u64) {
     }
 }
 
+/// A VDI container username: it becomes the container name suffix and a
+/// directory under `home_base`, so only a plain name is accepted. Letters,
+/// digits, '.', '_' and '-', at most 32 characters (the Linux limit), not
+/// starting with '.' or '-' (which rules out `.` and `..`).
+pub(crate) fn valid_vdi_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     GuacdConnection(String),
@@ -2503,6 +2811,59 @@ pub(crate) fn check_share_token_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_hoc_requests_cannot_claim_an_entry() {
+        // A poweruser's ad-hoc request naming a real entry and a rotation
+        // limit of 1 would have deleted that entry's older recordings when
+        // the session ended.
+        let mut req: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "session_type": "ssh",
+            "hostname": "10.0.0.1",
+            "address_book_entry": "shared/prod/db01",
+            "address_book_folder": "prod",
+            "entry_display_name": "db01",
+            "max_recordings": 1,
+            "record_typescript": true,
+            "enable_recording": true
+        }))
+        .unwrap();
+        req.clear_entry_only_fields();
+        assert_eq!(req.address_book_entry, None);
+        assert_eq!(req.address_book_folder, None);
+        assert_eq!(req.entry_display_name, None);
+        assert_eq!(req.max_recordings, None);
+        assert_eq!(req.record_typescript, None);
+        // What the caller may choose is left alone.
+        assert_eq!(req.hostname.as_deref(), Some("10.0.0.1"));
+        assert_eq!(req.enable_recording, Some(true));
+    }
+
+    #[test]
+    fn vdi_username_must_be_a_plain_name() {
+        // It becomes a directory under home_base that is bind-mounted into the
+        // container, so anything that could leave home_base is refused.
+        for ok in ["alice", "svc.backup", "j_smith-2", "A1", &"a".repeat(32)] {
+            assert!(valid_vdi_username(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../../etc",
+            "../root",
+            "a/b",
+            "/etc",
+            ".hidden",
+            "-rf",
+            "a b",
+            "a\\b",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert!(!valid_vdi_username(bad), "{bad:?} should be refused");
+        }
+    }
 
     // ── Typescript filename templating (#159) ──
 
@@ -2755,6 +3116,7 @@ mod tests {
             shadow_tokens: Vec::new(),
             share_allowed: true,
             fullscreen_on_connect: false,
+            reuse_fingerprint: String::new(),
             autohide_side_tabs: false,
         }
     }
@@ -2954,32 +3316,44 @@ mod tests {
         assert_eq!(guard.active_connections, 0);
     }
 
-    #[test]
-    fn test_check_allowed_network_ipv4_match() {
-        assert!(check_allowed_network("127.0.0.1", 22, &["127.0.0.0/8".into()]).is_ok());
-        assert!(check_allowed_network("10.1.2.3", 80, &["10.0.0.0/8".into()]).is_ok());
+    #[tokio::test]
+    async fn test_check_allowed_network_ipv4_match() {
+        assert!(
+            check_allowed_network("127.0.0.1", 22, &["127.0.0.0/8".into()])
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_allowed_network("10.1.2.3", 80, &["10.0.0.0/8".into()])
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn test_check_allowed_network_ipv4_denied() {
-        let err = check_allowed_network("8.8.8.8", 22, &["127.0.0.0/8".into()]);
+    #[tokio::test]
+    async fn test_check_allowed_network_ipv4_denied() {
+        let err = check_allowed_network("8.8.8.8", 22, &["127.0.0.0/8".into()]).await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_check_allowed_network_empty_allowlist() {
-        let err = check_allowed_network("127.0.0.1", 22, &[]);
+    #[tokio::test]
+    async fn test_check_allowed_network_empty_allowlist() {
+        let err = check_allowed_network("127.0.0.1", 22, &[]).await;
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("no valid CIDR"), "got: {}", msg);
     }
 
-    #[test]
-    fn test_check_allowed_network_multiple_cidrs() {
+    #[tokio::test]
+    async fn test_check_allowed_network_multiple_cidrs() {
         let cidrs = vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()];
-        assert!(check_allowed_network("10.1.1.1", 22, &cidrs).is_ok());
-        assert!(check_allowed_network("192.168.1.1", 22, &cidrs).is_ok());
-        assert!(check_allowed_network("172.16.0.1", 22, &cidrs).is_err());
+        assert!(check_allowed_network("10.1.1.1", 22, &cidrs).await.is_ok());
+        assert!(check_allowed_network("192.168.1.1", 22, &cidrs)
+            .await
+            .is_ok());
+        assert!(check_allowed_network("172.16.0.1", 22, &cidrs)
+            .await
+            .is_err());
     }
 
     /// The fence flag is server-set; a request body must not switch it off.
@@ -3044,22 +3418,90 @@ mod tests {
     }
 
     #[test]
-    fn test_allowed_address_returns_literal() {
-        let ip = allowed_address("10.1.2.3", 22, &["10.0.0.0/8".into()]).unwrap();
+    fn wol_is_dropped_for_untrusted_ad_hoc_and_wait_is_capped() {
+        let req = fenced_request(serde_json::json!({
+            "session_type": "ssh",
+            "wol_send_packet": true,
+            "wol_mac_addr": "00:11:22:33:44:55",
+            "wol_broadcast_addr": "192.0.2.255",
+            "wol_udp_port": 4822,
+            "wol_wait_time": 999999,
+        }));
+        let fenced = wol_params(&req, true);
+        assert!(!fenced.send_packet && fenced.broadcast_addr.is_none());
+        let trusted = wol_params(&req, false);
+        assert!(trusted.send_packet);
+        assert_eq!(trusted.wait_time, Some(MAX_WOL_WAIT_SECS));
+    }
+
+    async fn allowed_address_for_test(host: &str) -> Result<std::net::IpAddr, SessionError> {
+        allowed_address(host, 22, &["10.0.0.0/8".to_string()]).await
+    }
+
+    /// Reproduces the DNS stall: with a resolver that never answers, the
+    /// allowlist lookup held tokio worker threads for the whole resolver
+    /// timeout, so the rest of rustguac (including /api/health) stopped.
+    /// Needs a dead resolver, so it is ignored by default. Run it with:
+    ///
+    ///   printf 'nameserver 10.255.255.1\noptions timeout:3 attempts:2\n' > /tmp/dead.conf
+    ///   unshare -rm sh -c 'mount --bind /tmp/dead.conf /etc/resolv.conf && \
+    ///     cargo test slow_dns_does_not_stall_the_runtime -- --ignored'
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a resolver that does not answer; see the comment"]
+    async fn slow_dns_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let beats = Arc::new(AtomicU64::new(0));
+        let b = beats.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                b.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let lookups: Vec<_> = (0..4)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let host = format!("host{i}.unresolvable.example");
+                    let _ = allowed_address_for_test(&host).await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let n = beats.load(Ordering::Relaxed);
+        heartbeat.abort();
+        for l in lookups {
+            l.abort();
+        }
+        // 3s at one beat per 50ms is ~60; a stalled runtime manages almost none.
+        assert!(
+            n >= 30,
+            "runtime stalled during DNS lookups: {n} heartbeats in 3s"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allowed_address_returns_literal() {
+        let ip = allowed_address("10.1.2.3", 22, &["10.0.0.0/8".into()])
+            .await
+            .unwrap();
         assert_eq!(ip.to_string(), "10.1.2.3");
     }
 
     /// A dual-stack name with only one family allowed still resolves to the
     /// allowed address instead of failing.
-    #[test]
-    fn test_allowed_address_skips_disallowed_family() {
-        let ip = allowed_address("localhost", 22, &["127.0.0.0/8".into()]).unwrap();
+    #[tokio::test]
+    async fn test_allowed_address_skips_disallowed_family() {
+        let ip = allowed_address("localhost", 22, &["127.0.0.0/8".into()])
+            .await
+            .unwrap();
         assert!(ip.is_ipv4() && ip.is_loopback(), "got {ip}");
     }
 
-    #[test]
-    fn test_allowed_address_rejects_when_none_allowed() {
-        assert!(allowed_address("localhost", 22, &["10.0.0.0/8".into()]).is_err());
+    #[tokio::test]
+    async fn test_allowed_address_rejects_when_none_allowed() {
+        assert!(allowed_address("localhost", 22, &["10.0.0.0/8".into()])
+            .await
+            .is_err());
     }
 
     #[test]
@@ -3068,11 +3510,58 @@ mod tests {
         assert_eq!(dial_host("::1".parse().unwrap()), "[::1]");
     }
 
-    #[test]
-    fn test_check_allowed_network_localhost_resolves() {
+    fn hop(hostname: &str, port: u16) -> tunnel::JumpHost {
+        tunnel::JumpHost {
+            hostname: hostname.into(),
+            port,
+            username: "u".into(),
+            password: None,
+            private_key: None,
+            host_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_network_without_hops_checks_the_target() {
+        let cidrs = vec!["127.0.0.0/8".into()];
+        assert!(check_session_network("127.0.0.1", 3389, &cidrs, &[])
+            .await
+            .is_ok());
+        assert!(check_session_network("8.8.8.8", 3389, &cidrs, &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn session_network_with_hops_skips_unresolvable_target() {
+        // The whole point of a bastion: the target name resolves only there.
+        let rdp = vec!["10.0.0.0/8".into()];
+        let hops = vec![hop("127.0.0.1", 22)];
+        assert!(
+            check_session_network("liva-z-remote", 3389, &rdp, &hops)
+                .await
+                .is_ok(),
+            "bastion-only target name must not be resolved locally"
+        );
+    }
+
+    /// Hop 0 is fenced only for untrusted callers, where the chain is built
+    /// (see `fenced_jump_host_outside_allowlist_refused`); admins and
+    /// connection entries name their own bastions.
+    #[tokio::test]
+    async fn session_network_leaves_hop_zero_to_the_fence() {
+        let rdp = vec!["10.0.0.0/8".into()];
+        let hops = vec![hop("192.0.2.10", 22), hop("unresolvable-second-hop", 22)];
+        assert!(check_session_network("liva-z-remote", 3389, &rdp, &hops)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_allowed_network_localhost_resolves() {
         // "localhost" should resolve to 127.0.0.1 or ::1
         let cidrs = vec!["127.0.0.0/8".into(), "::1/128".into()];
-        assert!(check_allowed_network("localhost", 80, &cidrs).is_ok());
+        assert!(check_allowed_network("localhost", 80, &cidrs).await.is_ok());
     }
 
     #[test]
@@ -3167,6 +3656,252 @@ mod tests {
         // The default DriveConfig uses cleanup_on_close=true, retention=0.
         let cfg = DriveConfig::default();
         assert_eq!(drive_cleanup_settings(&Some(cfg)), (true, 0));
+    }
+
+    // ── Pending-session reuse (repeat Connect on an entry) ──
+
+    fn entry_request(extra: serde_json::Value) -> CreateSessionRequest {
+        let mut body = serde_json::json!({
+            "session_type": "rdp",
+            "hostname": "rdp.example.test",
+            "port": 3389,
+            "username": "alice",
+            "password": "correct horse",
+            "domain": "CORP",
+            "address_book_entry": "shared/ops/rdp-1",
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// A Pending session as `create_session` leaves it for an entry connect:
+    /// guacd connected (any stream will do here), owner not yet attached.
+    fn pending_entry_session(req: &CreateSessionRequest, created_by: &str) -> Session {
+        let (a, _b) = tokio::io::duplex(64);
+        let mut s = seed_test_session(&format!("tok-{}", Uuid::new_v4()));
+        s.status = SessionStatus::Pending;
+        s.guacd_stream = Some(Box::new(a));
+        s.created_by = created_by.into();
+        s.address_book_entry = req.address_book_entry.clone();
+        s.reuse_fingerprint = req.reuse_fingerprint();
+        s
+    }
+
+    #[test]
+    fn reuse_fingerprint_tracks_target_and_credentials() {
+        let base = entry_request(serde_json::json!({}));
+        let same = entry_request(serde_json::json!({}));
+        assert_eq!(base.reuse_fingerprint(), same.reuse_fingerprint());
+        assert_eq!(base.reuse_fingerprint().len(), 64);
+        // Does not contain a secret in the clear.
+        assert!(!base.reuse_fingerprint().contains("correct horse"));
+
+        for (key, value) in [
+            ("password", serde_json::json!("wrong horse")),
+            ("username", serde_json::json!("bob")),
+            ("domain", serde_json::json!("OTHER")),
+            ("private_key", serde_json::json!("-----BEGIN KEY-----")),
+            ("hostname", serde_json::json!("rdp2.example.test")),
+            ("port", serde_json::json!(3390)),
+            ("jump_password", serde_json::json!("hop")),
+        ] {
+            let other = entry_request(serde_json::json!({ key: value }));
+            assert_ne!(
+                base.reuse_fingerprint(),
+                other.reuse_fingerprint(),
+                "{key} must change the fingerprint"
+            );
+        }
+        // Display params are not part of it: a second click from a resized
+        // window still reuses the session.
+        let resized = entry_request(serde_json::json!({ "width": 800, "height": 600 }));
+        assert_eq!(base.reuse_fingerprint(), resized.reuse_fingerprint());
+        // Absent and empty are different, and so is a shifted boundary.
+        let empty_pw = entry_request(serde_json::json!({ "password": "" }));
+        let no_pw = {
+            let mut r = entry_request(serde_json::json!({}));
+            r.password = None;
+            r
+        };
+        assert_ne!(empty_pw.reuse_fingerprint(), no_pw.reuse_fingerprint());
+        let ab_c = entry_request(serde_json::json!({ "username": "ab", "password": "c" }));
+        let a_bc = entry_request(serde_json::json!({ "username": "a", "password": "bc" }));
+        assert_ne!(ab_c.reuse_fingerprint(), a_bc.reuse_fingerprint());
+    }
+
+    #[test]
+    fn reuse_fingerprint_covers_every_setting_but_display() {
+        // Not just credentials: an entry whose admin has turned recording
+        // on, changed the security mode or enabled the drive since the
+        // first click must not hand back the session made without it.
+        let base = entry_request(serde_json::json!({}));
+        for (key, value) in [
+            ("enable_recording", serde_json::json!(true)),
+            ("record_typescript", serde_json::json!(true)),
+            ("security", serde_json::json!("nla")),
+            ("ignore_cert", serde_json::json!(true)),
+            ("enable_drive", serde_json::json!(true)),
+            ("disable_copy", serde_json::json!(true)),
+            ("allow_sharing", serde_json::json!(true)),
+            ("container_env", serde_json::json!({"A": "1"})),
+        ] {
+            let other = entry_request(serde_json::json!({ key: value }));
+            assert_ne!(
+                base.reuse_fingerprint(),
+                other.reuse_fingerprint(),
+                "{key} must change the fingerprint"
+            );
+        }
+        let mut fenced = entry_request(serde_json::json!({}));
+        fenced.fence_all_targets = true;
+        assert_ne!(base.reuse_fingerprint(), fenced.reuse_fingerprint());
+
+        // Display-only fields do not: a resized window, another pixel
+        // density or banner still reuses the Pending session.
+        let display = entry_request(serde_json::json!({
+            "width": 1696, "height": 944, "dpi": 192, "banner": "elsewhere"
+        }));
+        assert_eq!(base.reuse_fingerprint(), display.reuse_fingerprint());
+
+        // A map's insertion order does not matter.
+        let ab = entry_request(serde_json::json!({ "container_env": {"A": "1", "B": "2"} }));
+        let ba = entry_request(serde_json::json!({ "container_env": {"B": "2", "A": "1"} }));
+        assert_eq!(ab.reuse_fingerprint(), ba.reuse_fingerprint());
+    }
+
+    #[tokio::test]
+    async fn changed_entry_settings_get_a_new_session() {
+        let mgr = new_manager_for_tests();
+        let req = entry_request(serde_json::json!({}));
+        let id = insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
+
+        for change in [
+            serde_json::json!({ "enable_recording": true }),
+            serde_json::json!({ "security": "nla" }),
+            serde_json::json!({ "ignore_cert": true }),
+            serde_json::json!({ "enable_drive": true }),
+        ] {
+            let next = entry_request(change.clone());
+            assert!(
+                mgr.find_reusable_session(
+                    "alice@example.com",
+                    "shared/ops/rdp-1",
+                    &next.reuse_fingerprint(),
+                )
+                .await
+                .is_none(),
+                "{change} must not reuse the earlier session"
+            );
+        }
+        let resized = entry_request(serde_json::json!({ "width": 800, "height": 600, "dpi": 144 }));
+        let found = mgr
+            .find_reusable_session(
+                "alice@example.com",
+                "shared/ops/rdp-1",
+                &resized.reuse_fingerprint(),
+            )
+            .await
+            .expect("only the display changed: reused");
+        assert_eq!(found.session_id, id);
+    }
+
+    #[tokio::test]
+    async fn fresh_pending_session_reused_for_same_entry_and_credentials() {
+        let mgr = new_manager_for_tests();
+        let req = entry_request(serde_json::json!({}));
+        let id = insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
+
+        let again = entry_request(serde_json::json!({}));
+        let found = mgr
+            .find_reusable_session(
+                "alice@example.com",
+                "shared/ops/rdp-1",
+                &again.reuse_fingerprint(),
+            )
+            .await
+            .expect("same entry, same credentials, within the window: reused");
+        assert_eq!(found.session_id, id);
+    }
+
+    #[tokio::test]
+    async fn retry_with_different_credentials_gets_a_new_session() {
+        let mgr = new_manager_for_tests();
+        let req = entry_request(serde_json::json!({}));
+        insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
+
+        // A mistyped password at the prompt, retried within 15 s: the old
+        // Pending session holds the old password, so it must not be handed
+        // back.
+        let retry = entry_request(serde_json::json!({ "password": "wrong horse" }));
+        assert!(mgr
+            .find_reusable_session(
+                "alice@example.com",
+                "shared/ops/rdp-1",
+                &retry.reuse_fingerprint(),
+            )
+            .await
+            .is_none());
+        let other_user = entry_request(serde_json::json!({ "username": "bob" }));
+        assert!(mgr
+            .find_reusable_session(
+                "alice@example.com",
+                "shared/ops/rdp-1",
+                &other_user.reuse_fingerprint(),
+            )
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn reuse_is_scoped_to_user_entry_status_and_age() {
+        let mgr = new_manager_for_tests();
+        let req = entry_request(serde_json::json!({}));
+        let fp = req.reuse_fingerprint();
+
+        insert_session(&mgr, pending_entry_session(&req, "alice@example.com")).await;
+        // Another user's identical Pending session is not ours to take.
+        assert!(mgr
+            .find_reusable_session("mallory@example.com", "shared/ops/rdp-1", &fp)
+            .await
+            .is_none());
+        // Nor is the same user's session for a different entry.
+        assert!(mgr
+            .find_reusable_session("alice@example.com", "shared/ops/rdp-2", &fp)
+            .await
+            .is_none());
+
+        // An owner already attached: the stream is consumed, not re-ownable.
+        let mgr = new_manager_for_tests();
+        let mut active = pending_entry_session(&req, "alice@example.com");
+        active.status = SessionStatus::Active;
+        insert_session(&mgr, active).await;
+        assert!(mgr
+            .find_reusable_session("alice@example.com", "shared/ops/rdp-1", &fp)
+            .await
+            .is_none());
+
+        // Older than the window: left to the pending-timeout reaper.
+        let mgr = new_manager_for_tests();
+        let mut stale = pending_entry_session(&req, "alice@example.com");
+        stale.created_at =
+            Utc::now() - chrono::Duration::seconds(SessionManager::REUSABLE_PENDING_SECS + 1);
+        insert_session(&mgr, stale).await;
+        assert!(mgr
+            .find_reusable_session("alice@example.com", "shared/ops/rdp-1", &fp)
+            .await
+            .is_none());
+
+        // No guacd stream (deferred connect): nothing to hand over yet.
+        let mgr = new_manager_for_tests();
+        let mut deferred = pending_entry_session(&req, "alice@example.com");
+        deferred.guacd_stream = None;
+        insert_session(&mgr, deferred).await;
+        assert!(mgr
+            .find_reusable_session("alice@example.com", "shared/ops/rdp-1", &fp)
+            .await
+            .is_none());
     }
 }
 

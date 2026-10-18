@@ -69,6 +69,38 @@
             cursor: pointer;
         }
         #banner-continue:hover { background: var(--primary-hover); }
+        /* Fullscreen-on-connect gate: covers the session until the browser
+           is fullscreen, so the first picture the user sees is the one that
+           fits (the fullscreen desktop), not a scaled-down windowed fit. */
+        #fs-gate {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--bg);
+            z-index: 3100; /* above the side tabs (3001); hidden before the disconnect overlay (3000) is shown */
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+        }
+        #fs-gate.visible { display: flex; }
+        #fs-gate-box {
+            text-align: center;
+            font-family: monospace;
+            color: var(--text);
+            max-width: 600px;
+            padding: 2em 3em;
+        }
+        #fs-gate-spinner {
+            width: 30px; height: 30px; margin: 0 auto 1.2em;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: fs-gate-spin 0.8s linear infinite;
+        }
+        @keyframes fs-gate-spin { to { transform: rotate(360deg); } }
+        #fs-gate-title { font-size: 1.3em; font-weight: bold; margin-bottom: 0.5em; }
+        #fs-gate-status { color: var(--text-dim); font-size: 0.95em; min-height: 1.2em; letter-spacing: 0.02em; }
+        #fs-gate-status.connected { color: var(--accent); }
         #disconnected-overlay {
             display: none;
             position: fixed;
@@ -187,6 +219,7 @@
     <script src="/guac/KeyEventInterpreter.js"></script>
     <script src="/guac/Layer.js"></script>
     <script src="/guac/Mouse.js"></script>
+    <script src="/guac/MonitorPointer.js"></script>
     <script src="/guac/Parser.js"></script>
     <script src="/guac/Position.js"></script>
     <script src="/guac/Status.js"></script>
@@ -240,6 +273,13 @@
         </div>
     </div>
     <div id="fs-esc-notice"></div>
+    <div id="fs-gate">
+        <div id="fs-gate-box">
+            <div id="fs-gate-spinner"></div>
+            <div id="fs-gate-title"></div>
+            <div id="fs-gate-status"></div>
+        </div>
+    </div>
     <div id="display"></div>
 
     <script>
@@ -254,6 +294,36 @@
             throw new Error('No session ID');
         }
 
+        // Whether asking the server for this size would actually change
+        // anything, keyed by monitor index.
+        //
+        // The RDP display patch rounds both dimensions down to a multiple of
+        // 16 (patch 007-rdp-disp-mod16), so two viewport sizes inside the same
+        // 16px band resolve to the same framebuffer. A resize between them is
+        // a no-op on the wire -- but not a free one: a resolution change tears
+        // down and rebuilds the browser's hardware H.264 decoder, measured at
+        // ~6 seconds of stalled video on D3D11. Dragging a window across a
+        // hundred pixels in pauses could buy several of those for nothing.
+        //
+        // Only the decision is taken on the rounded value; the size sent is
+        // the true one, since the client cannot tell an RDP session from a VNC
+        // one and a VNC server does no such rounding -- it should not be handed
+        // a framebuffer up to 15px short.
+        var lastRequestedSize = {};
+
+        function sizeWouldChange(width, height, index) {
+
+            var key = (index === undefined || index === null) ? 0 : index;
+            var rounded = (width - width % 16) + 'x' + (height - height % 16);
+
+            if (lastRequestedSize[key] === rounded)
+                return false;
+
+            lastRequestedSize[key] = rounded;
+            return true;
+
+        }
+
         var statusEl = document.getElementById('status');
         var urlParams = new URLSearchParams(window.location.search);
         var shareToken = urlParams.get('token');
@@ -264,6 +334,44 @@
         // POST /api/ws-ticket and hands the browser /client/{id}?ticket=...
         var urlTicket = urlParams.get('ticket');
         var entryName = urlParams.get('name');
+        // Embedded in a full-viewport iframe on the launcher tab (that tab is
+        // already fullscreen, so this page does no fullscreen of its own and
+        // just fills the frame; it tells the parent when the session ends).
+        var embedded = urlParams.get('embedded') === '1';
+        // ?fs=0: opened by the launcher's "open in a new window" button (⧉).
+        // An explicitly windowed session: no fullscreen-on-connect, whatever
+        // the entry says, so no cover asking for a click.
+        var windowed = urlParams.get('fs') === '0';
+        function rgNotifyParent(kind) { if (!embedded) return; try { window.parent.postMessage({ rgSession: kind }, location.origin); } catch (e) {} }
+        // Every navigation away from the session goes through here. Embedded,
+        // it moves the whole tab: the frame may only hold this session's
+        // client, and any other page refuses to load in a frame.
+        function rgGo(url) {
+            if (embedded) { try { window.top.location.href = url; return; } catch (e) {} }
+            window.location.href = url;
+        }
+        // Embedded: the launcher enters fullscreen, waits for the viewport to
+        // stop changing and creates the session at that measured size, so the
+        // frame paints into exactly the size the remote was given. The connect
+        // cover stays up, and the fit-to-window sends wait, until the launcher
+        // confirms that (its 'viewport' message, sent once this frame reports
+        // ready), so nothing is shown or sent against a viewport that is still
+        // moving.
+        var viewportSettled = !embedded;
+        var _onViewportSettled = [];
+        function rgWhenViewportSettled(fn) { if (viewportSettled) fn(); else _onViewportSettled.push(fn); }
+        function rgMarkViewportSettled() {
+            if (viewportSettled) return;
+            viewportSettled = true;
+            var fns = _onViewportSettled; _onViewportSettled = [];
+            for (var i = 0; i < fns.length; i++) { try { fns[i](); } catch (e) {} }
+        }
+        if (embedded) {
+            window.addEventListener('message', function (e) {
+                if (e.origin !== location.origin || !e.data || e.data.rgLauncher !== 'viewport') return;
+                rgMarkViewportSettled();
+            });
+        }
         // Populated from /api/sessions/:id when the session is backed by a
         // Connections entry. Used by the Reconnect button to launch a fresh
         // session against the same entry instead of reloading a dead one.
@@ -272,6 +380,51 @@
         // show in the in-fullscreen top bar. Populated from the same fetch.
         var entryDisplayName = '';
         var wantFullscreen = false;
+        var bitmapSession = false;   // rdp/vnc: a server-side resize is slow and visible
+        var fsEverEntered = false;   // after the first fullscreen, size to the window again
+        // #257: the launcher adds ?fs=1 for a fullscreen-on-connect entry. We
+        // request fullscreen immediately, here, before the async session fetch
+        // — the window still holds the user activation carried from the Connect
+        // click, which may have lapsed by the time the metadata returns. If the
+        // browser honours it there is no click at all; if not, the cover's
+        // armed gesture still enters it. Showing the cover now also avoids any
+        // flash of the page before the session loads.
+        // Embedded frames show the same cover from the start (no fullscreen
+        // request of their own: the parent tab holds it) and lift it once
+        // connected and the viewport has settled.
+        var _rgEarlyCover = function () {
+            try {
+                var _g = document.getElementById('fs-gate');
+                if (!_g) return;
+                var _t = document.getElementById('fs-gate-title');
+                if (_t) _t.textContent = entryName || 'Session';
+                var _s = document.getElementById('fs-gate-status');
+                if (_s) _s.textContent = 'Connecting…';
+                _g.className = 'visible';
+            } catch (e) {}
+        };
+        // Windowed (⧉) sessions arrive from the matching splash on
+        // /launch.html, so they keep the cover up until connected too.
+        if (embedded || windowed) {
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _rgEarlyCover);
+            else _rgEarlyCover();
+        }
+        if (urlParams.get('fs') === '1' && !embedded) {
+            wantFullscreen = true;
+            var _rgEarlyFs = function () {
+                _rgEarlyCover();
+                try {
+                    var _el = document.documentElement;
+                    var _req = _el.requestFullscreen || _el.webkitRequestFullscreen || _el.mozRequestFullScreen || _el.msRequestFullscreen;
+                    if (_req) { var _p = _req.call(_el); if (_p && _p.catch) _p.catch(function () {}); }
+                } catch (e) {}
+            };
+            // Requesting fullscreen during initial parse is refused, so wait for
+            // the document to be interactive — but still before the async
+            // session fetch, so the window keeps the Connect click's activation.
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _rgEarlyFs);
+            else _rgEarlyFs();
+        }
         // Per-entry autohide of the clipboard/files side tabs; populated from
         // the same /api/sessions/:id fetch and read when the tabs are built.
         var wantAutohideTabs = false;
@@ -348,7 +501,8 @@
                     };
                 }
                 if (session && session.entry_display_name) entryDisplayName = session.entry_display_name;
-                if (session && session.fullscreen_on_connect) wantFullscreen = true;
+                if (session && session.fullscreen_on_connect && !embedded && !windowed) wantFullscreen = true;
+                bitmapSession = !!(session && (session.session_type === 'rdp' || session.session_type === 'vnc'));
                 if (session && session.autohide_side_tabs) wantAutohideTabs = true;
                 return showBanner(session.banner);
             })
@@ -562,7 +716,7 @@
                     // back to Connections. Session may keep running until
                     // socket closes; user can explicitly terminate from
                     // Connections' active-session card.
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                 });
                 document.getElementById('cp-fullscreen').addEventListener('click', function() {
                     rgEnterFullscreen();
@@ -850,7 +1004,7 @@
                 var win = window.open('', 'rustguac-mon-' + index,
                     'width=1280,height=800,menubar=no,toolbar=no,location=no,status=no');
                 if (!win) {
-                    alert('Popup blocked. Allow popups for this site to open an extra monitor.');
+                    rgAlert('Popup blocked. Allow popups for this site to open an extra monitor.');
                     renderMonitorControls();
                     return;
                 }
@@ -920,62 +1074,23 @@
                     popResizeTimer = win.setTimeout(function() {
                         var w = (win.innerWidth || 0) & ~0x7;
                         var h = win.innerHeight || 0;
-                        if (w >= 8 && h >= 8) client.sendSize(w, h, index, 0);
-                    }, 300);
+                        if (w >= 8 && h >= 8 && sizeWouldChange(w, h, index))
+                            client.sendSize(w, h, index, 0);
+                    }, 500);
                 });
 
-                // Mouse: map the pointer from popup-window pixels to this
-                // monitor's native pixels using the canvas's LIVE on-screen
-                // geometry (getBoundingClientRect), then offset into the combined
-                // framebuffer. Reading the live rect each event avoids any stale
-                // cached scale/offset. Sent raw; guacd maps the combined
-                // coordinate back to this head.
-                // Native pointer handling (bypasses Guacamole.Mouse, which does
-                // not track the X axis correctly in a popup window). Map the raw
-                // client coordinate into the canvas's live on-screen rect as a
-                // 0..1 fraction, then into this monitor's native pixels and the
-                // combined framebuffer. Fraction-based, so it self-recalibrates
-                // on any resize.
-                function popupPointer(ev) {
-                    var rect = monitorLayout[index];
-                    if (!rect) return;
-                    var cr = canvas.getBoundingClientRect();
-                    var fx = cr.width > 0 ? (ev.clientX - cr.left) / cr.width : 0;
-                    var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
-                    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
-                    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
-                    client.sendMouseState(new Guacamole.Mouse.State({
-                        x: rect.left + fx * rect.width,
-                        y: rect.top + fy * rect.height,
-                        left:   (ev.buttons & 1) !== 0,
-                        middle: (ev.buttons & 4) !== 0,
-                        right:  (ev.buttons & 2) !== 0,
-                        up: false, down: false
-                    }), false);
-                    ev.preventDefault();
-                }
-                canvas.addEventListener('mousedown', popupPointer);
-                canvas.addEventListener('mousemove', popupPointer);
-                canvas.addEventListener('mouseup', popupPointer);
-                canvas.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
-                // Scroll wheel -> momentary up/down button.
-                canvas.addEventListener('wheel', function(ev) {
-                    var rect = monitorLayout[index];
-                    if (!rect) return;
-                    var cr = canvas.getBoundingClientRect();
-                    var fx = cr.width > 0 ? (ev.clientX - cr.left) / cr.width : 0;
-                    var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
-                    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
-                    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
-                    var base = { x: rect.left + fx * rect.width, y: rect.top + fy * rect.height,
-                                 left: false, middle: false, right: false, up: false, down: false };
-                    var dir = ev.deltaY < 0 ? 'up' : 'down';
-                    base[dir] = true;
-                    client.sendMouseState(new Guacamole.Mouse.State(base), false);
-                    base[dir] = false;
-                    client.sendMouseState(new Guacamole.Mouse.State(base), false);
-                    ev.preventDefault();
-                }, { passive: false });
+                // Pointer, wheel and context menu. Guacamole.Mouse is not
+                // used here -- it does not track the X axis correctly in a
+                // popup -- so the mapping, the repeat suppression and the
+                // coalesced replay live in Guacamole.MonitorPointer, where a
+                // test can reach them. The rect is read per event rather than
+                // captured, because the layout changes under a running window.
+                Guacamole.MonitorPointer(canvas,
+                    function () { return monitorLayout[index]; },
+                    function (state) {
+                        client.sendMouseState(new Guacamole.Mouse.State(state),
+                                false);
+                    });
 
                 // Keyboard: forward to the same client (combined session).
                 var keyboard = new Guacamole.Keyboard(win.document);
@@ -1434,38 +1549,59 @@
                 } catch(e) { /* ignore capture errors */ }
             }
 
-            // ── Fullscreen (#154) ──
-            // The browser API requires a fresh user gesture to enter
-            // fullscreen, and navigation from connections.html consumes
-            // the prior gesture. So when the entry is marked
-            // fullscreen-on-connect we don't try to fire on page load.
-            // Instead we arm a one-shot listener for the next mousedown
-            // or keydown after CONNECTED. The Ctrl+Alt+Shift menu's
-            // fullscreen button uses its own click gesture and works at
-            // any time once shown.
+            // ── Fullscreen (#154, #257) ──
+            // A fullscreen-on-connect entry goes fullscreen before its picture
+            // is shown, so the desktop is painted once at the final size with
+            // no windowed frame and no resize. The browser needs a user
+            // gesture to enter fullscreen; the Connect click on the
+            // connections page is carried into this window (opened within that
+            // click), so rgEnterFullscreen() is tried immediately on load and
+            // usually succeeds with no further interaction. A cover stays over
+            // the page the whole time — while fullscreen is requested, while
+            // the tunnel connects, while the server paints — and lifts only
+            // once the window is fullscreen and the session connected. If the
+            // browser won't honour the load-time request, the next click or
+            // key (armed below) enters fullscreen instead; that press is taken
+            // in the capture phase so it never reaches the remote (#256).
             function rgFullscreenEl() {
                 return document.fullscreenElement
                     || document.webkitFullscreenElement
                     || document.mozFullScreenElement
                     || document.msFullscreenElement || null;
             }
-            function rgEnterFullscreen() {
+            // A bitmap (RDP/VNC) fullscreen-on-connect session is created at
+            // the screen's size and kept there until fullscreen lands, so the
+            // picture painted behind the cover is already the fullscreen one —
+            // no resize when it is revealed. Everything else, and everything
+            // after the first fullscreen, tracks the window.
+            function rgTargetSize(anyPanelOpen) {
+                if (wantFullscreen && bitmapSession && !fsEverEntered && !rgFullscreenEl() && window.screen && screen.width > 0 && screen.height > 0)
+                    return [screen.width, screen.height];
+                return [anyPanelOpen ? window.innerWidth - 380 : window.innerWidth, window.innerHeight];
+            }
+            // Try to enter fullscreen. onReject runs if the browser refuses
+            // (e.g. no user activation on load): the caller decides whether to
+            // wait for a gesture or give up and show the windowed session.
+            var fsKeyboardLocked = false;
+            function rgOnFullscreenEntered() {
+                if (fsKeyboardLocked) return;
+                fsKeyboardLocked = true;
+                if (navigator.keyboard && navigator.keyboard.lock) {
+                    navigator.keyboard.lock(['Escape']).catch(rgShowEscNoticeOnce);
+                } else {
+                    rgShowEscNoticeOnce();
+                }
+            }
+            function rgEnterFullscreen(onReject) {
                 var el = document.documentElement;
                 var req = el.requestFullscreen
                     || el.webkitRequestFullscreen
                     || el.mozRequestFullScreen
                     || el.msRequestFullscreen;
-                if (!req) return;
+                if (!req) { if (onReject) onReject(); return; }
                 var p;
-                try { p = req.call(el); } catch (e) { return; }
-                var onOk = function() {
-                    if (navigator.keyboard && navigator.keyboard.lock) {
-                        navigator.keyboard.lock(['Escape']).catch(rgShowEscNoticeOnce);
-                    } else {
-                        rgShowEscNoticeOnce();
-                    }
-                };
-                if (p && p.then) p.then(onOk).catch(function(){}); else onOk();
+                try { p = req.call(el); } catch (e) { if (onReject) onReject(); return; }
+                if (p && p.then) p.then(rgOnFullscreenEntered).catch(function(){ if (onReject) onReject(); }); else rgOnFullscreenEntered();
             }
             function rgExitFullscreen() {
                 try { if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock(); } catch (e) {}
@@ -1475,14 +1611,88 @@
                     || document.msExitFullscreen;
                 if (x) { try { x.call(document); } catch (e) {} }
             }
+            var fsConnected = false;   // the tunnel has reached CONNECTED
+            var fsGestureArmed = false;
+            // Reveal the session only once it is both fullscreen and
+            // connected: the picture behind the cover is then the final one.
+            function rgMaybeReveal() {
+                if (fsConnected && rgFullscreenEl()) rgHideConnectCover();
+            }
+            // Fallback when the load-time fullscreen request is refused: wait
+            // for the user's next click or key and enter fullscreen on it. The
+            // press is swallowed (capture phase) so it isn't sent to the
+            // remote, and a hint on the cover tells the user what to do.
             function rgArmFullscreenGesture() {
-                var fire = function() {
-                    document.removeEventListener('mousedown', fire, true);
-                    document.removeEventListener('keydown', fire, true);
-                    rgEnterFullscreen();
+                if (fsGestureArmed) return;
+                fsGestureArmed = true;
+                var fire = function(e) {
+                    if (e.type === 'keydown' && (e.key === 'Escape' || e.key === 'Tab')) return;
+                    rgDisarmFullscreenGesture();
+                    e.stopPropagation();
+                    e.preventDefault();
+                    rgEnterFullscreen(function() {
+                        // Still refused: show the windowed session rather than
+                        // trap the user behind the cover forever.
+                        rgHideConnectCover();
+                    });
                 };
-                document.addEventListener('mousedown', fire, true);
-                document.addEventListener('keydown', fire, true);
+                window.addEventListener('mousedown', fire, true);
+                window.addEventListener('keydown', fire, true);
+                rgArmFullscreenGesture._fire = fire;
+            }
+            function rgDisarmFullscreenGesture() {
+                if (!fsGestureArmed) return;
+                fsGestureArmed = false;
+                var fire = rgArmFullscreenGesture._fire;
+                if (fire) {
+                    window.removeEventListener('mousedown', fire, true);
+                    window.removeEventListener('keydown', fire, true);
+                }
+            }
+            // The connect cover (#fs-gate): an opaque panel with a spinner,
+            // the entry name and a status line. It hides everything until the
+            // window is fullscreen and the session painted. No button, no
+            // decision to make.
+            function rgGateStatus(text, connected) {
+                var el = document.getElementById('fs-gate-status');
+                if (!el) return;
+                el.textContent = text;
+                el.className = connected ? 'connected' : '';
+            }
+            function rgShowConnectCover(status, connected) {
+                var g = document.getElementById('fs-gate');
+                if (!g) return;
+                document.getElementById('fs-gate-title').textContent =
+                    entryDisplayName || ('Session ' + sessionId.substring(0,8));
+                rgGateStatus(status || 'Connecting…', !!connected);
+                g.className = 'visible';
+            }
+            function rgHideConnectCover() {
+                var g = document.getElementById('fs-gate');
+                if (g) g.className = '';
+            }
+            // Request fullscreen as soon as the page is up, using the
+            // activation carried from the Connect click. If it is honoured the
+            // user never has to act; if not, wait for their next press.
+            function rgStartFullscreenOnConnect() {
+                if (!document.getElementById('fs-gate') || !document.getElementById('fs-gate').classList.contains('visible'))
+                    rgShowConnectCover('Connecting\u2026', false);
+                if (rgFullscreenEl()) return;          // early fs=1 request already landed
+                rgArmFullscreenGesture();              // fallback if the browser refused it
+            }
+            // Tell the remote that nothing is held: every key the keyboard
+            // tracks as down, and all mouse buttons at the last pointer
+            // position. Used after a fullscreen transition, during which the
+            // browser may not deliver the releases to the display element.
+            function rgReleaseAllInput() {
+                try { if (keyboard) keyboard.reset(); } catch (e) {}
+                try {
+                    if (!mouse || !mouse.currentState) return;
+                    var st = new Guacamole.Mouse.State(mouse.currentState);
+                    st.left = st.middle = st.right = st.up = st.down = false;
+                    if (fillX !== 1 || fillY !== 1) { st.x /= fillX; st.y /= fillY; }
+                    client.sendMouseState(st, true);
+                } catch (e) {}
             }
             function rgShowEscNoticeOnce() {
                 if (sessionStorage.getItem('rustguac_esc_notice_seen')) return;
@@ -1536,6 +1746,7 @@
             function rgOnFullscreenChange() {
                 var inFs = !!rgFullscreenEl();
                 var bar = document.getElementById('fs-bar');
+                if (inFs) { fsEverEntered = true; rgDisarmFullscreenGesture(); rgOnFullscreenEntered(); rgReleaseAllInput(); rgMaybeReveal(); } else { rgHideConnectCover(); }
                 if (bar) {
                     if (inFs) {
                         bar.classList.add('visible');
@@ -1558,15 +1769,19 @@
             document.getElementById('fs-disconnect').addEventListener('click', function() {
                 rgExitFullscreen();
                 try { if (window.__guac_client) window.__guac_client.disconnect(); } catch (e) {}
-                window.location.href = '/connections.html';
+                rgGo('/connections.html');
             });
 
             client.onstatechange = function(state) {
                 switch (state) {
-                    case Guacamole.Client.State.CONNECTING: statusEl.textContent = 'Connecting...'; statusEl.className = ''; break;
-                    case Guacamole.Client.State.WAITING: statusEl.textContent = 'Waiting for server...'; statusEl.className = ''; break;
+                    case Guacamole.Client.State.CONNECTING: statusEl.textContent = 'Connecting...'; statusEl.className = ''; rgGateStatus('Connecting...', false); break;
+                    case Guacamole.Client.State.WAITING: statusEl.textContent = 'Waiting for server...'; statusEl.className = ''; rgGateStatus('Waiting for server...', false); break;
                     case Guacamole.Client.State.CONNECTED:
                         statusEl.textContent = 'Connected'; statusEl.className = 'connected';
+                        rgNotifyParent('ready');
+                        fsConnected = true;
+                        rgGateStatus('Connected', true);
+                        rgMaybeReveal();
                         // Fit the session to the actual window on connect. The session
                         // may have been created at different dimensions (e.g. opened in a
                         // new window at a fixed size), and the client otherwise only sends
@@ -1578,18 +1793,41 @@
                         // silently dropped. Retry a few times past that window — guacd
                         // coalesces to a single resize since the requested size is
                         // unchanged, so the redundant sends are cheap no-ops.
+                        // A fresh connection knows nothing about what the
+                        // server is already displaying.
+                        lastRequestedSize = {};
                         (function() {
                             var fitToWindow = function() {
                                 scaleDisplay();
                                 var anyPanelOpen = panelOpen || filePanelOpen;
-                                var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                                var sh = window.innerHeight;
-                                if (sw > 0 && sh > 0) client.sendSize(sw, sh);
+                                var ts = rgTargetSize(anyPanelOpen);
+                                var sw = ts[0], sh = ts[1];
+                                if (sw > 0 && sh > 0) {
+                                    // Sent whether or not it would change
+                                    // anything: the repeats above are
+                                    // deliberate, covering a window where the
+                                    // server drops the size silently, and
+                                    // suppressing them would defeat that.
+                                    // Recorded all the same, so that a user
+                                    // resize inside the same 16px band
+                                    // afterwards is correctly skipped.
+                                    sizeWouldChange(sw, sh);
+                                    client.sendSize(sw, sh);
+                                }
                             };
-                            setTimeout(fitToWindow, 800);
-                            setTimeout(fitToWindow, 2000);
-                            setTimeout(fitToWindow, 4000);
+                            var scheduleFit = function() {
+                                setTimeout(fitToWindow, 800);
+                                setTimeout(fitToWindow, 2000);
+                                setTimeout(fitToWindow, 4000);
+                            };
+                            // Embedded: not before the viewport has settled,
+                            // or an 800ms send mid-transition would resize
+                            // the remote to a size it is about to leave.
+                            rgWhenViewportSettled(scheduleFit);
                         })();
+                        // Never hold the embedded cover on a parent that does
+                        // not answer (e.g. a stale launcher script).
+                        if (embedded) setTimeout(rgMarkViewportSettled, 3000);
                         // Start thumbnail capture for session owner
                         if (!shareToken && !_thumbInterval) {
                             _thumbInterval = setInterval(captureAndUploadThumbnail, 10000);
@@ -1598,7 +1836,23 @@
                         }
                         document.getElementById('fs-bar-title').textContent =
                             entryDisplayName || ('Session ' + sessionId.substring(0,8));
-                        if (wantFullscreen) rgArmFullscreenGesture();
+                        // Connected. If this is a fullscreen-on-connect entry
+                        // that is already fullscreen, the cover lifts now
+                        // (rgMaybeReveal above) onto the final picture. If
+                        // fullscreen hasn't landed yet, give the load-time
+                        // request a moment; if it still hasn't, the cover
+                        // invites the single click that the armed gesture turns
+                        // into fullscreen. Non-fullscreen sessions just reveal.
+                        if (wantFullscreen && !rgFullscreenEl()) {
+                            rgGateStatus('Connected', true);
+                            setTimeout(function() {
+                                if (fsConnected && !rgFullscreenEl())
+                                    rgGateStatus('Connected \u2014 click to enter fullscreen', true);
+                            }, 1200);
+                        } else if (!wantFullscreen) {
+                            // Embedded: reveal only onto the final-size fit.
+                            rgWhenViewportSettled(function() { scaleDisplay(); rgHideConnectCover(); });
+                        }
                         break;
                     case Guacamole.Client.State.DISCONNECTING:
                         statusEl.textContent = 'Disconnecting...'; statusEl.className = '';
@@ -1611,7 +1865,9 @@
                         break;
                     case Guacamole.Client.State.DISCONNECTED:
                         statusEl.textContent = 'Disconnected'; statusEl.className = '';
+                        rgDisarmFullscreenGesture(); rgHideConnectCover();
                         if (_thumbInterval) { clearInterval(_thumbInterval); _thumbInterval = null; }
+                        if (embedded) { rgNotifyParent('end'); break; }
                         document.getElementById('disconnected-overlay').className = 'visible';
                         if (rgFullscreenEl()) rgExitFullscreen();
                         // Reflect the disconnect in any open monitor pop-outs
@@ -1624,6 +1880,7 @@
             client.onerror = function(status) {
                 statusEl.textContent = 'Error: ' + (status.message || 'Unknown error');
                 statusEl.className = '';
+                rgDisarmFullscreenGesture(); rgHideConnectCover();
                 // Stop the 10s thumbnail uploader; the session is dead and
                 // each XHR would otherwise 404 against a cleaned-up id.
                 if (_thumbInterval) { clearInterval(_thumbInterval); _thumbInterval = null; }
@@ -1673,9 +1930,12 @@
 
             // Disconnected overlay buttons
             document.getElementById('btn-close-session').addEventListener('click', function() {
+                // Embedded: the launcher closes the frame and the tab is back
+                // on Connections.
+                if (embedded) { rgNotifyParent('end'); return; }
                 window.close();
                 // window.close() may be blocked if not opened by script — navigate away as fallback
-                window.location.href = '/';
+                rgGo('/');
             });
             // Reconnect launches a fresh session against the same Connections
             // entry, then navigates to it. Reloading the dead session URL
@@ -1697,7 +1957,7 @@
                 // Ad-hoc sessions have no entry to relaunch from. Send the
                 // user back to Connections so they can pick where to go.
                 if (!relaunchInfo) {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                     return;
                 }
 
@@ -1709,7 +1969,7 @@
                 var firstSlash = key.indexOf('/');
                 var lastSlash = key.lastIndexOf('/');
                 if (firstSlash < 0 || lastSlash <= firstSlash) {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                     return;
                 }
                 var scope = key.substring(0, firstSlash);
@@ -1722,6 +1982,8 @@
                 var body = {
                     width: window.innerWidth,
                     height: window.innerHeight,
+                    screen_width: screen.width,
+                    screen_height: screen.height,
                     dpi: Math.round((window.devicePixelRatio || 1) * 96)
                 };
 
@@ -1741,7 +2003,7 @@
                         // none of those are fixable from this page. Punt to
                         // Connections where the user can fill in what's
                         // missing or pick a different entry.
-                        window.location.href = '/connections.html';
+                        rgGo('/connections.html');
                         return;
                     }
                     return res.json().then(function(data) {
@@ -1750,14 +2012,14 @@
                             if (relaunchInfo.display_name) {
                                 dest += '?name=' + encodeURIComponent(relaunchInfo.display_name);
                             }
-                            window.location.href = dest;
+                            rgGo(dest);
                         } else {
-                            window.location.href = '/connections.html';
+                            rgGo('/connections.html');
                         }
                     });
                 })
                 .catch(function() {
-                    window.location.href = '/connections.html';
+                    rgGo('/connections.html');
                 });
             });
 
@@ -1831,11 +2093,95 @@
                 if (document.hidden) keyboard.reset();
             });
 
-            // Mouse input
+            // Mouse input. Pointer positions come in screen pixels of the
+            // display element; sendMouseState divides out the uniform display
+            // scale, and the fill factors from scaleDisplay() are divided out
+            // here, since they are a transform the display knows nothing about.
+            var fillX = 1, fillY = 1;
             var mouse = new Guacamole.Mouse(client.getDisplay().getElement());
             mouse.onEach(['mousedown', 'mousemove', 'mouseup'], function(e) {
-                client.sendMouseState(e.state, true);
+                var state = e.state;
+                if (fillX !== 1 || fillY !== 1) {
+                    state = new Guacamole.Mouse.State(state);
+                    state.x /= fillX;
+                    state.y /= fillY;
+                }
+                client.sendMouseState(state, true);
             });
+
+            // Absorb a small shortfall between the framebuffer and the
+            // viewport. The uniform fit in scaleDisplay() makes one axis match
+            // exactly and leaves the other short when the server could not
+            // honour the requested size. For RDP that is our own guacd:
+            // patches/007-rdp-disp-mod16 rounds both dimensions down to a
+            // multiple of 16, with or without GFX, so a 1710-wide window gets
+            // a 1696-wide desktop and up to 15px of margin (#251). That
+            // rounding is deliberate (it prevents H.264's green band along the
+            // edge) and must not be relaxed to make the margin go away. A
+            // larger gap is a real aspect mismatch (fixed resolution, no
+            // resize support) and keeps the letterbox.
+            var FILL_MAX = 1.025;
+            // pixelExact: the picture is already drawn one framebuffer pixel per
+            // physical pixel (effective scale x devicePixelRatio == 1), so any
+            // stretch would be visibly soft. Then we never stretch — the small
+            // mod-16 margin is centred and shows the dark background instead
+            // (#251). When the picture is already being resampled, the stretch
+            // costs no extra sharpness, so we take it to fill the gap.
+            function applyFill(el, w, h, availW, availH, pixelExact) {
+                fillX = 1;
+                fillY = 1;
+                if (!pixelExact) {
+                    if (w > 0 && w < availW && availW / w <= FILL_MAX) fillX = availW / w;
+                    if (h > 0 && h < availH && availH / h <= FILL_MAX) fillY = availH / h;
+                }
+                if (fillX !== 1 || fillY !== 1) {
+                    el.style.transformOrigin = '0 0';
+                    el.style.transform = 'scale(' + fillX + ', ' + fillY + ')';
+                } else {
+                    el.style.transformOrigin = '';
+                    el.style.transform = '';
+                }
+            }
+
+            // Show the remote pointer image as the browser's own pointer, and
+            // only fall back to the display's software cursor layer where CSS
+            // cursors are unsupported. Guacamole.Display puts that layer in
+            // the DOM from construction, so without this handover both are
+            // drawn: the browser's arrow, composited by the OS, and the
+            // software one, moved by the page on each mousemove -- which
+            // overlap at rest and visibly separate during fast movement,
+            // further the busier the main thread.
+            //
+            // Not Guacamole.Mouse.setCursor(), which declares the image at one
+            // image pixel per CSS pixel: under Native Resolution the display
+            // is scaled by 1/devicePixelRatio, and a host scaling its UI sends
+            // a pointer image to match, so that would draw it at twice its
+            // size. image-set() declares its density instead, from the
+            // display's scale, so it lands at one image pixel per framebuffer
+            // pixel like everything else on screen. The hotspot is then in CSS
+            // pixels. Re-applied from scaleDisplay(), since the scale changes
+            // under a pointer that does not.
+            var remoteCursor = null;
+            function applyRemoteCursor() {
+                if (!remoteCursor) return;
+                var display = client.getDisplay();
+                var el = display.getElement();
+                var scale = display.getScale();
+                var url = 'url(' + remoteCursor.url + ')';
+                el.style.cursor = '';
+                if (Math.abs(scale - 1) > 0.01)
+                    el.style.cursor = 'image-set(' + url + ' ' + (1 / scale) + 'x) '
+                        + Math.round(remoteCursor.x * scale) + ' '
+                        + Math.round(remoteCursor.y * scale) + ', auto';
+                if (!el.style.cursor)
+                    el.style.cursor = url + ' ' + remoteCursor.x + ' '
+                        + remoteCursor.y + ', auto';
+                display.showCursor(!el.style.cursor);
+            }
+            client.getDisplay().oncursor = function(canvas, x, y) {
+                remoteCursor = { url: canvas.toDataURL('image/png'), x: x, y: y };
+                applyRemoteCursor();
+            };
 
             // Auto-scale display. When a multi-monitor layout is active, the
             // main window shows only monitor 0 (always at the origin of the
@@ -1874,40 +2220,58 @@
                     // Monitor 0 is at combined (0,0); no negative offset needed.
                     el.style.marginLeft = '0';
                     el.style.marginTop = '0';
+                    applyFill(el, 0, 0, 0, 0);
                 }
                 else {
                     // Single display: scale the whole framebuffer to fit.
-                    display.scale(Math.min(availW / dw, availH / dh));
+                    var scale = Math.min(availW / dw, availH / dh);
+                    display.scale(scale);
+                    var sw = dw * scale, sh = dh * scale;
+                    var pixelExact = Math.abs(scale * (window.devicePixelRatio || 1) - 1) < 0.002;
+                    applyFill(el, sw, sh, availW, availH, pixelExact);
                     displayEl.style.overflow = '';
                     displayEl.style.position = '';
                     displayEl.style.width = '';
                     displayEl.style.height = '';
                     displayEl.style.top = '';
                     displayEl.style.left = '';
-                    el.style.marginLeft = '';
-                    el.style.marginTop = '';
-                    // Offset display to the right when left panel is open
-                    displayEl.style.marginLeft = anyPanelOpen ? '380px' : '0';
+                    displayEl.style.marginLeft = '0';
+                    // Centre the (possibly stretched) framebuffer in the
+                    // available area so any residual mod-16 margin is split
+                    // evenly and shows the dark page background, instead of a
+                    // bare strip on one edge (#251). offsetLeft includes these
+                    // margins and ignores the fill transform, so the pointer
+                    // maths (which divides out fillX/fillY) stays correct.
+                    var fw = sw * fillX, fh = sh * fillY;
+                    el.style.marginLeft = (panelOffset + Math.max(0, (availW - fw) / 2)) + 'px';
+                    el.style.marginTop = Math.max(0, (availH - fh) / 2) + 'px';
                 }
+                applyRemoteCursor();
             }
 
             client.getDisplay().onresize = function() { scaleDisplay(); };
             var resizeTimer = null;
             window.addEventListener('resize', function() {
                 scaleDisplay();
-                // Debounce sendSize — RDP display updates are expensive
+                // Debounce sendSize. Half a second rather than a quarter
+                // because the cost of a resolution change is a decoder
+                // rebuild, not just an RDP display update.
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(function() {
+                    if (!viewportSettled) return;   // embedded, mid-transition: the settle fit follows
                     var anyPanelOpen = panelOpen || filePanelOpen;
-                    var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                    var sh = window.innerHeight;
-                    client.sendSize(sw, sh);
-                }, 250);
+                    var ts = rgTargetSize(anyPanelOpen);
+                    var sw = ts[0], sh = ts[1];
+                    if (sizeWouldChange(sw, sh))
+                        client.sendSize(sw, sh);
+                }, 500);
             });
 
+            if (wantFullscreen) rgStartFullscreenOnConnect();
             var connectData = shareToken ? 'token=' + encodeURIComponent(shareToken) : '';
             client.connect(connectData);
         }
     </script>
+    <script src="/ui.js"></script>
 </body>
 </html>

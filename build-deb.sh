@@ -121,8 +121,7 @@ build_guacd() {
         --with-rdp \
         --with-spice \
         --without-telnet \
-        --without-kubernetes \
-        --disable-guacenc \
+        --disable-kubernetes \
         --disable-guaclog \
         --disable-guacclip \
         --disable-static
@@ -133,6 +132,7 @@ build_guacd() {
     info "Installing guacd to staging..."
     rm -rf "$STAGING"
     make DESTDIR="$STAGING" install
+    bash "$SCRIPT_DIR/scripts/check-guacd-plugins.sh" "$STAGING$PREFIX/lib"
 
     cd "$SCRIPT_DIR"
     info "guacd staged at $STAGING"

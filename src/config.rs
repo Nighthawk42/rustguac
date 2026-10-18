@@ -26,6 +26,11 @@ pub struct OidcConfig {
     pub redirect_uri: String,
     #[serde(default = "default_oidc_default_role")]
     pub default_role: String,
+    /// Create a user account on first OIDC login (default: true). When false,
+    /// only users already in the database (pre-provisioned with `add-user`,
+    /// `POST /api/users` or the Admin page) can log in.
+    #[serde(default = "default_true")]
+    pub auto_create_users: bool,
     /// Name of the OIDC claim containing group memberships (default: "groups").
     #[serde(default = "default_groups_claim")]
     pub groups_claim: String,
@@ -53,6 +58,7 @@ impl std::fmt::Debug for OidcConfig {
             )
             .field("redirect_uri", &self.redirect_uri)
             .field("default_role", &self.default_role)
+            .field("auto_create_users", &self.auto_create_users)
             .field("groups_claim", &self.groups_claim)
             .field("extra_scopes", &self.extra_scopes)
             .field("tls_skip_verify", &self.tls_skip_verify)
@@ -76,7 +82,10 @@ pub struct VaultConfig {
     pub mount: String,
     #[serde(default = "default_vault_base_path")]
     pub base_path: String,
+    #[serde(default)]
     pub role_id: String,
+    /// Workload JWT login; when configured, never fall back to AppRole.
+    pub jwt_auth: Option<VaultJwtAuth>,
     pub namespace: Option<String>,
     /// Instance name for instance-scoped address book entries.
     /// Entries under `<base_path>/shared/` are visible to all instances.
@@ -113,6 +122,87 @@ impl std::fmt::Debug for VaultConfig {
                 &self.client_key.as_ref().map(|_| "[REDACTED]"),
             )
             .finish()
+    }
+}
+
+/// `[vault.jwt_auth]` (or under `[vault_shared]` / `[vault_local]`): log in
+/// with a workload identity JWT instead of AppRole. The JWT is fetched again
+/// at every login, so a rotated token is always the one used. Exactly one of
+/// `path` and `token_command` gives it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct VaultJwtAuth {
+    /// The JWT auth method's mount, e.g. `jwt` or `kubernetes-jwt`.
+    pub mount: String,
+    /// The role on that mount.
+    pub role: String,
+    /// A file holding the JWT: a Kubernetes projected service-account token,
+    /// a Nomad workload identity file, or one written by spiffe-helper.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// A command that prints the JWT, and nothing else, on stdout: a program
+    /// and its arguments, run directly (never through a shell), e.g. a
+    /// script that asks a cloud metadata service for the VM's identity
+    /// token. Its output is never logged.
+    #[serde(default)]
+    pub token_command: Option<Vec<String>>,
+    /// Seconds `token_command` may run before it is killed. Default 10.
+    #[serde(default = "default_jwt_command_timeout")]
+    pub token_command_timeout_secs: u64,
+}
+
+fn default_jwt_command_timeout() -> u64 {
+    10
+}
+
+impl VaultJwtAuth {
+    /// Check the settings before any login is tried.
+    pub fn validate(&self) -> Result<(), String> {
+        // The mount goes into the login URL path: plain segments only.
+        let mount_ok = !self.mount.is_empty()
+            && self.mount.split('/').all(|seg| {
+                !seg.is_empty()
+                    && seg != "."
+                    && seg != ".."
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            });
+        if !mount_ok {
+            return Err(
+                "jwt_auth.mount must be a Vault mount path such as `jwt` or `auth-k8s/jwt`".into(),
+            );
+        }
+        if self.role.trim().is_empty() {
+            return Err("jwt_auth.role is required".into());
+        }
+        let has_path = self.path.as_deref().is_some_and(|p| !p.trim().is_empty());
+        let has_command = self
+            .token_command
+            .as_ref()
+            .is_some_and(|c| !c.is_empty() && !c[0].trim().is_empty());
+        match (has_path, has_command) {
+            (true, false) | (false, true) => Ok(()),
+            (true, true) => Err("jwt_auth takes either path or token_command, not both".into()),
+            (false, false) => Err("jwt_auth needs path or token_command".into()),
+        }
+    }
+}
+
+impl VaultConfig {
+    /// The AppRole secret ID to log in with, from the environment variable
+    /// `env_name`, or an empty string when this backend logs in with a JWT
+    /// and needs none. The error says what is missing.
+    pub fn login_secret(&self, env_name: &str) -> Result<String, String> {
+        if let Some(ref jwt) = self.jwt_auth {
+            jwt.validate()?;
+            return Ok(String::new());
+        }
+        match std::env::var(env_name) {
+            Ok(s) if !s.is_empty() => Ok(s),
+            _ => Err(format!(
+                "{env_name} is required (or configure jwt_auth for workload identity login)"
+            )),
+        }
     }
 }
 
@@ -221,6 +311,63 @@ pub struct RecordingConfig {
     /// Ask guacd to create `typescript_path` if it doesn't already exist.
     #[serde(default)]
     pub create_typescript_path: bool,
+    /// Offer recordings as MP4 downloads, converted on request with guacenc
+    /// (#241). Default: true. Has no effect when guacenc is not installed.
+    #[serde(default = "default_true")]
+    pub mp4_enabled: bool,
+    /// The guacenc binary. Default: /opt/rustguac/bin/guacenc.
+    #[serde(default = "default_guacenc_path")]
+    pub guacenc_path: PathBuf,
+    /// Where converted MP4s are kept. Default: `mp4-cache` inside the
+    /// recording directory. Emptied first when rotation needs disk space.
+    #[serde(default)]
+    pub mp4_cache_path: Option<PathBuf>,
+    /// Remove a converted MP4 this many hours after it was made. Default: 24.
+    #[serde(default = "default_mp4_cache_hours")]
+    pub mp4_cache_hours: u64,
+    /// Conversions run at once; more wait their turn. Default: 1.
+    #[serde(default = "default_mp4_max_jobs")]
+    pub mp4_max_jobs: u32,
+    /// Give up on a conversion after this many seconds. Default: 1800.
+    #[serde(default = "default_mp4_timeout_secs")]
+    pub mp4_timeout_secs: u64,
+    /// Video bitrate in bits per second. Default: 2000000.
+    #[serde(default = "default_mp4_bitrate")]
+    pub mp4_bitrate: u32,
+    /// Largest video size; bigger recordings are scaled down to fit, keeping
+    /// their shape. Default: 1920 x 1080.
+    #[serde(default = "default_mp4_max_width")]
+    pub mp4_max_width: u32,
+    #[serde(default = "default_mp4_max_height")]
+    pub mp4_max_height: u32,
+}
+
+fn default_guacenc_path() -> PathBuf {
+    PathBuf::from("/opt/rustguac/bin/guacenc")
+}
+
+fn default_mp4_cache_hours() -> u64 {
+    24
+}
+
+fn default_mp4_max_jobs() -> u32 {
+    1
+}
+
+fn default_mp4_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_mp4_bitrate() -> u32 {
+    2_000_000
+}
+
+fn default_mp4_max_width() -> u32 {
+    1920
+}
+
+fn default_mp4_max_height() -> u32 {
+    1080
 }
 
 fn default_max_disk_percent() -> u8 {
@@ -242,6 +389,15 @@ impl Default for RecordingConfig {
             typescript_path: None,
             typescript_name: None,
             create_typescript_path: false,
+            mp4_enabled: true,
+            guacenc_path: default_guacenc_path(),
+            mp4_cache_path: None,
+            mp4_cache_hours: default_mp4_cache_hours(),
+            mp4_max_jobs: default_mp4_max_jobs(),
+            mp4_timeout_secs: default_mp4_timeout_secs(),
+            mp4_bitrate: default_mp4_bitrate(),
+            mp4_max_width: default_mp4_max_width(),
+            mp4_max_height: default_mp4_max_height(),
         }
     }
 }
@@ -1414,6 +1570,22 @@ mod tests {
     }
 
     #[test]
+    fn workload_jwt_config_needs_no_approle_id() {
+        let config: VaultConfig = toml::from_str(
+            r#"
+            addr = "https://secrets.example.com"
+            [jwt_auth]
+            mount = "workload-jwt"
+            role = "rustguac"
+            path = "/var/run/secrets/vault/token"
+        "#,
+        )
+        .unwrap();
+        assert!(config.role_id.is_empty());
+        assert!(config.jwt_auth.is_some());
+    }
+
+    #[test]
     fn test_single_vault_is_sufficient() {
         // Quick-start invariant: a lone [vault] block is all anyone needs; the
         // optional multi-Vault backends default to absent, so a single local
@@ -1535,6 +1707,7 @@ mod tests {
             client_secret: Some("sensitive-value".into()),
             redirect_uri: "https://console.example.com/oidc/callback".into(),
             default_role: default_oidc_default_role(),
+            auto_create_users: true,
             groups_claim: default_groups_claim(),
             extra_scopes: vec![],
             tls_skip_verify: false,

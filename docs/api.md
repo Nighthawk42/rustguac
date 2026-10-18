@@ -38,7 +38,7 @@ Quick-connect endpoint for external integrations (e.g., NetBox Custom Links). Cr
 
 When `scope`, `folder`, and `entry` are all provided, the endpoint connects via the connections (credentials from Vault). Otherwise it creates an ad-hoc session. No credentials are passed in the URL for ad-hoc mode — if the target requires authentication, the user will see guacd's login prompt.
 
-If the connections entry has `prompt_credentials: true` or has no stored password/key, the endpoint returns an inline credential form instead of creating the session immediately. The user enters credentials, which are POSTed to the connect endpoint and used for that session only (never stored).
+If the connections entry has `prompt_credentials: true` or has no stored password/key, the endpoint returns an inline credential form instead of creating the session immediately. The user enters credentials, which are POSTed to the connect endpoint and used for that session only (never stored). An entry without its own secret that is covered by [folder default credentials](credential-variables.md#folder-default-credentials) connects with those, exactly as it does from the Connections page.
 
 See [NetBox Integration](netbox.md) for usage with NetBox Custom Links.
 
@@ -206,7 +206,7 @@ The `jump_hosts` array defines an ordered chain of SSH bastion hops. Each hop co
 | `session_type` | string | All | `ssh`, `rdp`, `vnc`, `spice`, `proxmox`, `web`, or `vdi` (required) |
 | `hostname` | string | SSH, RDP, VNC | Target hostname or IP |
 | `port` | integer | SSH, RDP, VNC | Target port (defaults: SSH=22, RDP=3389, VNC=5900) |
-| `username` | string | SSH, RDP | Username for authentication |
+| `username` | string | SSH, RDP, VNC | Username for authentication (VNC: only for servers with username auth, e.g. VeNCrypt, RealVNC, macOS) |
 | `password` | string | SSH, RDP, VNC | Password (VNC uses this as the VNC password) |
 | `private_key` | string | SSH | OpenSSH PEM private key |
 | `generate_keypair` | boolean | SSH | Generate an ephemeral Ed25519 keypair |
@@ -229,7 +229,15 @@ The `jump_hosts` array defines an ordered chain of SSH bastion hops. Each hop co
 | `height` | integer | All | Display height in pixels |
 | `dpi` | integer | All | Display DPI |
 | `banner` | string | All | Banner message shown before session starts |
+| `ssh_font_size` | integer | SSH | Terminal font size in points (default 12, 6 to 72) |
+| `wol_send_packet` | boolean | SSH, RDP, VNC | Send a Wake-on-LAN magic packet before connecting |
+| `wol_mac_addr` | string | SSH, RDP, VNC | MAC address to wake (required with `wol_send_packet`) |
+| `wol_broadcast_addr` | string | SSH, RDP, VNC | Broadcast address for the packet (guacd default `255.255.255.255`) |
+| `wol_udp_port` | integer | SSH, RDP, VNC | UDP port for the packet (guacd default 9) |
+| `wol_wait_time` | integer | SSH, RDP, VNC | Seconds to wait for the host to boot before connecting (at most 600) |
 | `owner` | string | All | Create the session on behalf of this user (their login email). Admin callers only, see [Creating a session for someone else](#creating-a-session-for-someone-else) |
+
+Wake-on-LAN settings are ignored on sessions created by non-admin users; set them on a connection entry instead.
 
 **SPICE fields** (`session_type: spice`, direct connection to a SPICE server):
 
@@ -394,11 +402,23 @@ To build your own client, open the WebSocket at `ws_url` with the `guacamole` su
 
 ### `GET /api/recordings`
 
-List all recording files. Requires **operator** role or higher.
+List all recording files. Requires **poweruser** role or higher. When MP4 conversion is available on the server, each recording has an `mp4` field with the state of its MP4 (see below); without it, the field is left out.
 
 ### `GET /api/recordings/:name`
 
-Serve a recording file for playback. Requires **operator** role or higher. Filename is validated against path traversal.
+Serve a recording file for playback. Requires **poweruser** role or higher. Filename is validated against path traversal.
+
+### `POST /api/recordings/:name/mp4`
+
+Start converting a recording to MP4 with guacenc (see [MP4 downloads](configuration.md#mp4-downloads)). Same access as downloading the recording. Responses: `202` `{"state":"running"}` while it converts (asking again while it runs changes nothing); `200` `{"state":"ready","size_bytes":...}` when a converted copy is already there; `409` while the recording's session is still live; `404` for an unknown recording; `503` when conversion is not available on this server.
+
+### `GET /api/recordings/:name/mp4/status`
+
+Where a recording's MP4 stands: `{"state": "none" | "running" | "ready" | "failed" | "unavailable"}`, with `size_bytes` when ready and `error` when failed. A failed conversion is retried by the next `POST`.
+
+### `GET /api/recordings/:name/mp4`
+
+Download the converted MP4 (`video/mp4`, saved as `<recording>.mp4`). `404` until it is ready.
 
 ### `DELETE /api/recordings/:name`
 
@@ -409,6 +429,16 @@ Delete a recording file. Requires **admin** role.
 ### `GET /api/users`
 
 List all OIDC users.
+
+### `POST /api/users`
+
+Add a user ahead of their first OIDC login, which is how anyone gets in when `[oidc] auto_create_users = false`.
+
+```json
+{ "email": "jsmith@example.com", "role": "operator", "name": "J Smith" }
+```
+
+`role` is one of `admin`, `poweruser`, `operator`, `viewer`; `name` is optional and replaced by the provider's name on login. The email must contain `@`, be at most 254 characters and have no spaces or control characters; the name at most 200 characters. Responses: `201` with the user; `400` for an invalid email, name or role; `409` if a user with that email already exists, ignoring case. See [How a login is matched to a user](roles-and-access-control.md#how-a-login-is-matched-to-a-user).
 
 ### `PUT /api/users/:email/role`
 
@@ -511,13 +541,25 @@ Create a folder.
   "scope": "shared",
   "name": "production",
   "allowed_groups": ["engineering", "devops"],
-  "description": "Production servers"
+  "allowed_users": ["oncall@example.com"],
+  "description": "Production servers",
+  "display_name": "Production",
+  "inherit_from_parent": false
 }
 ```
 
+- `allowed_groups`: OIDC groups that can see the folder.
+- `allowed_users` (optional): login emails of individual users who can see the folder. They need not have logged in yet. Up to 500 per folder; blanks and repeats (ignoring case) are dropped, and an entry containing spaces or control characters is refused with `400`.
+- With both lists empty the folder is admin-only. See [Folder access control](roles-and-access-control.md#folder-access-control).
+- `display_name` (optional): a title shown over the folder name in Connections and in search results, for example a customer's full name over a short folder key. The folder name stays the key used in paths and the API. Left out of the stored config when empty.
+
 ### `PUT /api/addressbook/folders/:scope/:folder` (admin)
 
-Update folder configuration (allowed_groups, description).
+Update folder configuration (`allowed_groups`, `allowed_users`, `description`, `display_name`, `inherit_from_parent`). If `allowed_users` or `display_name` is left out, the stored value is kept as it is; send `[]` or `""` to clear it.
+
+### `GET /api/addressbook/folders/:scope/:folder/config` (admin)
+
+The folder's access settings, including `allowed_users`. The folder listings that operators can read include `allowed_groups` but never `allowed_users`.
 
 ### `DELETE /api/addressbook/folders/:scope/:folder` (admin)
 
@@ -553,7 +595,7 @@ Create a connection entry. The body includes a `name` field plus all entry field
 | `type` | string | All | `ssh`, `rdp`, `vnc`, `spice`, `proxmox`, `web`, or `vdi` |
 | `hostname` | string | SSH, RDP, VNC | Target hostname or IP |
 | `port` | integer | SSH, RDP, VNC | Target port |
-| `username` | string | SSH, RDP | Username |
+| `username` | string | SSH, RDP, VNC | Username |
 | `password` | string | SSH, RDP, VNC | Password |
 | `private_key` | string | SSH | OpenSSH PEM private key |
 | `url` | string | Web | Target URL |
@@ -572,16 +614,146 @@ Create a connection entry. The body includes a `name` field plus all entry field
 | `display_name` | string | All | Friendly display name (shown as banner) |
 | `prompt_credentials` | boolean | All | Prompt user for credentials at connect time |
 | `jump_hosts` | array | All | Multi-hop SSH tunnel chain (same format as session creation) |
+| `external_id` | string | All | Stable id of the record the entry is synced from (the [NetBox webhook](netbox.md#create-webhook-device-createdupdated) sends `netbox:device:<id>`). What `PUT ...?move=true` matches on; never used to connect. Preserved on update when omitted. |
 
 For `spice` and `proxmox` entries, the `spice_*` and `proxmox_*` fields listed under [`POST /api/sessions`](#post-apisessions) apply here too. The `proxmox_token_secret` is write-only: it is never returned by the read endpoints (a `has_proxmox_token_secret` boolean indicates whether one is stored), and it is preserved on update when omitted.
 
 ### `PUT /api/addressbook/folders/:scope/:folder/entries/:entry` (admin)
 
-Update a connection entry. Uses read-modify-write: reads existing entry from Vault, merges incoming fields on top. Credentials (`password`, `private_key`) that are omitted from the request are preserved from the existing entry. Jump host credentials are merged per-hop by index.
+Update a connection entry, or create it if there is none of that name in the folder. Uses read-modify-write: reads existing entry from Vault, merges incoming fields on top. Credentials (`password`, `private_key`, `container_password`, `proxmox_token_secret`) that are omitted from the request are preserved from the existing entry, and so is `external_id`. Jump host credentials are merged per-hop by index. If the existing entry cannot be read for any reason other than not existing, the response is `502` and nothing is written, so a request without secrets never replaces an entry that has them.
+
+**`?move=true`** is for sync sources such as the [NetBox webhook](netbox.md#create-webhook-device-createdupdated), where the folder or the name is computed from the device and can change. It needs `external_id` in the body and matches the device on that, never on its name:
+
+1. If `:folder/:entry` exists with the same `external_id`, or with none (an entry made by hand before syncing began), it is updated in place.
+2. Otherwise every entry in the scope is read, and the one carrying that `external_id` is moved to `:folder/:entry` by the server-side move below, credentials and credential variables included, and the update is then applied on top. The response says where it came from:
+
+   ```json
+   { "ok": true, "moved_from": { "folder": "mrgelato", "name": "fw01" } }
+   ```
+
+3. If no entry carries it, the entry is created.
+
+Entries in other folders that merely share the name are never touched. Responses: `400` without `external_id`; `409` if `:folder/:entry` belongs to a different `external_id`, if it has no `external_id` while another entry in the scope already carries this one (adopting it would put the id on two entries), or if the `external_id` is stored on more than one entry in the scope (nothing is changed in any of these); `502` with `"copied": true` if the move copied the entry but could not remove the original (it then exists in both folders, and the update is not applied). The scan in step 2 reads every entry in the scope, but it only happens when the entry is not already where the request says, that is on first sight of a device and when it moves.
+
+### `GET /api/addressbook/folders/:scope/:folder/defaults` (admin)
+
+The folder's default credentials, secrets stripped. These are lent to entries in the folder (and in subfolders without their own, per session type, but only subfolders that inherit access and grant no groups or users of their own) that have no password or private key of their own, so an entry created without secrets by a webhook or an import is connectable the moment it exists. An entry's own credentials always win, and an entry set to `prompt_credentials` still prompts. See [Folder default credentials](credential-variables.md#folder-default-credentials) for the storage layout, the inheritance rule and the note on web entries.
+
+```json
+{
+  "defaults": {
+    "ssh": { "username": "root", "domain": null, "has_password": false, "has_private_key": true },
+    "web": { "username": null, "domain": null, "has_password": true, "has_private_key": false }
+  }
+}
+```
+
+Entries covered by folder defaults list with `has_credentials: true` and `inherited_credentials: true`.
+
+### `PUT /api/addressbook/folders/:scope/:folder/defaults` (admin)
+
+Set default credentials per session type. Types not mentioned keep what is stored; `null` removes a type. Within a type an omitted field keeps the stored value and `""` clears it, the same rule entry PUTs use for secrets.
+
+```json
+{
+  "ssh": { "username": "root", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
+  "web": { "password": "router-password" },
+  "rdp": null
+}
+```
+
+Returns the same summary as `GET`. A type left with nothing in it is dropped; a folder left with no types loses its defaults entirely. Audited as `update_folder_defaults`.
+
+### `DELETE /api/addressbook/folders/:scope/:folder/defaults` (admin)
+
+Remove the folder's default credentials. Returns `204`.
+
 
 ### `DELETE /api/addressbook/folders/:scope/:folder/entries/:entry` (admin)
 
-Delete a connection entry.
+Delete a connection entry. Returns `404` if there is no such entry.
+
+### `POST /api/addressbook/folders/:scope/:folder/entries/:entry/move` (admin)
+
+Move an entry to another folder with everything stored in it, credentials included. The entry is written to the target first and the original is removed only after that succeeds.
+
+```json
+{ "target_scope": "shared", "target_folder": "servers/linux" }
+```
+
+Returns `409` if an entry of the same name already exists in the target (it is never overwritten), and `400` for an invalid scope, folder or name. If the copy succeeds but the original cannot be removed, the response is `502` with `"copied": true`: the entry then exists in both folders.
+
+Do not move an entry by creating it in the new folder and deleting the old one: the read endpoints never return credentials, so a copy made that way has none.
+
+### `POST /api/addressbook/folders/:scope/:folder/entries/:entry/copy` (admin)
+
+Copy an entry, credentials included, to `target_scope`/`target_folder` under `new_name` (default: the same name). Returns `409` if the target exists. Apply further changes to the copy with the `PUT` above, which keeps stored credentials it is not given.
+
+```json
+{ "target_scope": "shared", "target_folder": "servers/linux", "new_name": "web01-copy" }
+```
+
+### `POST /api/addressbook/bulk` (admin)
+
+Move, copy or delete up to 1000 entries in one request. Each entry is handled on its own, with the same rules as the single-entry endpoints above: credentials go with moved and copied entries, an existing entry is never overwritten, and a move removes the original only after the copy is written.
+
+```json
+{
+  "action": "move",
+  "items": [
+    { "scope": "shared", "folder": "imported", "name": "web01" },
+    { "scope": "shared", "folder": "imported", "name": "web02" }
+  ],
+  "target": { "scope": "shared", "folder": "servers/linux" },
+  "on_conflict": "skip"
+}
+```
+
+- `action` is `move`, `copy` or `delete`. `target` is required for `move` and `copy`.
+- `on_conflict` decides what happens when the target already has an entry of the same name: `skip` (default) leaves that entry where it is, `rename` uses the first free `name-2`, `name-3`, and so on. There is no overwrite option.
+
+The response lists what happened to each entry, plus a count per outcome:
+
+```json
+{
+  "results": [
+    { "scope": "shared", "folder": "imported", "name": "web01", "status": "moved" },
+    { "scope": "shared", "folder": "imported", "name": "web02", "status": "skipped",
+      "error": "an entry with that name already exists in the target folder" }
+  ],
+  "summary": { "moved": 1, "skipped": 1 }
+}
+```
+
+`status` is one of `moved`, `copied`, `deleted`, `skipped`, `failed`, or `copied_not_removed` (a move whose copy was written but whose original could not be removed, so the entry is in both folders). A renamed copy also carries `new_name`. Every entry acted on is recorded in the address book audit log.
+
+### `GET /api/addressbook/version?since=N`
+
+The address book's change log, answered from memory: no Vault or disk read, so clients may poll it often. Requires **operator**. `version` counts every successful change made through this API to entries, folders and folder config (moves, copies and bulk operations included); `changed_at` is unix milliseconds, `0` before the first change since start. With `since`, `changes` lists what moved after that version, one row per folder: `kind` is `entries` (entries in the folder were written), `tree` (the folder itself was created, deleted or its config changed) or `all` (not attributable; refresh everything). It is `null` when `since` is omitted, or when the log no longer reaches back that far (it keeps the last few hundred changes), and the client should refresh what it shows once.
+
+`epoch` identifies the server process the log belongs to. The version counter starts again at 0 when rustguac restarts, so a client should remember the `epoch` that came with its version and, when it changes, refresh what it shows once and ignore `changes`: after a restart they come from a different log, even when the numbers line up.
+
+For callers below **admin**, rows only ever name folders the caller can open. An `entries` row for any other folder is left out, and every `tree` row is replaced by one without a path (`"scope": "*", "folder": ""`), since a folder that was created, deleted or had its access changed may be one the caller cannot see; a client should treat it like `all`. Admins get every row as logged. Filtering reads folder config only when there are changes to answer, so a poll with nothing new still costs no Vault read.
+
+A user's own credential variables (`/api/me/credentials`) are not address-book changes and never appear here. The log is per process: with several rustguac instances on one Vault, each sees only its own changes.
+
+The Connections page polls this every 3 seconds while visible and re-reads only the folder it shows, or the folder list when a folder came or went; its search index is rebuilt only when search is next used.
+
+```json
+{
+  "version": 17,
+  "changed_at": 1760155200000,
+  "epoch": 3418867302915441,
+  "changes": [
+    { "scope": "shared", "folder": "customers/acme", "kind": "entries" },
+    { "scope": "instance", "folder": "lab", "kind": "tree" }
+  ]
+}
+```
+
+### `GET /api/addressbook/folder-paths` (admin)
+
+Every folder in both scopes, as `{ "folders": [{ "scope": "shared", "path": "servers/linux" }, ...] }`. Used to choose a target for bulk moves and copies.
 
 ## User API Tokens (self-service)
 

@@ -11,6 +11,7 @@ mod oidc;
 mod protocol;
 mod pve;
 mod recording;
+mod recording_mp4;
 mod session;
 mod tunnel;
 mod vault;
@@ -18,8 +19,8 @@ mod vdi;
 mod websocket;
 
 use crate::api::{
-    AppState, CredentialDefaultScope, DriveConfigured, OidcEnabled, SiteTitle, ThemeData,
-    VaultBackends, VaultCell, VaultConfigured, VaultState,
+    AppState, CredentialDefaultScope, DriveConfigured, OidcEnabled, OidcHandle, SiteTitle,
+    ThemeData, VaultBackends, VaultCell, VaultConfigured, VaultState,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -32,6 +33,7 @@ use axum::{middleware, Extension, Router};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::{Layer, ServiceExt};
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
@@ -63,6 +65,12 @@ enum Command {
         /// Expiry date in ISO 8601 format (e.g. "2025-12-31T23:59:59Z")
         #[arg(long)]
         expires: Option<String>,
+        /// Only create the admin if no admin account exists yet; otherwise
+        /// do nothing and exit successfully. For first-run provisioning
+        /// (the Docker entrypoint), where whether this is a first run
+        /// depends on the database named by db_path, not on any fixed file.
+        #[arg(long)]
+        if_none: bool,
     },
 
     /// List all admin accounts
@@ -119,6 +127,29 @@ enum Command {
 
     /// List all OIDC users
     ListUsers,
+
+    /// Add an OIDC user ahead of their first login (required to let anyone
+    /// in when `[oidc] auto_create_users = false`)
+    AddUser {
+        /// User email, exactly as the identity provider sends it
+        #[arg(long)]
+        email: String,
+        /// Role: admin, poweruser, operator, or viewer
+        #[arg(long)]
+        role: String,
+        /// Display name (replaced by the provider's name on login)
+        #[arg(long, default_value = "")]
+        name: String,
+    },
+
+    /// Forget the identity provider account a user is bound to, so their next
+    /// OIDC login binds to whichever account it comes from. For moving to a
+    /// different identity provider, where every user's subject changes.
+    ResetOidcSubject {
+        /// User email
+        #[arg(long)]
+        email: String,
+    },
 
     /// Set a user's role
     SetRole {
@@ -230,7 +261,21 @@ async fn main() {
             name,
             allowed_ips,
             expires,
+            if_none,
         }) => {
+            if if_none {
+                match db::list_admins(&database) {
+                    Ok(admins) if !admins.is_empty() => {
+                        println!("Admin accounts already exist; not creating '{}'.", name);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Error reading admins: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             cmd_add_admin(&database, &name, allowed_ips.as_deref(), expires.as_deref());
         }
         Some(Command::ListAdmins) => cmd_list_admins(&database),
@@ -249,6 +294,10 @@ async fn main() {
             cmd_generate_cert(&hostname, &out_dir, &extra_sans);
         }
         Some(Command::ListUsers) => cmd_list_users(&database),
+        Some(Command::AddUser { email, role, name }) => {
+            cmd_add_user(&database, &email, &role, &name)
+        }
+        Some(Command::ResetOidcSubject { email }) => cmd_reset_oidc_subject(&database, &email),
         Some(Command::SetRole { email, role }) => cmd_set_role(&database, &email, &role),
         Some(Command::DisableUser { email }) => cmd_disable_user(&database, &email),
         Some(Command::DeleteUser { email }) => cmd_delete_user(&database, &email),
@@ -495,6 +544,56 @@ fn cmd_list_users(database: &Db) {
     }
 }
 
+fn cmd_add_user(database: &Db, email: &str, role: &str, name: &str) {
+    let email = email.trim();
+    let name = name.trim();
+    if !["admin", "poweruser", "operator", "viewer"].contains(&role) {
+        eprintln!("Role must be admin, poweruser, operator, or viewer.");
+        std::process::exit(1);
+    }
+    if let Err(msg) = db::check_user_email(email).and_then(|_| db::check_user_name(name)) {
+        eprintln!("Invalid user: {msg}.");
+        std::process::exit(1);
+    }
+    match db::create_user(database, email, name, role) {
+        Ok(_) => {
+            println!("User '{}' added with role '{}'.", email, role);
+            audit_cli(database, "add_user", email, Some(&format!("role={}", role)));
+        }
+        Err(db::CreateUserError::Exists) => {
+            eprintln!(
+                "A user with email '{}' already exists (emails match ignoring case).",
+                email
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_reset_oidc_subject(database: &Db, email: &str) {
+    match db::reset_oidc_subject(database, email.trim()) {
+        Ok(Some(stored)) => {
+            println!(
+                "OIDC subject for '{}' cleared. Their next login binds to the identity provider account it comes from.",
+                stored
+            );
+            audit_cli(database, "reset_oidc_subject", &stored, None);
+        }
+        Ok(None) => {
+            eprintln!("No single user with email '{}'.", email.trim());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_set_role(database: &Db, email: &str, role: &str) {
     if !["admin", "poweruser", "operator", "viewer"].contains(&role) {
         eprintln!("Role must be admin, poweruser, operator, or viewer.");
@@ -632,15 +731,62 @@ fn cmd_map_group(database: &Db, group: &str, role: &str, force: bool) {
 #[derive(Clone)]
 struct TlsEnabled(bool);
 
+/// Content-Security-Policy sent with every response.
+///
+/// `img-src` must allow `data:` and `blob:`. The Guacamole client draws each
+/// `img` stream by loading a `data:image/...;base64,...` URI into an `Image`
+/// (the `DataURIReader` path in `Display.drawStream`) on browsers without
+/// WebCodecs `ImageDecoder`, which is Safari and Firefox. Without `img-src`
+/// the `default-src 'self'` fallback refuses those loads, the client silently
+/// skips the draw, and SSH/RDP sessions render black with only rect fills
+/// showing (#249). Chromium decodes straight from the stream bytes and never
+/// fetches a URL, so it hid the problem. The remote mouse cursor
+/// (`cursor: url(data:...)`) and blob: image URLs need the same allowance.
+///
+/// No page may be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`):
+/// a framed rustguac page, above all a live session, would take the clicks
+/// and keystrokes of whoever is fooled into using it. The one exception is
+/// `FRAMEABLE_CONTENT_SECURITY_POLICY` below.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline'; \
+    connect-src 'self' wss: ws:; \
+    img-src 'self' data: blob:; \
+    frame-ancestors 'none'";
+
+/// The policy for the one page that may be framed, and only by our own
+/// origin: the session client of a session opened from an entry with
+/// fullscreen-on-connect, which the Connections page loads in a same-origin
+/// iframe so the tab can go fullscreen on the Connect click (#257). See
+/// `ClientFrameable` and docs/security.md.
+const FRAMEABLE_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline'; \
+    connect-src 'self' wss: ws:; \
+    img-src 'self' data: blob:; \
+    frame-ancestors 'self'";
+
+/// Response marker set by `serve_client_page` when that session's client may
+/// be framed by our own origin; `security_headers` then sends the framing
+/// headers that allow it instead of the deny-all defaults.
+#[derive(Clone, Copy)]
+struct ClientFrameable;
+
 async fn security_headers(
     tls: Extension<TlsEnabled>,
     request: Request,
     next: middleware::Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    let frameable = response.extensions().get::<ClientFrameable>().is_some();
+    let (frame_options, csp) = if frameable {
+        ("SAMEORIGIN", FRAMEABLE_CONTENT_SECURITY_POLICY)
+    } else {
+        ("DENY", CONTENT_SECURITY_POLICY)
+    };
     let headers = response.headers_mut();
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert("X-Frame-Options", frame_options.parse().unwrap());
     headers.insert(
         "Referrer-Policy",
         "strict-origin-when-cross-origin".parse().unwrap(),
@@ -649,10 +795,7 @@ async fn security_headers(
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),
     );
-    headers.insert(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:".parse().unwrap(),
-    );
+    headers.insert("Content-Security-Policy", csp.parse().unwrap());
     if tls.0 .0 {
         headers.insert(
             "Strict-Transport-Security",
@@ -782,8 +925,8 @@ async fn run_server(config: Config, database: Db) {
     let mut local_cell = default_cell.clone();
 
     if let Some(ref vault_config) = config.vault {
-        match std::env::var("VAULT_SECRET_ID") {
-            Ok(sid) if !sid.is_empty() => {
+        match vault_config.login_secret("VAULT_SECRET_ID") {
+            Ok(sid) => {
                 connect_vault_backend(
                     "default",
                     default_cell.clone(),
@@ -793,36 +936,32 @@ async fn run_server(config: Config, database: Db) {
                 )
                 .await;
             }
-            _ => {
-                tracing::error!("VAULT_SECRET_ID env var required when [vault] is configured");
+            Err(e) => {
+                tracing::error!("[vault]: {e}");
                 tracing::error!("Address book and drive features will be unavailable");
             }
         }
     }
 
     if let Some(ref vc) = config.vault_shared {
-        match std::env::var("VAULT_SHARED_SECRET_ID") {
-            Ok(sid) if !sid.is_empty() => {
+        match vc.login_secret("VAULT_SHARED_SECRET_ID") {
+            Ok(sid) => {
                 let cell: VaultCell = Arc::new(tokio::sync::RwLock::new(None));
                 connect_vault_backend("shared", cell.clone(), vc.clone(), sid, None).await;
                 shared_cell = cell;
             }
-            _ => tracing::error!(
-                "VAULT_SHARED_SECRET_ID required for [vault_shared]; shared-scope connections unavailable"
-            ),
+            Err(e) => tracing::error!("[vault_shared]: {e}; shared-scope connections unavailable"),
         }
     }
 
     if let Some(ref vc) = config.vault_local {
-        match std::env::var("VAULT_LOCAL_SECRET_ID") {
-            Ok(sid) if !sid.is_empty() => {
+        match vc.login_secret("VAULT_LOCAL_SECRET_ID") {
+            Ok(sid) => {
                 let cell: VaultCell = Arc::new(tokio::sync::RwLock::new(None));
                 connect_vault_backend("local", cell.clone(), vc.clone(), sid, None).await;
                 local_cell = cell;
             }
-            _ => tracing::error!(
-                "VAULT_LOCAL_SECRET_ID required for [vault_local]; instance-scope connections unavailable"
-            ),
+            Err(e) => tracing::error!("[vault_local]: {e}; instance-scope connections unavailable"),
         }
     }
 
@@ -860,6 +999,7 @@ async fn run_server(config: Config, database: Db) {
 
     let oidc_enabled = OidcEnabled(oidc_state.is_some());
     let vault_configured = VaultConfigured(config.vault.is_some());
+    let ab_changes = api::AddressBookChanges::default();
     let credential_default_scope =
         CredentialDefaultScope(config.user_credentials_default_scope.clone());
     let drive_configured = DriveConfigured(config.drive.is_some());
@@ -892,10 +1032,22 @@ async fn run_server(config: Config, database: Db) {
         let logo = config.theme.as_ref().and_then(|t| t.logo_url.as_deref());
         let title = &config.site_title;
         let mut pages = std::collections::HashMap::new();
+        // One hash per distinct asset, not per reference: every page links
+        // the same stylesheet and client.html alone carries 36 scripts.
+        let mut hashes = std::collections::HashMap::new();
+        let version_assets_enabled = std::env::var_os("RUSTGUAC_NO_ASSET_VERSIONING").is_none();
+        let mut brand = |html: &str| {
+            let html = rewrite_branding(html, title, logo);
+            if version_assets_enabled {
+                version_assets(&html, &static_path, &mut hashes)
+            } else {
+                html
+            }
+        };
         // Embedded client.html
         pages.insert(
             "client.html".to_string(),
-            rewrite_branding(include_str!("../static/client.html"), title, logo),
+            BrandedPage::new(brand(include_str!("../static/client.html"))),
         );
         // Disk-served HTML pages
         for name in &[
@@ -910,8 +1062,14 @@ async fn run_server(config: Config, database: Db) {
         ] {
             let path = std::path::Path::new(&static_path).join(name);
             if let Ok(html) = std::fs::read_to_string(&path) {
-                pages.insert(name.to_string(), rewrite_branding(&html, title, logo));
+                pages.insert(name.to_string(), BrandedPage::new(brand(&html)));
             }
+        }
+        let versioned = hashes.values().filter(|h| h.is_some()).count();
+        if version_assets_enabled {
+            tracing::info!("Content-hashed {} static asset URLs", versioned);
+        } else {
+            tracing::info!("Asset versioning disabled (RUSTGUAC_NO_ASSET_VERSIONING)");
         }
         Arc::new(pages)
     };
@@ -1075,6 +1233,25 @@ async fn run_server(config: Config, database: Db) {
         }
     }
 
+    // MP4 downloads of recordings (#241): guacenc on request, cached.
+    let mp4_converter = Arc::new(recording_mp4::Mp4Converter::new(
+        &manager.recording_config(),
+        manager.recording_path(),
+    ));
+    {
+        // Clear out what an earlier run left (work directories, expired and
+        // orphaned MP4s) now, then every hour.
+        let conv = mp4_converter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let c = conv.clone();
+                let _ = tokio::task::spawn_blocking(move || c.purge(false)).await;
+            }
+        });
+    }
+
     // Spawn recording rotation background task
     {
         let rec_config = manager.recording_config();
@@ -1087,6 +1264,7 @@ async fn run_server(config: Config, database: Db) {
                 interval_secs
             );
             let rot_manager = manager.clone();
+            let rot_conv = mp4_converter.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -1097,8 +1275,19 @@ async fn run_server(config: Config, database: Db) {
                     // Snapshot recordings of still-live sessions so rotation
                     // never deletes an in-progress (open) recording.
                     let active = rot_manager.active_recording_paths().await;
-                    let _ =
-                        tokio::task::spawn_blocking(move || recording::rotate(&cfg, &active)).await;
+                    let conv = rot_conv.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        // Converted MP4s are copies, so they go before any
+                        // recording does when the disk is too full.
+                        if cfg.max_disk_percent > 0
+                            && recording::disk_usage_percent(&cfg.path)
+                                .is_ok_and(|p| p > cfg.max_disk_percent as f64)
+                        {
+                            conv.purge(true);
+                        }
+                        recording::rotate(&cfg, &active)
+                    })
+                    .await;
                 }
             });
         }
@@ -1152,6 +1341,14 @@ async fn run_server(config: Config, database: Db) {
         .route("/api/recordings", get(api::list_recordings))
         .route("/api/recordings/{name}", get(api::serve_recording))
         .route("/api/recordings/{name}", delete(api::delete_recording))
+        .route(
+            "/api/recordings/{name}/mp4",
+            post(api::start_recording_mp4).get(api::serve_recording_mp4),
+        )
+        .route(
+            "/api/recordings/{name}/mp4/status",
+            get(api::recording_mp4_status),
+        )
         // #159: typescript register is list-only by design (no serve/delete).
         .route("/api/typescripts", get(api::list_typescripts))
         .route("/api/reports/sessions", get(api::report_sessions))
@@ -1164,7 +1361,7 @@ async fn run_server(config: Config, database: Db) {
         .route("/api/reports/top-users", get(api::report_top_users))
         .route("/api/reports/summary", get(api::report_summary))
         .route("/api/system/status", get(api::system_status))
-        .route("/api/users", get(api::list_users))
+        .route("/api/users", get(api::list_users).post(api::create_user))
         .route("/api/users/{email}/role", put(api::set_user_role))
         .route(
             "/api/users/{email}/sessions",
@@ -1219,9 +1416,18 @@ async fn run_server(config: Config, database: Db) {
         .route("/api/ws-ticket", post(api::create_ws_ticket))
         // Address book routes
         .route("/api/addressbook", get(api::ab_list_all))
+        .route("/api/addressbook/version", get(api::ab_version))
         .route("/api/addressbook/search-index", get(api::ab_search_index))
         .route("/api/addressbook/folders", get(api::ab_list_folders))
         .route("/api/addressbook/folders", post(api::ab_create_folder))
+        .route("/api/addressbook/folder-paths", get(api::ab_folder_paths))
+        // Up to 1000 entries is ~100KB of JSON, over the global 64KB body
+        // cap. Raised for this route alone; it is admin-only and the auth
+        // middleware rejects a request before its body is read.
+        .route(
+            "/api/addressbook/bulk",
+            post(api::ab_bulk).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route(
             "/api/addressbook/folders/{scope}/{folder}",
             put(api::ab_update_folder),
@@ -1237,6 +1443,18 @@ async fn run_server(config: Config, database: Db) {
         .route(
             "/api/addressbook/folders/{scope}/{folder}/subfolders",
             get(api::ab_list_subfolders),
+        )
+        .route(
+            "/api/addressbook/folders/{scope}/{folder}/defaults",
+            get(api::ab_get_folder_defaults),
+        )
+        .route(
+            "/api/addressbook/folders/{scope}/{folder}/defaults",
+            put(api::ab_put_folder_defaults),
+        )
+        .route(
+            "/api/addressbook/folders/{scope}/{folder}/defaults",
+            delete(api::ab_delete_folder_defaults),
         )
         .route(
             "/api/addressbook/folders/{scope}/{folder}/entries",
@@ -1255,6 +1473,14 @@ async fn run_server(config: Config, database: Db) {
             delete(api::ab_delete_entry),
         )
         .route(
+            "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/move",
+            post(api::ab_move_entry),
+        )
+        .route(
+            "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/copy",
+            post(api::ab_copy_entry),
+        )
+        .route(
             "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/connect",
             post(api::ab_connect_entry),
         )
@@ -1262,11 +1488,18 @@ async fn run_server(config: Config, database: Db) {
         .merge(session_create_route)
         .with_state(manager.clone())
         .layer(middleware::from_fn(auth::require_auth))
+        // Added after require_auth, so it runs outside it and also sees
+        // refused requests. Those fail, and only successful changes (or a
+        // failed one whose handler reports what it changed anyway) are
+        // logged. The log itself is layered below so this sees it.
+        .layer(middleware::from_fn(api::ab_change_track))
         .layer(Extension(ws_ticket_store.clone()))
         .layer(Extension(vault_client.clone()))
         .layer(Extension(vault_configured.clone()))
         .layer(Extension(credential_default_scope.clone()))
-        .layer(Extension(database.clone()));
+        .layer(Extension(database.clone()))
+        .layer(Extension(ab_changes.clone()))
+        .layer(Extension(mp4_converter.clone()));
     // Applied OUTSIDE require_auth so requests with bad credentials are
     // counted too: a flood of bogus keys is throttled before each one
     // queues on the database lock to be looked up.
@@ -1331,7 +1564,14 @@ async fn run_server(config: Config, database: Db) {
         .route("/reports.html", get(serve_branded_page))
         .route("/admin.html", get(serve_branded_page))
         .route("/tokens.html", get(serve_branded_page))
-        .route("/docs.html", get(serve_branded_page));
+        .route("/docs.html", get(serve_branded_page))
+        // Optional auth only: an anonymous request still gets the page (the
+        // page itself sends the user to log in), but a logged-in one gets
+        // the variant with its navigation already right. No WsTicketStore
+        // here: without it optional_auth skips tickets, so a page URL
+        // carrying ?ticket= cannot use up a single-use WebSocket ticket.
+        .layer(middleware::from_fn(auth::optional_auth))
+        .layer(Extension(database.clone()));
 
     // Build full router (all Router<()> at this point)
     let mut app: Router<()> = Router::new()
@@ -1384,12 +1624,28 @@ async fn run_server(config: Config, database: Db) {
         .layer(middleware::from_fn(security_headers))
         .layer(Extension(tls_enabled))
         .layer(Extension(oidc_enabled))
+        .layer(Extension(OidcHandle(oidc_state.clone())))
         .layer(Extension(drive_configured))
         .layer(Extension(site_title))
         .layer(Extension(theme_data))
         .layer(Extension(trusted_proxies))
         .layer(Extension(branded_pages))
-        .fallback_service(ServeDir::new(&static_path));
+        // Static assets carry Last-Modified and an ETag from ServeDir but no
+        // freshness directive, so Chrome caches them heuristically and never
+        // revalidates -- a rebuild stays invisible until the cache ages out.
+        // asset_cache_control supplies the directive, per request.
+        .fallback_service(axum::middleware::from_fn(asset_cache_control).layer(
+            // ServeDir answers with its own body type; from_fn needs an
+            // axum Response, and the turbofish is what pins down which
+            // request type the mapped service is being taken over.
+            ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
+                ServeDir::new(&static_path),
+                |r| {
+                    use axum::response::IntoResponse;
+                    r.into_response()
+                },
+            ),
+        ));
 
     let scheme = if server_tls.is_some() {
         "https"
@@ -1501,33 +1757,304 @@ fn build_guacd_tls(config: &Config) -> Option<tokio_rustls::TlsConnector> {
     Some(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
 }
 
+/// One pre-branded HTML page, in one variant per role level, each with the
+/// ETag its bytes hash to.
+///
+/// The pages are branded once at startup and cannot change until a restart,
+/// so the tags are computed there too -- serving one is a string compare.
+///
+/// The variants differ only in the `data-role-level` attribute written on
+/// `<html>`: the stylesheet gates navigation links and admin-only controls on
+/// it, so the header is right on first paint for whoever the page is served
+/// to, instead of hiding everything gated and showing it after `/api/me`
+/// answers, which flashed and reflowed on every navigation.
+struct BrandedPage {
+    /// Indexed by role level, 0 (anonymous) to 4 (admin).
+    variants: Vec<BrandedVariant>,
+}
+
+struct BrandedVariant {
+    html: String,
+    etag: String,
+}
+
+/// Highest role level, the index of the last page variant.
+const MAX_ROLE_LEVEL: u8 = 4;
+
+impl BrandedPage {
+    fn new(html: String) -> Self {
+        use sha2::{Digest, Sha256};
+        let variants = (0..=MAX_ROLE_LEVEL)
+            .map(|level| {
+                let html = role_variant_html(&html, level);
+                // Quoted, because an ETag is a quoted-string on the wire. A
+                // bare hash tends to be ignored rather than rejected, which
+                // would look exactly like the stale-cache bug this exists to
+                // fix.
+                let etag = format!("\"{}\"", hex::encode(Sha256::digest(html.as_bytes())));
+                BrandedVariant { html, etag }
+            })
+            .collect();
+        Self { variants }
+    }
+
+    fn variant(&self, level: u8) -> &BrandedVariant {
+        &self.variants[level.min(MAX_ROLE_LEVEL) as usize]
+    }
+}
+
+/// Write the caller's role level onto the page's `<html>` tag. A page that
+/// has no bare `<html>` start tag is returned unchanged. Extracted for test.
+fn role_variant_html(html: &str, level: u8) -> String {
+    match html.find("<html>") {
+        Some(i) => format!(
+            "{}<html data-role-level=\"{}\">{}",
+            &html[..i],
+            level,
+            &html[i + "<html>".len()..]
+        ),
+        None => html.to_string(),
+    }
+}
+
+type BrandedPages = Arc<std::collections::HashMap<String, BrandedPage>>;
+
+/// Whether an `If-None-Match` value covers `etag`.
+///
+/// The comparison for `If-None-Match` is the weak one, so a tag a proxy has
+/// weakened to `W/"..."` still matches.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate == etag
+            || candidate.strip_prefix("W/").map(str::trim) == Some(etag)
+    })
+}
+
+/// Answer with `page`, or 304 if the client already holds this exact version.
+///
+/// `Cache-Control: no-cache` means revalidate, not do-not-store: the browser
+/// keeps the body and asks whether it is still current, so an unchanged page
+/// costs a 304 and a rebuilt one lands on the next load. Without it these
+/// responses carry no freshness information at all and Chrome caches them
+/// heuristically, serving a stale page long after a restart.
+fn page_response(
+    page: &BrandedPage,
+    level: u8,
+    headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+
+    let page = page.variant(level);
+    // The variant depends on who is logged in, so a cache must not hand one
+    // user's copy to another: it keys on the session cookie.
+    let cache_headers = [
+        (header::CACHE_CONTROL, "no-cache"),
+        (header::ETAG, page.etag.as_str()),
+        (header::VARY, "Cookie"),
+    ];
+
+    let known = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| etag_matches(v, &page.etag));
+
+    if known {
+        (StatusCode::NOT_MODIFIED, cache_headers).into_response()
+    } else {
+        (cache_headers, Html(page.html.clone())).into_response()
+    }
+}
+
+/// How long a content-addressed asset may be cached: a year, the longest
+/// span RFC 9111 attaches meaning to, plus `immutable` so that a reload does
+/// not revalidate it either.
+const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// Choose a static asset's `Cache-Control` from the request URL.
+///
+/// A `?v=` query means the URL is content-addressed: the hash was written
+/// into the HTML from the bytes on disk at startup, so this exact URL can
+/// never come to mean different bytes and the browser need never ask again.
+/// A bare URL keeps the revalidating default -- an HTML page cached from
+/// before this change still asks for one, as does anything linked by hand.
+async fn asset_cache_control(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let versioned = request
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|param| param.starts_with("v=")));
+    let mut response = next.run(request).await;
+    // Only a response that carries the asset may be kept for a year. A 404
+    // under a versioned URL is a deployment that has gone wrong, and pinning
+    // it in the cache until next year would make it outlive its cause.
+    let status = response.status();
+    let cacheable = status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(if versioned && cacheable {
+            // Set on the 304 as well as the 200 it stands in for: a
+            // revalidation answering without the directive would re-teach the
+            // browser the old, absent freshness every time.
+            IMMUTABLE_CACHE
+        } else {
+            "no-cache"
+        }),
+    );
+    response
+}
+
+/// Append a content hash to the local asset URLs in `html`.
+///
+/// Turns `src="/guac/Client.js"` into `src="/guac/Client.js?v=4c93eac7`, which
+/// lets those responses be cached for a year instead of revalidated on every
+/// page load -- 37 conditional requests that a WAN client pays a round trip
+/// for and that almost always answer 304.
+///
+/// The hash is taken at startup, in the same pass that brands the page, so
+/// the URL and the bytes it names are produced together and cannot disagree.
+/// The corollary is that **editing an asset now needs a restart to be seen**,
+/// where before a reload was enough; `RUSTGUAC_NO_ASSET_VERSIONING` turns
+/// this off for that reason.
+///
+/// An asset that cannot be read is left alone: a missing file is a 404 either
+/// way, and a URL bearing a hash of nothing would be worse than a bare one.
+fn version_assets(
+    html: &str,
+    static_path: &std::path::Path,
+    hashes: &mut std::collections::HashMap<String, Option<String>>,
+) -> String {
+    const ATTRS: [&str; 2] = ["src=\"", "href=\""];
+
+    let mut out = String::with_capacity(html.len() + 1024);
+    let mut rest = html;
+    // Whichever attribute comes first each time, so neither kind is skipped.
+    while let Some((at, attr)) = ATTRS
+        .iter()
+        .filter_map(|attr| rest.find(attr).map(|at| (at, *attr)))
+        .min_by_key(|(at, _)| *at)
+    {
+        let value_at = at + attr.len();
+        let Some(len) = rest[value_at..].find('"') else {
+            break;
+        };
+        let url = &rest[value_at..value_at + len];
+        out.push_str(&rest[..value_at]);
+        out.push_str(url);
+        if let Some(hash) = asset_hash(url, static_path, hashes) {
+            out.push_str("?v=");
+            out.push_str(&hash);
+        }
+        rest = &rest[value_at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The short content hash for a local asset URL, or None if it is not one we
+/// version.
+fn asset_hash(
+    url: &str,
+    static_path: &std::path::Path,
+    hashes: &mut std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    // Root-relative, unadorned, and one of the two kinds that go stale. An
+    // absolute URL belongs to someone else, and a query or fragment means the
+    // page is already saying something about this URL.
+    if !url.starts_with('/') || url.starts_with("//") || url.contains('?') || url.contains('#') {
+        return None;
+    }
+    if !(url.ends_with(".js")
+        || url.ends_with(".css")
+        || url.ends_with(".svg")
+        || url.ends_with(".png")
+        || url.ends_with(".ico"))
+    {
+        return None;
+    }
+    let rel = url.trim_start_matches('/');
+    // These paths are ours, but they arrive as text out of an HTML file, so
+    // they are treated as untrusted rather than as ours.
+    if rel
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if let Some(known) = hashes.get(url) {
+        return known.clone();
+    }
+    let hash = std::fs::read(static_path.join(rel)).ok().map(|bytes| {
+        use sha2::{Digest, Sha256};
+        // Eight hex digits: the tag only has to tell one build of a file from
+        // the next, and the full 64 across 37 references is page weight spent
+        // on nothing.
+        hex::encode(Sha256::digest(&bytes))[..8].to_string()
+    });
+    hashes.insert(url.to_string(), hash.clone());
+    hash
+}
+
 /// Serve a branded HTML page from the pre-processed in-memory map.
 async fn serve_branded_page(
-    Extension(pages): Extension<Arc<std::collections::HashMap<String, String>>>,
+    Extension(pages): Extension<BrandedPages>,
+    identity: Option<Extension<auth::AuthIdentity>>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let path = request.uri().path().trim_start_matches('/');
     let key = if path.is_empty() { "index.html" } else { path };
-    if let Some(html) = pages.get(key) {
-        Html(html.clone()).into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    // Whoever the page is for decides which navigation it carries. An API-key
+    // user sends no credential on the page GET and gets the anonymous
+    // variant; the page reconciles that from /api/me.
+    let level = identity
+        .map(|Extension(id)| auth::role_level(id.role()))
+        .unwrap_or(0);
+    match pages.get(key) {
+        Some(page) => page_response(page, level, request.headers()),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Serve the client HTML page for SSH sessions.
 /// The session_id is extracted by the JS on the page, not by this handler.
 async fn serve_client_page(
-    Extension(pages): Extension<Arc<std::collections::HashMap<String, String>>>,
+    axum::extract::State(manager): axum::extract::State<crate::api::AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Extension(pages): Extension<BrandedPages>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if let Some(html) = pages.get("client.html") {
-        Html(html.clone()).into_response()
-    } else {
-        Html(include_str!("../static/client.html")).into_response()
+    let mut response = match pages.get("client.html") {
+        Some(page) => page_response(page, 0, &headers),
+        // Unreachable: the map always carries the embedded copy.
+        None => Html(include_str!("../static/client.html")).into_response(),
+    };
+    let session = match uuid::Uuid::parse_str(&session_id) {
+        Ok(id) => manager.get_session(id).await,
+        Err(_) => None,
+    };
+    if session
+        .as_ref()
+        .is_some_and(|s| client_frameable(s.fullscreen_on_connect, s.address_book_entry.is_some()))
+    {
+        response.extensions_mut().insert(ClientFrameable);
     }
+    response
+}
+
+/// Whether a session's client page may be framed by our own origin: only a
+/// session opened from a saved entry whose admin turned fullscreen-on-connect
+/// on. That is the only case the Connections page hosts the client in an
+/// iframe; an ad-hoc session, whatever its request said, and an unknown or
+/// ended session are never frameable.
+fn client_frameable(fullscreen_on_connect: bool, from_entry: bool) -> bool {
+    fullscreen_on_connect && from_entry
 }
 
 /// HTML-escape a string to prevent XSS when injecting config values into HTML.
@@ -1564,6 +2091,246 @@ fn rewrite_branding(html: &str, site_title: &str, logo_url: Option<&str>) -> Str
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn role_variant_writes_level_on_html_tag_only() {
+        let page = "<!DOCTYPE html>\n<html>\n<head><title>x</title></head><body><html>text</html></body></html>";
+        let v = role_variant_html(page, 4);
+        assert!(v.starts_with("<!DOCTYPE html>\n<html data-role-level=\"4\">\n<head>"));
+        // only the first bare start tag is touched; the literal later on is content
+        assert_eq!(v.matches("data-role-level").count(), 1);
+        assert_eq!(
+            role_variant_html("<p>no html tag</p>", 2),
+            "<p>no html tag</p>"
+        );
+        let branded = BrandedPage::new(page.to_string());
+        assert_eq!(branded.variants.len(), 5);
+        assert_ne!(branded.variant(0).etag, branded.variant(4).etag);
+        assert_eq!(
+            branded.variant(9).etag,
+            branded.variant(4).etag,
+            "levels clamp to admin"
+        );
+    }
+
+    #[test]
+    fn framing_is_denied_except_for_the_frameable_client() {
+        // Clickjacking: no page may be framed, by anyone. The one exception,
+        // the client of a fullscreen-on-connect entry's session (#257), may
+        // be framed by our own origin and nothing wider. The two policies
+        // must otherwise be identical, so the exception loosens framing and
+        // nothing else.
+        let ancestors = |csp: &str| -> Vec<String> {
+            let d = csp
+                .split(';')
+                .map(str::trim)
+                .find(|d| d.starts_with("frame-ancestors "))
+                .expect("CSP must carry a frame-ancestors directive");
+            d.split_whitespace().skip(1).map(String::from).collect()
+        };
+        assert_eq!(ancestors(CONTENT_SECURITY_POLICY), vec!["'none'"]);
+        assert_eq!(ancestors(FRAMEABLE_CONTENT_SECURITY_POLICY), vec!["'self'"]);
+        let rest = |csp: &str| -> Vec<String> {
+            csp.split(';')
+                .map(str::trim)
+                .filter(|d| !d.starts_with("frame-ancestors "))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(
+            rest(CONTENT_SECURITY_POLICY),
+            rest(FRAMEABLE_CONTENT_SECURITY_POLICY)
+        );
+    }
+
+    #[test]
+    fn only_fullscreen_entry_sessions_are_frameable() {
+        assert!(client_frameable(true, true));
+        assert!(!client_frameable(false, true), "a normal entry");
+        assert!(
+            !client_frameable(true, false),
+            "an ad-hoc session cannot opt itself in"
+        );
+        assert!(!client_frameable(false, false));
+    }
+
+    #[tokio::test]
+    async fn security_headers_deny_framing_unless_the_page_is_marked() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::response::IntoResponse;
+        let app = Router::new()
+            .route("/plain", get(|| async { "x" }))
+            .route(
+                "/client",
+                get(|| async {
+                    let mut r = "x".into_response();
+                    r.extensions_mut().insert(ClientFrameable);
+                    r
+                }),
+            )
+            .layer(middleware::from_fn(security_headers))
+            .layer(Extension(TlsEnabled(false)));
+        let get_headers = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .headers()
+                    .clone()
+            }
+        };
+        let plain = get_headers("/plain").await;
+        assert_eq!(plain["x-frame-options"], "DENY");
+        assert!(plain["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
+        let client = get_headers("/client").await;
+        assert_eq!(client["x-frame-options"], "SAMEORIGIN");
+        assert!(client["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'self'"));
+    }
+
+    #[test]
+    fn test_csp_allows_data_and_blob_images() {
+        // Safari and Firefox draw Guacamole image streams through data: URIs
+        // (#249). Chromium uses ImageDecoder and would not catch a regression.
+        let directives: Vec<&str> = CONTENT_SECURITY_POLICY.split(';').map(str::trim).collect();
+        let img_src = directives
+            .iter()
+            .find(|d| d.starts_with("img-src "))
+            .expect("CSP must carry an explicit img-src directive");
+        let sources: Vec<&str> = img_src.split_whitespace().skip(1).collect();
+        assert!(sources.contains(&"'self'"), "img-src must allow 'self'");
+        assert!(sources.contains(&"data:"), "img-src must allow data: URIs");
+        assert!(sources.contains(&"blob:"), "img-src must allow blob: URLs");
+        // The string continuation must not leave stray whitespace runs.
+        assert!(!CONTENT_SECURITY_POLICY.contains("  "));
+        assert!(!CONTENT_SECURITY_POLICY.contains('\n'));
+    }
+
+    #[test]
+    fn test_version_assets_rewrites_local_js_and_css() {
+        // Tests run from the crate root, so this is the real static tree.
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let html = concat!(
+            "<link rel=\"stylesheet\" href=\"/rustguac.css\">",
+            "<script src=\"/guac/Client.js\"></script>",
+        );
+        let out = version_assets(html, static_path, &mut hashes);
+        assert!(out.contains("/rustguac.css?v="), "{out}");
+        assert!(out.contains("/guac/Client.js?v="), "{out}");
+        // The rest of the markup survives untouched.
+        assert!(out.starts_with("<link rel=\"stylesheet\""));
+        assert!(out.ends_with("></script>"));
+    }
+
+    #[test]
+    fn page_response_varies_on_the_cookie() {
+        // The variant served depends on the session cookie, so a cache must
+        // never hand an admin's copy to an anonymous visitor or the reverse.
+        use axum::http::{header, HeaderMap, StatusCode};
+        let page = BrandedPage::new("<html>x</html>".to_string());
+        let res = page_response(&page, 4, &HeaderMap::new());
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::VARY], "Cookie");
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_NONE_MATCH, page.variant(4).etag.parse().unwrap());
+        let res = page_response(&page, 4, &h);
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.headers()[header::VARY], "Cookie");
+        // Another role's tag is not this variant: full page.
+        assert_eq!(page_response(&page, 1, &h).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_version_assets_versions_the_logo() {
+        // The logo used to be revalidated on every page load, which blanked
+        // it for a moment on each navigation in some browsers. It is content
+        // addressed like the scripts now.
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let out = version_assets(
+            "<img id=\"site-logo\" src=\"/logo.svg\" alt=\"\">",
+            static_path,
+            &mut hashes,
+        );
+        assert!(out.contains("src=\"/logo.svg?v="), "{out}");
+    }
+
+    #[test]
+    fn test_version_assets_leaves_everything_else_alone() {
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        for html in [
+            // Not ours to version.
+            "<script src=\"https://cdn.example/x.js\"></script>",
+            "<script src=\"//cdn.example/x.js\"></script>",
+            // Already says something about this URL.
+            "<script src=\"/guac/Client.js?debug=1\"></script>",
+            // Not a kind we version (a page, a download).
+            "<a href=\"/docs.html\">",
+            // No such file: a hash of nothing is worse than none.
+            "<script src=\"/guac/NoSuchFile.js\"></script>",
+            // Traversal, which these paths have no business doing.
+            "<script src=\"/../Cargo.toml.js\"></script>",
+        ] {
+            assert_eq!(
+                version_assets(html, static_path, &mut hashes),
+                html,
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_asset_hash_is_content_derived_and_cached() {
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let css = asset_hash("/rustguac.css", static_path, &mut hashes).expect("css hashes");
+        let js = asset_hash("/guac/Client.js", static_path, &mut hashes).expect("js hashes");
+        assert_ne!(css, js);
+        assert_eq!(css.len(), 8);
+        assert!(css.chars().all(|c| c.is_ascii_hexdigit()));
+        // One entry per distinct URL, hit or miss -- a miss is cached too, so
+        // a page full of broken links does not re-stat the disk per reference.
+        assert_eq!(
+            asset_hash("/rustguac.css", static_path, &mut hashes),
+            Some(css)
+        );
+        assert!(asset_hash("/guac/NoSuchFile.js", static_path, &mut hashes).is_none());
+        assert_eq!(hashes.len(), 3);
+    }
+
+    #[test]
+    fn test_etag_matches_exact_weak_and_wildcard() {
+        let etag = "\"abc\"";
+        assert!(etag_matches("\"abc\"", etag));
+        assert!(etag_matches("W/\"abc\"", etag));
+        assert!(etag_matches("*", etag));
+        // A list, as a browser holding several cached variants sends.
+        assert!(etag_matches("\"other\", \"abc\"", etag));
+        assert!(!etag_matches("\"other\"", etag));
+        // A rebuilt page: same length, different bytes.
+        assert!(!etag_matches("\"abd\"", etag));
+    }
+
+    #[test]
+    fn test_branded_page_etag_tracks_content() {
+        let a = BrandedPage::new("<html>one</html>".to_string());
+        let b = BrandedPage::new("<html>two</html>".to_string());
+        let (a, b) = (a.variant(0), b.variant(0));
+        assert_ne!(a.etag, b.etag);
+        // Quoted, or caches ignore it.
+        assert!(a.etag.starts_with('"') && a.etag.ends_with('"'));
+        assert!(etag_matches(&a.etag, &a.etag));
+        assert!(!etag_matches(&b.etag, &a.etag));
+    }
 
     #[test]
     fn test_rewrite_branding_title() {

@@ -147,6 +147,12 @@ web_allowed_networks = ["127.0.0.0/8", "::1/128"]
 # # Default: "operator"
 # default_role = "operator"
 #
+# # Create an account automatically on first OIDC login (default: true).
+# # Set to false to let in only users an admin has added beforehand
+# # (`rustguac add-user --email ... --role ...`, POST /api/users, or the
+# # Admin page). The email must match what the identity provider sends.
+# auto_create_users = true
+#
 # # OIDC claim name containing group memberships (default: "groups").
 # groups_claim = "groups"
 #
@@ -167,8 +173,8 @@ web_allowed_networks = ["127.0.0.0/8", "::1/128"]
 # are stored in HashiVault or OpenBao KV v2. Credentials never reach the
 # browser — the server reads them from Vault and creates sessions directly.
 #
-# Authentication uses AppRole. The secret_id is provided via the
-# VAULT_SECRET_ID environment variable.
+# Authentication defaults to AppRole; provide VAULT_SECRET_ID in the environment.
+# Alternatively select workload JWT authentication with the nested block below.
 #
 # Vault KV v2 path structure:
 #   <base_path>/shared/<folder>/<entry>          — shared across instances
@@ -183,6 +189,14 @@ web_allowed_networks = ["127.0.0.0/8", "::1/128"]
 # # namespace = "my-ns"       # optional, Vault Enterprise / OpenBao namespaces
 # # instance_name = "prod-1"  # optional, enables instance-scoped entries
 # # tls_skip_verify = false   # skip TLS cert verification (dev only, default: false)
+
+# # Instead of role_id/VAULT_SECRET_ID, read a projected workload JWT:
+# [vault.jwt_auth]
+# mount = "workload-jwt"      # JWT auth mount, not the KV mount
+# role = "rustguac"
+# path = "/var/run/secrets/vault/token"
+# # ...or a command that prints the token (run directly, no shell):
+# # token_command = ["/opt/rustguac/bin/fetch-vault-jwt"]
 
 # ─── Recording ──────────────────────────────────────────────────────────────
 #

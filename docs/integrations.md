@@ -217,6 +217,14 @@ rustguac roles. See [Roles and Access Control](roles-and-access-control.md).
 - **Groups appear as object IDs, not names**: that's the default. Either
   use the object IDs in your group-to-role mappings (stable, recommended)
   or switch the claim to emit `sAMAccountName` in step 3 and use names.
+- **`ID token verification failed` with `Signature verification failed`
+  in the log**: the log line says whether the token's key id
+  (`token_kid`) is among the provider's published keys. If it is not,
+  the usual cause is an app created under **Enterprise applications**
+  rather than **App registrations**: Entra then signs tokens with an
+  app-specific key that the standard key set does not contain. Create
+  the app as in step 1. A restart also rules out a key rotation since
+  rustguac started.
 - **Login succeeds but `default_role` doesn't get applied**: `default_role`
   only fires when no group-to-role mapping matches. Configure mappings on
   the Admin page (or, for a single-user test, set `default_role = "admin"`
@@ -388,11 +396,151 @@ chmod 644 /opt/rustguac/certs/ca.pem /opt/rustguac/certs/client.pem
 | `rustguac/shared/<folder>/<entry>` | Connection entry (shared across all instances) |
 | `rustguac/instance/<name>/<folder>/<entry>` | Instance-specific entry (requires `instance_name`) |
 
-### AppRole token management
+### Workload JWT authentication
+
+Vault and OpenBao can verify workload JWTs, including Kubernetes projected
+service-account tokens. This authenticates the rustguac server to the secret
+store; it does not replace OIDC authentication for browser users.
+
+Configure a JWT auth mount with the workload issuer and a role bound to the
+exact service account and a dedicated audience. For example, with the existing
+`rustguac` KV policy:
+
+```sh
+vault auth enable -path=workload-jwt jwt
+vault write auth/workload-jwt/config \
+  oidc_discovery_url="https://issuer.example.com" \
+  bound_issuer="https://issuer.example.com"
+vault write auth/workload-jwt/role/rustguac \
+  role_type=jwt user_claim=sub \
+  bound_subject="system:serviceaccount:remote-access:rustguac" \
+  bound_audiences=vault token_policies=rustguac \
+  token_ttl=5m token_max_ttl=5m token_explicit_max_ttl=5m
+```
+
+Use your cluster's actual issuer URL. Its OIDC discovery and signing-key endpoints
+must be reachable from the secret store. This does not require a TokenReview
+credential. However, JWT verification does not check Kubernetes revocation:
+deleted pods' or service accounts' JWTs remain valid until token expiry, and
+already issued Vault/OpenBao sessions have their own lifetime. Keep both short.
+
+Mount a projected token into the rustguac container (relevant pod spec excerpt):
+
+```yaml
+spec:
+  serviceAccountName: rustguac
+  automountServiceAccountToken: false
+  containers:
+    - name: rustguac
+      # image and other settings omitted
+      volumeMounts:
+        - name: vault-identity
+          mountPath: /var/run/secrets/vault
+          readOnly: true
+  volumes:
+    - name: vault-identity
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: vault
+              expirationSeconds: 600
+```
+
+Configure rustguac without `role_id` or `VAULT_SECRET_ID`:
+
+```toml
+[vault]
+addr = "https://vault.example.com:8200"
+mount = "secret"
+base_path = "rustguac"
+
+[vault.jwt_auth]
+mount = "workload-jwt"
+role = "rustguac"
+path = "/var/run/secrets/vault/token"
+```
+
+JWT mode rereads the file on login and reauthentication, including after a 403.
+A missing, empty or rejected JWT does not trigger AppRole fallback. Use the same
+nested block under `vault_shared` or `vault_local` for additional backends.
+
+#### Other identity sources
+
+The same `[vault.jwt_auth]` block works with any issuer Vault or OpenBao can verify.
+Point the auth mount at that issuer's discovery URL or keys, bind the role to the
+workload's identity, and give rustguac the token through `path` or `token_command`.
+
+**Nomad.** Run rustguac as a Nomad job with a workload identity written to a file,
+and trust Nomad's JWKS (`https://<nomad>/.well-known/jwks.json`) on the auth mount.
+Nomad renews the token at roughly half its TTL.
+
+```hcl
+identity {
+  name     = "vault_default"
+  aud      = ["vault"]
+  ttl      = "1h"
+  file     = true
+  filepath = "secrets/vault.jwt"
+}
+```
+
+`filepath` is relative to the task's working directory; give rustguac the path
+as the task sees it (with the `docker` and `exec` drivers the secrets directory
+is `/secrets`):
+
+```toml
+[vault.jwt_auth]
+mount = "nomad-jwt"
+role = "rustguac"
+path = "/secrets/vault.jwt"
+```
+
+**SPIRE.** On a machine running a SPIRE agent, `spiffe-helper` keeps a JWT-SVID
+for an audience in a file and refreshes it before it expires. Trust the SPIRE
+server's OIDC discovery provider on the auth mount and bind the role to
+rustguac's SPIFFE ID.
+
+```
+# spiffe-helper helper.conf
+agent_address = "/run/spire/agent/public/api.sock"
+daemon_mode = true
+jwt_svids = [{ jwt_audience = "vault", jwt_svid_file_name = "/run/rustguac/vault.jwt" }]
+jwt_svid_file_mode = 0600
+```
+
+```toml
+[vault.jwt_auth]
+mount = "spire-jwt"
+role = "rustguac"
+path = "/run/rustguac/vault.jwt"
+```
+
+SPIRE can identify a machine without any stored secret, for example with a TPM
+(`tpm_devid` node attestation), which includes Proxmox VMs with a virtual TPM.
+We are working towards a documented Proxmox vTPM setup.
+
+**Cloud VMs.** Where the platform hands a VM a signed identity token on request
+(Azure managed identity, GCP's metadata server), a small script can fetch it.
+It must print the token and nothing else:
+
+```toml
+[vault.jwt_auth]
+mount = "azure-jwt"
+role = "rustguac"
+token_command = ["/opt/rustguac/bin/fetch-vault-jwt"]
+```
+
+**What JWT login does and doesn't remove.** It removes the long-lived AppRole
+secret ID from the rustguac host only when the platform itself vouches for the
+workload (Kubernetes, Nomad, SPIRE attestation, a cloud provider). Fetching a JWT
+with a client secret from an identity provider just moves the secret elsewhere.
+
+### Token management
 
 rustguac manages Vault tokens automatically:
 
-- Authenticates via AppRole (`role_id` + `secret_id`) on startup
+- Authenticates via AppRole (`role_id` + `secret_id`) or the configured workload JWT on startup
 - Renews tokens at 50% of their TTL
 - Falls back to full re-authentication on 403 Forbidden responses
 - Retries every 30 seconds if Vault is unavailable at startup (non-fatal)

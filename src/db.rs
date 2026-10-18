@@ -513,31 +513,95 @@ impl std::fmt::Display for AuthError {
 
 // ── User management ──
 
-/// Upsert a user from OIDC login. Creates on first login, updates last_login_at on subsequent.
-pub fn upsert_user(
-    db: &Db,
-    email: &str,
-    name: &str,
-    oidc_subject: Option<&str>,
-    default_role: &str,
-    groups: &[String],
-) -> rusqlite::Result<User> {
-    let groups_str = groups.join(",");
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "INSERT INTO users (email, name, oidc_subject, role, oidc_groups)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(email) DO UPDATE SET
-             name = excluded.name,
-             oidc_subject = COALESCE(excluded.oidc_subject, users.oidc_subject),
-             oidc_groups = excluded.oidc_groups,
-             last_login_at = datetime('now')",
-        params![email, name, oidc_subject, default_role, groups_str],
-    )?;
+/// Check an email an admin gives for a new user: what an identity provider
+/// could send, not just anything. Returns the reason it is refused.
+pub fn check_user_email(email: &str) -> Result<(), &'static str> {
+    if email.is_empty() {
+        return Err("email is required");
+    }
+    if email.len() > 254 {
+        return Err("email is longer than 254 characters");
+    }
+    if email.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("email must not contain spaces or control characters");
+    }
+    if !email.contains('@') {
+        return Err("email must contain @");
+    }
+    Ok(())
+}
+
+/// Check a display name an admin gives for a new user.
+pub fn check_user_name(name: &str) -> Result<(), &'static str> {
+    if name.chars().count() > 200 {
+        return Err("name is longer than 200 characters");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("name must not contain control characters");
+    }
+    Ok(())
+}
+
+/// How an OIDC login matched the users table (`upsert_user`).
+#[derive(Debug)]
+pub enum OidcLogin {
+    /// Logged in: the user's profile and last_login_at were updated, or the
+    /// user was created.
+    User(User),
+    /// No user has this email, and creating one was not allowed
+    /// (`auto_create_users = false`).
+    NoAccount,
+    /// The user with this email is bound to a different OIDC subject. Their
+    /// identity provider account is not the one that logged in before, so
+    /// the login is refused; `rustguac reset-oidc-subject` releases the
+    /// binding after a provider migration.
+    SubjectMismatch,
+    /// More than one user has this email in a different case, so it is not
+    /// clear who is logging in. Nothing was changed.
+    Ambiguous,
+}
+
+/// Which user an email names (`find_user_for_email`).
+enum EmailMatch {
+    /// One user: their id and recorded OIDC subject.
+    One(i64, Option<String>),
+    None,
+    /// Several users match ignoring case and none exactly.
+    Ambiguous,
+}
+
+/// The user an email names: an exact match, or else the one user whose email
+/// matches ignoring case (providers and admins do not always agree on case).
+fn find_user_for_email(conn: &Connection, email: &str) -> rusqlite::Result<EmailMatch> {
+    let exact = conn.query_row(
+        "SELECT id, oidc_subject FROM users WHERE email = ?1",
+        params![email],
+        |row| Ok(EmailMatch::One(row.get(0)?, row.get(1)?)),
+    );
+    match exact {
+        Ok(found) => return Ok(found),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return Err(e),
+    }
+    let mut stmt =
+        conn.prepare("SELECT id, oidc_subject FROM users WHERE lower(email) = lower(?1)")?;
+    let mut rows: Vec<EmailMatch> = stmt
+        .query_map(params![email], |row| {
+            Ok(EmailMatch::One(row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(match rows.len() {
+        0 => EmailMatch::None,
+        1 => rows.remove(0),
+        _ => EmailMatch::Ambiguous,
+    })
+}
+
+fn user_by_id(conn: &Connection, id: i64) -> rusqlite::Result<User> {
     conn.query_row(
         "SELECT id, email, name, oidc_subject, role, disabled, created_at, last_login_at, oidc_groups
-         FROM users WHERE email = ?1",
-        params![email],
+         FROM users WHERE id = ?1",
+        params![id],
         |row| {
             Ok(User {
                 id: row.get(0)?,
@@ -552,6 +616,123 @@ pub fn upsert_user(
             })
         },
     )
+}
+
+/// Record an OIDC login.
+///
+/// The user is found by email, ignoring case. A user who has logged in before
+/// is bound to the OIDC subject (`sub`) their provider sent then: a login
+/// with the same email but a different subject is refused
+/// (`SubjectMismatch`), because the email alone is not proof of identity (a
+/// provider may let people set it). A user who has not logged in yet, such
+/// as one an admin added, takes the subject of their first login.
+///
+/// A user not in the table is created with `default_role` when
+/// `create_if_missing` is set; otherwise `NoAccount` and nothing is written
+/// (OIDC `auto_create_users = false`).
+pub fn upsert_user(
+    db: &Db,
+    email: &str,
+    name: &str,
+    oidc_subject: Option<&str>,
+    default_role: &str,
+    groups: &[String],
+    create_if_missing: bool,
+) -> rusqlite::Result<OidcLogin> {
+    let groups_str = groups.join(",");
+    let conn = db.lock().unwrap();
+    let id = match find_user_for_email(&conn, email)? {
+        EmailMatch::Ambiguous => return Ok(OidcLogin::Ambiguous),
+        EmailMatch::One(id, recorded) => {
+            if let (Some(recorded), Some(subject)) = (recorded.as_deref(), oidc_subject) {
+                if recorded != subject {
+                    return Ok(OidcLogin::SubjectMismatch);
+                }
+            }
+            conn.execute(
+                "UPDATE users SET
+                     name = ?2,
+                     oidc_subject = COALESCE(?3, oidc_subject),
+                     oidc_groups = ?4,
+                     last_login_at = datetime('now')
+                 WHERE id = ?1",
+                params![id, name, oidc_subject, groups_str],
+            )?;
+            id
+        }
+        EmailMatch::None if create_if_missing => {
+            conn.execute(
+                "INSERT INTO users (email, name, oidc_subject, role, oidc_groups, last_login_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                params![email, name, oidc_subject, default_role, groups_str],
+            )?;
+            conn.last_insert_rowid()
+        }
+        EmailMatch::None => return Ok(OidcLogin::NoAccount),
+    };
+    user_by_id(&conn, id).map(OidcLogin::User)
+}
+
+/// Why `create_user` did not add a user.
+#[derive(Debug)]
+pub enum CreateUserError {
+    /// A user with this email already exists, in any case.
+    Exists,
+    Db(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for CreateUserError {
+    fn from(e: rusqlite::Error) -> Self {
+        CreateUserError::Db(e)
+    }
+}
+
+impl std::fmt::Display for CreateUserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateUserError::Exists => write!(f, "a user with that email already exists"),
+            CreateUserError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Pre-provision a user so they can log in via OIDC when automatic account
+/// creation is disabled. The OIDC subject, name and groups are filled in on
+/// first login. Refused if a user with the same email exists in any case,
+/// since logins match email ignoring case.
+pub fn create_user(db: &Db, email: &str, name: &str, role: &str) -> Result<User, CreateUserError> {
+    let conn = db.lock().unwrap();
+    let taken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE lower(email) = lower(?1)",
+        params![email],
+        |row| row.get(0),
+    )?;
+    if taken > 0 {
+        return Err(CreateUserError::Exists);
+    }
+    conn.execute(
+        "INSERT INTO users (email, name, role) VALUES (?1, ?2, ?3)",
+        params![email, name, role],
+    )?;
+    Ok(user_by_id(&conn, conn.last_insert_rowid())?)
+}
+
+/// Forget the OIDC subject a user is bound to, so their next login binds to
+/// whatever subject it brings. For moving to a different identity provider,
+/// where every user's subject changes. Returns the user's stored email, or
+/// `None` when no user (or, ignoring case, more than one) has this email.
+pub fn reset_oidc_subject(db: &Db, email: &str) -> rusqlite::Result<Option<String>> {
+    let conn = db.lock().unwrap();
+    match find_user_for_email(&conn, email)? {
+        EmailMatch::One(id, _) => {
+            conn.execute(
+                "UPDATE users SET oidc_subject = NULL WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(Some(user_by_id(&conn, id)?.email))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Create an auth session for a user. Returns the plaintext session token
@@ -1948,5 +2129,173 @@ mod tests {
         assert!(validate_api_key(&db, &k, None).is_ok());
         let k = add_admin(&db, "none", None, None).unwrap();
         assert!(validate_api_key(&db, &k, None).is_ok());
+    }
+
+    #[test]
+    fn test_upsert_user_creates_when_allowed() {
+        let db = test_db();
+        let groups = vec!["ops".to_string()];
+        let user = upsert_user(
+            &db,
+            "a@example.com",
+            "A",
+            Some("sub-a"),
+            "operator",
+            &groups,
+            true,
+        )
+        .unwrap();
+        let user = logged_in(user);
+        assert_eq!(user.role, "operator");
+        assert_eq!(user.oidc_subject.as_deref(), Some("sub-a"));
+    }
+
+    #[test]
+    fn test_upsert_user_without_create_rejects_unknown() {
+        let db = test_db();
+        let res = upsert_user(
+            &db,
+            "x@example.com",
+            "X",
+            Some("sub-x"),
+            "admin",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(res, OidcLogin::NoAccount));
+        assert!(get_user_by_email(&db, "x@example.com").is_err());
+    }
+
+    #[test]
+    fn test_upsert_user_without_create_logs_in_provisioned() {
+        let db = test_db();
+        create_user(&db, "p@example.com", "", "viewer").unwrap();
+        let groups = vec!["devs".to_string()];
+        let user = upsert_user(
+            &db,
+            "p@example.com",
+            "P",
+            Some("sub-p"),
+            "admin",
+            &groups,
+            false,
+        )
+        .unwrap();
+        let user = logged_in(user);
+        // Pre-provisioned role is kept, default_role is not applied.
+        assert_eq!(user.role, "viewer");
+        assert_eq!(user.name, "P");
+        assert_eq!(user.oidc_subject.as_deref(), Some("sub-p"));
+        assert_eq!(user.oidc_groups, "devs");
+        assert!(user.last_login_at.is_some());
+    }
+
+    #[test]
+    fn test_create_user_duplicate_fails() {
+        let db = test_db();
+        create_user(&db, "d@example.com", "", "viewer").unwrap();
+        let err = create_user(&db, "d@example.com", "", "admin").unwrap_err();
+        assert!(matches!(err, CreateUserError::Exists));
+        // Logins match email ignoring case, so a different case is the same user.
+        let err = create_user(&db, "D@Example.com", "", "admin").unwrap_err();
+        assert!(matches!(err, CreateUserError::Exists));
+    }
+
+    fn logged_in(o: OidcLogin) -> User {
+        match o {
+            OidcLogin::User(u) => u,
+            other => panic!("expected a login, got {other:?}"),
+        }
+    }
+
+    fn login(db: &Db, email: &str, sub: &str, create: bool) -> OidcLogin {
+        upsert_user(db, email, "N", Some(sub), "viewer", &[], create).unwrap()
+    }
+
+    #[test]
+    fn oidc_login_is_bound_to_the_first_subject() {
+        // An admin-added user takes the subject of their first login...
+        let db = test_db();
+        create_user(&db, "alice@corp.example", "", "admin").unwrap();
+        logged_in(login(&db, "alice@corp.example", "sub-alice", false));
+        logged_in(login(&db, "alice@corp.example", "sub-alice", false));
+        // ...and someone else's provider account carrying the same email is
+        // refused, with auto-create on or off, and nothing is changed.
+        for create in [false, true] {
+            assert!(matches!(
+                login(&db, "alice@corp.example", "sub-mallory", create),
+                OidcLogin::SubjectMismatch
+            ));
+        }
+        let alice = get_user_by_email(&db, "alice@corp.example").unwrap();
+        assert_eq!(alice.oidc_subject.as_deref(), Some("sub-alice"));
+        assert_eq!(alice.role, "admin");
+    }
+
+    #[test]
+    fn reset_oidc_subject_lets_the_next_login_bind_again() {
+        // A move to a different identity provider gives everyone a new
+        // subject; the admin releases the old binding and the next login
+        // records the new one.
+        let db = test_db();
+        logged_in(login(&db, "bob@corp.example", "old-idp-bob", true));
+        assert!(matches!(
+            login(&db, "bob@corp.example", "new-idp-bob", true),
+            OidcLogin::SubjectMismatch
+        ));
+        assert_eq!(
+            reset_oidc_subject(&db, "BOB@corp.example")
+                .unwrap()
+                .as_deref(),
+            Some("bob@corp.example")
+        );
+        let bob = logged_in(login(&db, "bob@corp.example", "new-idp-bob", true));
+        assert_eq!(bob.oidc_subject.as_deref(), Some("new-idp-bob"));
+        assert_eq!(
+            reset_oidc_subject(&db, "nobody@corp.example").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn oidc_login_matches_email_ignoring_case() {
+        // The admin typed the email in one case and the provider sends
+        // another: the same user logs in, with the role the admin chose, and
+        // no second account appears.
+        let db = test_db();
+        create_user(&db, "JSmith@Example.com", "", "operator").unwrap();
+        let u = logged_in(login(&db, "jsmith@example.com", "sub-j", false));
+        assert_eq!(u.role, "operator");
+        let u = logged_in(login(&db, "jsmith@example.com", "sub-j", true));
+        assert_eq!(u.role, "operator");
+        assert_eq!(list_users(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oidc_login_refuses_an_ambiguous_email() {
+        // Two users already differ only in case (created before logins
+        // ignored case): refuse rather than guess, and change nothing.
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (email, role) VALUES ('Ann@x.example', 'viewer')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO users (email, role) VALUES ('ANN@x.example', 'admin')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            login(&db, "ann@x.example", "sub-ann", true),
+            OidcLogin::Ambiguous
+        ));
+        assert_eq!(list_users(&db).unwrap().len(), 2);
+        // An exact match is never ambiguous.
+        logged_in(login(&db, "Ann@x.example", "sub-ann", false));
     }
 }

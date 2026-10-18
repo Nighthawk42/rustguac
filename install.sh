@@ -37,14 +37,40 @@ for arg in "$@"; do
         --deps-only)   DEPS_ONLY=1 ;;
         --no-tls)      NO_TLS=1 ;;
         --hostname=*)  TLS_HOSTNAME="${arg#--hostname=}" ;;
+        # An alias for the environment variable rather than a second switch
+        # reaching the same place, so there is one thing to read when the
+        # answer looks wrong. Set here, it also wins over an inherited
+        # RUSTGUAC_DRIVE_SETUP=yes, which is the precedence an explicit flag
+        # should have.
+        --no-drive)    RUSTGUAC_DRIVE_SETUP=no ;;
         -h|--help)
-            echo "Usage: sudo $0 [--deps-only|--no-deps] [--no-tls] [--hostname=FQDN]"
+            echo "Usage: sudo $0 [--deps-only|--no-deps] [--no-tls] [--no-drive]"
+            echo "                        [--hostname=FQDN]"
             echo ""
             echo "Options:"
             echo "  --deps-only       Only install system packages, then exit"
             echo "  --no-deps         Skip apt install (assume packages already present)"
             echo "  --no-tls          Skip TLS certificate generation (plain HTTP only)"
+            echo "  --no-drive        Skip the encrypted drive prompt (same as"
+            echo "                    RUSTGUAC_DRIVE_SETUP=no)"
             echo "  --hostname=FQDN   Hostname for TLS certificate (default: system hostname)"
+            echo ""
+            echo "Environment:"
+            echo "  The encrypted drive for RDP file transfer is the only part of this"
+            echo "  installer that asks a question. It is skipped on its own when the"
+            echo "  container already exists, when cryptsetup is missing, or when stdin"
+            echo "  is not a terminal; these answer it otherwise."
+            echo ""
+            echo "  RUSTGUAC_DRIVE_SETUP    yes|no — answer the prompt without a terminal"
+            echo "  RUSTGUAC_DRIVE_SIZE     LUKS container size (default: 4G)"
+            echo "  RUSTGUAC_DRIVE_MOUNT    Mount point (default: /mnt/rustguac-drives)"
+            echo "  RUSTGUAC_LUKS_DEVICE    Container path (default: PREFIX/drives.luks)"
+            echo "  RUSTGUAC_LUKS_NAME      dm-crypt mapper name (default: rustguac-drives)"
+            echo ""
+            echo "  Settings for guacd itself belong in PREFIX/guacd.env, which is"
+            echo "  created once and never overwritten; the unit files are rewritten on"
+            echo "  every run, so anything set in them directly is lost at the next"
+            echo "  install."
             exit 0
             ;;
     esac
@@ -179,8 +205,7 @@ build_guacd() {
         --with-rdp \
         --with-spice \
         --without-telnet \
-        --without-kubernetes \
-        --disable-guacenc \
+        --disable-kubernetes \
         --disable-guaclog \
         --disable-guacclip \
         --disable-static
@@ -190,6 +215,7 @@ build_guacd() {
 
     info "Installing guacd to $PREFIX..."
     make install
+    bash "$SCRIPT_DIR/scripts/check-guacd-plugins.sh" "$PREFIX/lib"
 
     # Verify FreeRDP plugins were installed (required for drive redirection + audio)
     local freerdp_plugin_dir
@@ -235,12 +261,67 @@ install_rustguac() {
 
     mkdir -p "$PREFIX"/{bin,data,recordings,static}
 
+    # A running binary cannot be overwritten -- cp fails with "Text file busy"
+    # and leaves the old one in place, after the script has already reported
+    # building the new one. That failure reads exactly like a successful
+    # upgrade that changed nothing, which is the worst shape a deploy problem
+    # can take. Stop it here and restart it at the end, but only if it was
+    # running: a first install should not be started behind the operator's
+    # back before there is an admin account.
+    WAS_RUNNING=0
+    if systemctl is-active --quiet rustguac 2>/dev/null; then
+        WAS_RUNNING=1
+        info "Stopping rustguac for the upgrade..."
+        systemctl stop rustguac
+    fi
+
     # Binary
     cp "$SCRIPT_DIR/target/release/rustguac" "$PREFIX/bin/rustguac"
     chmod 755 "$PREFIX/bin/rustguac"
 
-    # Static web assets
-    cp -r "$SCRIPT_DIR/static/"* "$PREFIX/static/"
+    # Static web assets, mirrored rather than copied over the top.
+    #
+    # An overlay copy never removes anything, so a file that leaves the repo
+    # stays served for ever. That is not only clutter: ServeDir is rooted at
+    # $PREFIX/static, so whatever is left there is reachable. A stray nested
+    # copy of the whole tree sat at $PREFIX/static/static from July until
+    # September 2026, serving two-month-old HTML and JavaScript at /static/...
+    # to anyone who asked for it, and three files from an abandoned branch
+    # outlived the branch the same way.
+    #
+    # `static/.` rather than `static/*` because the latter is one slip away
+    # from `cp -r static "$PREFIX/static/"`, which nests the tree instead of
+    # filling the directory -- which is how that copy got there.
+    #
+    # Operators are told to put their own files here too (a theme logo_url
+    # such as /acme-logo.png, see docs/configuration.md), so a blind mirror
+    # would delete them on every upgrade. Instead each install records what
+    # it put there, and the next one removes only files from that record that
+    # have since left the repo. Anything an operator added is never in the
+    # record and is left alone.
+    local manifest="$PREFIX/.static-installed-files"
+    local new_manifest
+    new_manifest="$(mktemp)"
+    (cd "$SCRIPT_DIR/static" && find . -type f | sort) > "$new_manifest"
+    if [[ -f "$manifest" ]]; then
+        comm -23 <(sort "$manifest") "$new_manifest" | while IFS= read -r stale; do
+            case "$stale" in
+                ./*) ;;
+                *) continue ;;
+            esac
+            [[ "$stale" == *..* ]] && continue
+            rm -f -- "$PREFIX/static/${stale#./}"
+            info "Removed stale static file ${stale#./}"
+        done
+    fi
+    # The nested copy described above predates any record, so name it.
+    if [[ -d "$PREFIX/static/static" && ! -e "$SCRIPT_DIR/static/static" ]]; then
+        rm -rf -- "$PREFIX/static/static"
+        info "Removed stray nested $PREFIX/static/static"
+    fi
+    cp -r "$SCRIPT_DIR/static/." "$PREFIX/static/"
+    install -m 0644 "$new_manifest" "$manifest"
+    rm -f "$new_manifest"
 
     # Default config (don't overwrite existing)
     if [[ ! -f "$PREFIX/config.toml" ]]; then
@@ -359,6 +440,21 @@ setup_drive() {
         return 0
     fi
 
+    # Only ask if there is someone there to answer. Run from a pipe, a
+    # nohup, CI or any other non-interactive context, `read` gets EOF
+    # immediately under `set -e`... or worse, waits for ever holding a
+    # terminal that no one is watching. This prompt sits *after* the binary
+    # and the assets are installed, so a hang here looks like a deploy that
+    # completed except for the service coming back -- which is exactly how it
+    # presented, repeatedly, before this guard.
+    #
+    # RUSTGUAC_DRIVE_SETUP=yes|no answers it without a terminal.
+    if [[ -z "$SETUP" && ! -t 0 ]]; then
+        SETUP="no"
+        info "Drive / File Transfer Setup skipped (not interactive)."
+        info "  Set RUSTGUAC_DRIVE_SETUP=yes to enable it from a script."
+    fi
+
     if [[ -z "$SETUP" ]]; then
         echo ""
         local AVAIL
@@ -468,6 +564,25 @@ setup_ldconfig
 install_systemd() {
     info "Installing systemd services..."
 
+    # guacd environment file. Created only if absent -- the unit files below
+    # are rewritten on every run, so anything set directly in them (or via
+    # "systemctl edit") is lost on the next install. Local settings belong
+    # here instead, and this file is never overwritten.
+    if [[ ! -f "$PREFIX/guacd.env" ]]; then
+        cat > "$PREFIX/guacd.env" <<'EOF'
+# Environment for rustguac-guacd. Preserved across reinstalls.
+# Uncomment to enable; restart rustguac-guacd after changing.
+
+# guacd log level: trace, debug, info, warning, error. H.264 passthrough logs
+# per-surface-command codec detail at trace and per-frame detail at debug.
+#GUACD_LOG_LEVEL=debug
+EOF
+        chown rustguac:rustguac "$PREFIX/guacd.env" 2>/dev/null || true
+        info "Created $PREFIX/guacd.env (edit to set guacd environment)."
+    else
+        info "Keeping existing $PREFIX/guacd.env"
+    fi
+
     # guacd service
     cat > /etc/systemd/system/rustguac-guacd.service <<EOF
 [Unit]
@@ -477,10 +592,11 @@ After=network.target
 [Service]
 Type=simple
 User=rustguac
-ExecStart=$PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L info -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem
+ExecStart=/bin/sh -c 'exec $PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L \${GUACD_LOG_LEVEL:-info} -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem'
 Restart=on-failure
 RestartSec=5
 Environment=LD_LIBRARY_PATH=$PREFIX/lib
+EnvironmentFile=-$PREFIX/guacd.env
 
 [Install]
 WantedBy=multi-user.target
@@ -506,6 +622,22 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target
 EOF
 
+    # Warn about systemd drop-ins. They merge with the unit written above and
+    # win, but live in a separate directory this script never touches, so a
+    # forgotten "systemctl edit" silently overrides everything here -- including
+    # ExecStart, which discards the log-level wrapper and any flags set above.
+    local dropin_dir="/etc/systemd/system/rustguac-guacd.service.d"
+    if compgen -G "$dropin_dir/*.conf" > /dev/null; then
+        warn "Systemd drop-in overrides exist and take precedence over the unit"
+        warn "just written. They are NOT managed by this installer:"
+        for f in "$dropin_dir"/*.conf; do
+            warn "  $f"
+            sed 's/^/      /' "$f" | while read -r line; do warn "$line"; done
+        done
+        warn "Review with: systemctl cat rustguac-guacd"
+        warn "Settings belong in $PREFIX/guacd.env instead, which persists."
+    fi
+
     systemctl daemon-reload
     systemctl enable rustguac-guacd.service
     systemctl enable rustguac.service
@@ -522,6 +654,40 @@ install_systemd
 rm -rf "$BUILD_DIR"
 
 # ---------------------------------------------------------------------------
+# Restart, if this was an upgrade of a running service
+# ---------------------------------------------------------------------------
+# guacd first, and whenever it is running. `make install` replaced its binary
+# and libraries above, but a running guacd keeps executing the old ones, and
+# restarting rustguac does not touch it: Requires= starts a stopped guacd and
+# never restarts a running one. So an upgrade otherwise rebuilt guacd and then
+# went on serving the previous build until someone restarted it by hand. Live
+# sessions are not a concern here -- they go through rustguac, which is
+# already stopped for the upgrade or was never running.
+if systemctl is-active --quiet rustguac-guacd 2>/dev/null; then
+    info "Restarting guacd..."
+    systemctl restart rustguac-guacd
+    sleep 1
+    if ! systemctl is-active --quiet rustguac-guacd; then
+        error "guacd did not come back up. Check: journalctl -u rustguac-guacd -n 50"
+        exit 1
+    fi
+fi
+
+# rustguac only when it was already running. A first install leaves it stopped
+# so that an admin account can be created before anything is reachable.
+if [[ "${WAS_RUNNING:-0}" -eq 1 ]]; then
+    info "Restarting rustguac..."
+    systemctl restart rustguac
+    sleep 2
+    if systemctl is-active --quiet rustguac; then
+        info "rustguac is running."
+    else
+        error "rustguac did not come back up. Check: journalctl -u rustguac -n 50"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo ""
@@ -533,8 +699,12 @@ info "Next steps:"
 info "  1. Create an admin:"
 info "     $PREFIX/bin/rustguac --config $PREFIX/config.toml add-admin --name admin"
 info ""
-info "  2. Start the services:"
-info "     sudo systemctl start rustguac"
+if [[ "${WAS_RUNNING:-0}" -eq 1 ]]; then
+    info "  2. Services were already running and have been restarted."
+else
+    info "  2. Start the services:"
+    info "     sudo systemctl start rustguac"
+fi
 info ""
 if [[ $NO_TLS -eq 0 ]]; then
     info "  3. Open in browser:"

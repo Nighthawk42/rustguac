@@ -133,3 +133,52 @@ path "secret/metadata/rustguac/users/*" {
 | `GET` | `/api/me/credentials` | operator+ | List own saved variables (passwords masked) |
 | `PUT` | `/api/me/credentials` | operator+ | Save/update own variables |
 | `GET` | `/api/credential-variables` | operator+ | List all variables used across accessible entries |
+
+## Folder default credentials
+
+A folder can lend credentials to entries that have none of their own, per session type. An entry created without secrets (a NetBox webhook, a bulk import) is then connectable the moment it exists, with no second pass to fill it in. Admins set them from the folder dialog in Connections ("Default credentials") or with the `/api/addressbook/folders/:scope/:folder/defaults` endpoints (see [API reference](api.md)).
+
+### Where they live
+
+Defaults are stored in Vault at `<folder>/.defaults`, beside the folder's `.config`:
+
+```
+<base_path>/shared/<folder>/.config      access settings
+<base_path>/shared/<folder>/.defaults    default credentials, keyed by session type
+```
+
+```json
+{
+  "ssh": { "username": "root", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." },
+  "web": { "password": "router-password" }
+}
+```
+
+Each type can carry `username`, `password`, `private_key` and `domain`. A type with no password or private key lends nothing (a username alone cannot authenticate). The existing connections Vault policy covers this path; no policy change is needed. `.defaults` is a reserved name, like `.config`: it is never listed as an entry and an entry cannot be called that.
+
+### How they apply
+
+At connect time, an entry with no password or private key of its own, and not set to `prompt_credentials`, takes the defaults for its session type. The entry's own `username` and `domain` win when set; otherwise the defaults' values fill them. An entry with its own secret is never touched, and an entry set to prompt still prompts. This happens on both connect paths, the Connections page (`POST .../entries/:entry/connect`) and quick-connect links (`GET /api/connect?scope=...&folder=...&entry=...`), through the same resolver, so an entry that works from the page works from a link.
+
+Entries covered by defaults list with `has_credentials: true` and `inherited_credentials: true`, and show a `[folder]` marker in Connections.
+
+A default password or username can be a credential variable such as `$tenant_password`. Defaults are applied before variables are resolved, so each user connects with their own value from My Credentials. The "credentials needed" marker in Connections only checks an entry's own fields, so it won't flag a variable that comes from a folder default.
+
+### Inheritance and the `inherit_from_parent` boundary
+
+A subfolder without its own `.defaults` uses its nearest ancestor's, per session type: the nearest folder on the path wins for each type, and a type it lacks comes from the next folder up.
+
+A parent's defaults reach a subfolder only when exactly the parent's audience can open it: the subfolder's `.config` has `inherit_from_parent: true` and grants no `allowed_groups` or `allowed_users` of its own. The walk up the tree stops at any other folder:
+
+- A folder with `inherit_from_parent: false` is isolated for access (see [Roles and access control](roles-and-access-control.md#inheritance)), so its parent's defaults do not flow into it.
+- A folder that inherits but also grants groups or users of its own admits people the parent doesn't (access is the union of both), so its parent's defaults do not flow into it either. Otherwise a contractor added to `corp/partner` through `allowed_users` could connect with `corp`'s key.
+
+The folder where the walk stops still applies its own `.defaults` to its entries and to subfolders that share its audience. A folder with no `.config`, or one written before the flag existed, counts as not inheriting, exactly as the access check treats it.
+
+### Migration between Vaults
+
+`rustguac vault-migrate` copies each folder's `.defaults` alongside its `.config`, so a DR split keeps the defaults; the dry run lists them as `[defaults] <folder>`. Deleting a folder removes its `.defaults` with it.
+
+### Web entries: the password is visible to the user
+
+A **web** entry with a default password has that password typed into the page by the login autofill, the same as a web entry with its own stored password. The user can read it from the page (a show-password toggle, the browser's developer tools, a form that echoes it). Treat a web default as shared with everyone who can connect through that folder, and prefer per-entry or per-user credentials (`$variables`) where the password must stay secret. SSH, RDP and VNC defaults are passed to guacd and never reach the browser.

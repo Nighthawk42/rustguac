@@ -2,7 +2,6 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>rustguac - Connections</title>
     <link rel="stylesheet" href="/rustguac.css">
     <style>
@@ -18,7 +17,7 @@
             border-right: 1px solid var(--border);
             padding-right: var(--s-4);
         }
-        .main { flex: 1; min-width: 0; }
+        .main { flex: 1; min-width: 0; padding: 0 var(--s-5); }
 
         /* Compact "open in new window" companion to the Connect button — a small
            icon, not a full-size button */
@@ -39,8 +38,8 @@
             border-bottom: 1px solid var(--border);
         }
         .sidebar-header strong {
-            flex: 1; font-weight: 600;
-            font-size: var(--fz-sm); color: var(--text-muted);
+            flex: 1; text-transform: uppercase; letter-spacing: 0.14em;
+            font-size: var(--fz-sm); color: var(--text-muted); font-weight: normal;
         }
 
         /* Folder tree */
@@ -67,7 +66,6 @@
         }
         .tree-chevron:hover { color: var(--primary); background: var(--input); }
         .tree-chevron.expanded { color: var(--primary); }
-        .tree-chevron.leaf { visibility: hidden; cursor: default; }
         .tree-children {
             padding-left: var(--s-4) !important;
             margin-left: 15px !important;
@@ -109,7 +107,8 @@
             vertical-align: middle;
         }
         .entries-table th {
-            color: var(--text-muted); font-size: var(--fz-xs); font-weight: 600;
+            color: var(--text-muted); font-size: var(--fz-sm); font-weight: normal;
+            text-transform: uppercase; letter-spacing: 0.12em;
             background: var(--surface); line-height: 1.6;
         }
         .entries-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
@@ -117,20 +116,108 @@
         .entries-table tbody tr:last-child td { border-bottom: none; }
         .entries-table td:last-child { text-align: right; white-space: nowrap; }
 
+        .entries-table .actions-cell { white-space: nowrap; text-align: right; }
+        /* Long names wrap inside their cell instead of widening the table past
+           the page: a dotted FQDN like db01.prod.example.internal has no
+           natural break point, so at any width a long enough one overran it
+           whatever the padding (#252). Buttons stay on one line. */
+        .entries-table td { overflow-wrap: anywhere; }
+        .entries-table td.connect-cell, .entries-table td.actions-cell { overflow-wrap: normal; }
+        .entries-table .actions-cell .btn-small { margin-left: var(--s-1); }
+
+        /* Bulk selection (admins). */
+        .entries-table .sel-cell { width: 2em; text-align: center; padding-right: 0; }
+        .entries-table .sel-cell input { width: auto; margin: 0; cursor: pointer; }
+        .entries-table tbody tr.selected { background: var(--surface); }
+        #bulk-bar {
+            position: sticky; bottom: 0; z-index: 2;
+            display: none; align-items: center; gap: var(--s-2);
+            margin-top: var(--s-2); padding: var(--s-2) var(--s-3);
+            background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+        }
+        #bulk-bar.active { display: flex; }
+        #bulk-bar .bulk-count { font-weight: bold; margin-right: auto; }
+        .bulk-folder-list {
+            max-height: 40vh; overflow-y: auto; margin-top: var(--s-1);
+            border: 1px solid var(--border); border-radius: var(--radius);
+        }
+        .bulk-folder-list label {
+            display: flex; align-items: center; gap: 0.5em; margin: 0;
+            padding: 0.3em 0.6em; cursor: pointer; text-transform: none; letter-spacing: 0;
+        }
+        .bulk-folder-list label:hover { background: var(--surface); }
+        .bulk-folder-list input { width: auto; margin: 0; }
+        .bulk-folder-list .scope-tag { margin-left: auto; color: var(--text-dim); font-size: var(--fz-sm); }
+        .bulk-folder-list .bulk-current { color: var(--text-dim); }
+        .bulk-preview { margin-top: var(--s-3); font-size: var(--fz-sm); line-height: 1.5; }
+        .bulk-preview .bulk-warn { color: var(--status-pending); }
+        .bulk-conflict label { display: flex; align-items: center; gap: 0.5em; text-transform: none; letter-spacing: 0; cursor: pointer; }
+        .bulk-conflict input { width: auto; margin: 0; }
+        .bulk-results ul { margin: var(--s-2) 0 0 0; padding-left: 1.2em; font-size: var(--fz-sm); max-height: 30vh; overflow-y: auto; }
+        .bulk-results .bulk-bad { color: var(--primary); }
+        #bulk-confirm.bulk-danger { color: var(--status-error); border-color: var(--status-error); }
+        #bulk-confirm.bulk-danger:hover:not(:disabled) { color: var(--bg); background: var(--status-error); }
+
         /* Folder action bar */
         .folder-actions {
-            display: flex; align-items: center; gap: var(--s-2);
-            margin-bottom: var(--s-4); padding-bottom: var(--s-3);
+            display: flex; align-items: flex-start; gap: var(--s-3);
+            padding-bottom: var(--s-2);
             border-bottom: 1px solid var(--border);
             flex-wrap: wrap;
         }
         .folder-actions strong {
             font-size: var(--fz-xl); color: var(--text);
-            font-weight: bold; letter-spacing: 0.02em; line-height: 1.3;
+            font-weight: bold; letter-spacing: 0.02em; line-height: 1.2;
         }
+        .folder-actions-btns {
+            display: flex; align-items: center; gap: var(--s-2);
+            flex-wrap: wrap; flex-shrink: 0; margin-left: auto;
+        }
+        .entries-heading {
+            flex: 1 1 auto; min-width: 0;
+            display: flex; flex-direction: column; gap: 2px;
+        }
+        .entries-title-row {
+            display: flex; align-items: baseline; gap: var(--s-3);
+            flex-wrap: wrap; min-width: 0;
+        }
+        .entries-key { color: var(--text-dim); font-size: var(--fz-xs); letter-spacing: 0.04em; }
+        .entries-key:empty { display: none; }
+        .folder-desc.folder-key { letter-spacing: 0.04em; }
         .folder-actions .desc {
-            color: var(--text-muted); font-size: var(--fz-md); font-style: italic;
+            color: var(--text-muted); font-size: var(--fz-sm); font-style: italic; min-width: 0;
         }
+
+        /* Narrow desktops (a 1710px-wide MacBook display, 1600px monitors):
+           the 18px monospace table plus three padded action cells overran
+           the main column by ~300px, with "delete" cut off at the right.
+           Tighten the chrome rather than hide columns: smaller side
+           padding and sidebar, 16px cells with less padding, a narrower
+           Connect button. Everything then fits with ~250px to spare. */
+        @media (max-width: 1800px) {
+            /* page padding at this width lives in rustguac.css, shared by
+               every page, so switching tabs does not shift the gutter */
+            .layout { gap: var(--s-4); }
+            .sidebar { min-width: 240px; max-width: 280px; padding-right: var(--s-3); }
+            .entries-table th, .entries-table td {
+                padding: var(--s-2) var(--s-3);
+                font-size: var(--fz-sm);
+            }
+            .entries-table th { font-size: var(--fz-xs); letter-spacing: 0.08em; }
+            .btn-connect { min-width: 110px; padding: 0 var(--s-3); }
+            .btn-connect-win { min-width: 0; padding: 0 var(--s-1); }
+            .folder-actions strong { font-size: var(--fz-lg); }
+            .folder-actions .desc { font-size: var(--fz-sm); }
+        }
+        /* Folder modal: default credentials */
+        .fm-defaults { margin: var(--s-3) 0; border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s-2) var(--s-3); }
+        .fm-defaults summary { cursor: pointer; color: var(--text); font-size: var(--fz-md); }
+        .fm-defaults-table { width: 100%; border-collapse: collapse; margin-top: var(--s-2); }
+        .fm-defaults-table th { text-align: left; font-weight: normal; color: var(--text-muted); font-size: var(--fz-sm); padding: var(--s-1) var(--s-2) var(--s-1) 0; width: 3em; vertical-align: top; }
+        .fm-defaults-table td { padding: var(--s-1); vertical-align: top; }
+        .fm-defaults-table input, .fm-defaults-table textarea { width: 100%; margin: 0; font-size: var(--fz-sm); }
+        .fm-defaults-table textarea { min-height: var(--ctl-sm); resize: vertical; }
+        .fmd-clear-label { display: flex; align-items: center; gap: var(--s-1); font-size: var(--fz-xs); color: var(--text-dim); white-space: nowrap; padding-top: var(--s-2); }
 
         /* Active sessions strip */
         .active-sessions { margin-bottom: var(--s-5); }
@@ -153,8 +240,6 @@
             display: flex; gap: var(--s-1); align-items: center;
         }
         .session-card-info .card-meta .type-badge { font-size: 10px; min-width: 36px; }
-        /* Proxmox VE brand orange badge */
-        .type-badge.type-proxmox { background: #e57000; color: #000; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
         .session-card.dormant { opacity: 0.75; }
         .session-card.dormant .session-card-thumb { filter: brightness(0.7); }
         .card-actions {
@@ -315,9 +400,243 @@
             padding: 1px var(--s-1); font-size: 0.85em; color: var(--text);
         }
         .onboard-hl { color: var(--accent); font-weight: bold; }
+
+        /* UX (#254) layout: sidebar scroll, indent, density */
+        /* Sidebar is sticky and scrolls on its own so a long folder tree never
+           drags the entries table off screen; .main keeps scrolling with the page. */
+        .sidebar {
+            position: sticky; top: var(--s-3);
+            align-self: flex-start;
+            max-height: calc(100vh - var(--s-3) * 2);
+            overflow-y: auto; overflow-x: hidden;
+            overscroll-behavior: contain;
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }
+        .sidebar::-webkit-scrollbar { width: 6px; }
+        .sidebar::-webkit-scrollbar-track { background: transparent; }
+        .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        /* Header + tools slot pinned at the top of the sidebar while the list scrolls */
+        .sidebar-pin {
+            position: sticky; top: 0; z-index: 2;
+            display: flex; flex-direction: column;
+            background: var(--bg);
+        }
+        .sidebar-pin .sidebar-header { margin-bottom: var(--s-2); }
+        #sidebar-tools:not(:empty) { padding-bottom: var(--s-2); }
+
+        /* Rows start flush with the sidebar edge: the 3px accent bar is the only
+           thing before the content. A chevron is rendered only for folders with
+           children, so leaves carry no dead indent. */
+        .folder-row {
+            gap: var(--s-1);
+            padding: var(--s-1) var(--s-2) var(--s-1) var(--s-2);
+            min-height: 40px;
+            font-size: var(--fz-sm);
+            color: var(--text-muted);
+            transition: background .1s, color .1s;
+        }
+        .folder-list li:hover > .folder-row { color: var(--text); }
+        .folder-list li.selected > .folder-row { color: var(--text); }
+        .folder-list li.selected > .folder-row .folder-name { color: var(--text); font-weight: bold; }
+        .tree-chevron {
+            width: 22px; height: 28px; margin-left: -2px;
+            font-size: 13px;
+        }
+        .tree-children {
+            padding-left: 0 !important;
+            margin-left: 14px !important;
+            margin-top: 1px;
+        }
+        .folder-row-main { gap: 0; line-height: 1.3; }
+        .folder-name-row { gap: var(--s-2); }
+        .folder-name-row > .folder-name { font-size: var(--fz-sm); }
+        .folder-count {
+            flex-shrink: 0;
+            min-width: 1.6em; padding: 0 var(--s-1);
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--text-muted);
+            font-size: var(--fz-xs); line-height: 1.5;
+            text-align: center; letter-spacing: 0;
+            transition: background .1s, color .1s;
+        }
+        .folder-count::before { content: none; }
+        .folder-count[data-count="0"] { color: var(--text-dim); background: transparent; box-shadow: inset 0 0 0 1px var(--border); }
+        .folder-list li.selected > .folder-row .folder-count { background: var(--bg); color: var(--text); }
+        .folder-row .folder-scope {
+            width: 16px; height: 16px;
+            font-size: 16px;
+            color: var(--text-dim);
+        }
+        .folder-list li:hover > .folder-row .folder-scope,
+        .folder-list li.selected > .folder-row .folder-scope { color: var(--accent); }
+        .folder-desc { line-height: 1.25; }
+
+        /* UX (#254) selection feedback: jump to top, change animation, skeleton */
+        /* Title slides in from the left and the action bar's bottom border
+           flashes accent when the selected folder changes. The .changed class
+           is added by announceFolderShown() and removed on animationend so
+           it can replay on the next selection. */
+        #entries-header.changed #entries-title {
+            animation: rg-title-in 350ms ease-out both;
+        }
+        #entries-header.changed .folder-actions {
+            animation: rg-header-flash 700ms ease-out both;
+        }
+        @keyframes rg-title-in {
+            from { opacity: 0; transform: translateX(-4px); }
+            to   { opacity: 1; transform: none; }
+        }
+        @keyframes rg-header-flash {
+            0%   { border-bottom-color: var(--accent); }
+            60%  { border-bottom-color: var(--accent); }
+            100% { border-bottom-color: var(--border); }
+        }
+        /* Skeleton: a real .entries-table so column padding, header height and
+           the 38px Connect-button row height are identical to the loaded
+           table; only the cells are replaced by shimmering bars. */
+        .entries-table.skeleton tbody tr:hover { background: inherit; }
+        .sk-bar {
+            display: inline-block; vertical-align: middle;
+            height: 1em; width: 60%; max-width: 100%;
+            border-radius: var(--radius);
+            background: var(--surface)
+                linear-gradient(90deg, transparent 0%, var(--input) 50%, transparent 100%)
+                no-repeat;
+            background-size: 45% 100%;
+            animation: rg-shimmer 1.2s ease-in-out infinite;
+        }
+        .sk-bar.sk-btn { height: var(--ctl-sm); width: 130px; }
+        .sk-bar.sk-badge { height: 1.4em; width: 3.2em; }
+        .sk-bar.sk-check { height: 16px; width: 16px; }
+        .entries-table.skeleton tbody tr:nth-child(2) td > .sk-bar:only-child:not([class*=" sk-"]) { width: 72%; }
+        .entries-table.skeleton tbody tr:nth-child(3) td > .sk-bar:only-child:not([class*=" sk-"]) { width: 48%; }
+        .entries-table.skeleton tbody tr:nth-child(4) td > .sk-bar:only-child:not([class*=" sk-"]) { width: 66%; }
+        @keyframes rg-shimmer {
+            from { background-position: -100% 0; }
+            to   { background-position: 250% 0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            #entries-header.changed #entries-title,
+            #entries-header.changed .folder-actions,
+            .sk-bar { animation: none; }
+            /* Still mark the change without motion: a static accent border
+               while .changed is on (flashEntriesHeader clears it by timer). */
+            #entries-header.changed .folder-actions { border-bottom-color: var(--accent); }
+        }
+
+        /* UX (#254) filter + keyboard */
+        #sidebar-tools { margin-bottom: var(--s-3); }
+        #sidebar-tools:empty { display: none; }
+        .folder-filter-wrap { position: relative; display: flex; align-items: center; }
+        #folder-filter {
+            flex: 1 1 auto; width: 100%; min-width: 0;
+            height: var(--ctl-sm); padding: 0 var(--s-2);
+            font-family: monospace; font-size: var(--fz-sm);
+        }
+        /* Native clear glyph is replaced by #folder-filter-clear (Firefox has none) */
+        #folder-filter::-webkit-search-cancel-button { -webkit-appearance: none; display: none; }
+        #folder-filter-count {
+            position: absolute; right: calc(var(--s-1) + 26px); top: 50%; transform: translateY(-50%);
+            font-size: var(--fz-xs); color: var(--text-dim); white-space: nowrap;
+            pointer-events: none; letter-spacing: 0.02em;
+        }
+        #folder-filter-count.no-match { color: var(--primary); }
+        #folder-filter-clear {
+            position: absolute; right: var(--s-1); top: 50%; transform: translateY(-50%);
+            width: 24px; height: 24px; padding: 0; margin: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: transparent; border: 0; border-radius: var(--radius);
+            color: var(--text-muted); font-family: monospace; font-size: var(--fz-md); line-height: 1;
+            cursor: pointer;
+        }
+        #folder-filter-clear:hover { color: var(--primary); background: var(--input); }
+        .folder-filter-wrap:not(.filtering) #folder-filter-count,
+        .folder-filter-wrap:not(.filtering) #folder-filter-clear { display: none; }
+        .folder-list li.filtered-out { display: none; }
+        .folder-row:focus { outline: none; }
+        .folder-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+        /* UX (#254) app shell: the header stays put, the sidebar and the
+           entries area are two independent scroll panes that always fit the
+           viewport. The earlier sticky sidebar was sized from the viewport,
+           not from where it starts below the header, so at the top of the
+           page its bottom hung off screen and the page had to be scrolled
+           before the list could be scrolled to its end. */
+        html, body { height: 100%; }
+        /* overflow: clip, not hidden: hidden still lets scripts scroll the
+           body (scrollIntoView on anything inside), which moved the header
+           out of view; clip makes the body unscrollable for good. The border
+           box is the full height so the page padding is inside the viewport. */
+        body { display: flex; flex-direction: column; overflow: clip; min-height: 0; box-sizing: border-box; }
+        #main-content { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+        #main-content > :not(.layout) { flex: none; }
+        .layout { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+        .sidebar {
+            position: static; top: auto; align-self: auto;
+            max-height: none; height: auto; min-height: 0;
+            display: flex; flex-direction: column;
+            overflow-y: auto; overflow-x: hidden;
+            padding: 0; margin: 0;
+            border: 1px solid var(--border); border-radius: var(--radius);
+            background: rgba(255,255,255,0.015);
+        }
+        .main { min-height: 0; overflow-y: auto; overflow-x: hidden; padding-left: var(--s-5); padding-right: var(--s-5); }
+        /* The folder header (name, description, search, actions, filters)
+           pins to the top of the entries pane, so it stays under the nav and
+           the active-sessions strip while a long table scrolls beneath it. */
+        #entries-header {
+            position: sticky; top: 0; z-index: 30;
+            background: var(--bg);
+            padding: var(--s-3) var(--s-4) var(--s-2);
+            margin-bottom: var(--s-3);
+            box-shadow: 0 6px 10px -8px rgba(0, 0, 0, 0.6);
+        }
+        #entries-header .folder-actions { margin: 0; }
+        .entries-toolbar {
+            display: flex; align-items: center; gap: var(--s-3);
+            flex-wrap: wrap; margin-top: var(--s-2);
+        }
+        .entries-toolbar #entries-filters { margin: 0; }
+        .entries-toolbar .folder-actions-btns { margin-left: auto; }
+        #entries-header .list-tools { margin-bottom: 0; }
+
+        /* Sidebar panel: one pinned header band (label, new-folder button,
+           filter) on a surface tone, then the list with hairline dividers.
+           Every band shares the same 12px horizontal padding so edges line up. */
+        .sidebar-pin {
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: var(--s-2) var(--s-3);
+            gap: var(--s-2);
+        }
+        .sidebar-pin .sidebar-header {
+            margin: 0; padding: 0; border: 0;
+            min-height: 30px;
+            justify-content: space-between;
+        }
+        .sidebar-pin .sidebar-header strong { font-size: var(--fz-xs); letter-spacing: 0.14em; }
+        #btn-new-folder { height: 30px; padding: 0 var(--s-2); font-size: var(--fz-xs); }
+        #sidebar-tools { margin: 0; }
+        #sidebar-tools:not(:empty) { padding-bottom: 0; }
+        #folder-filter {
+            height: 34px; font-size: var(--fz-sm);
+            background: var(--bg); border: 1px solid var(--border);
+        }
+        .folder-list { padding: var(--s-1) 0 var(--s-2); }
+        .folder-list > li { margin: 0; }
+        .folder-list > li + li > .folder-row { border-top: 1px solid rgba(255,255,255,0.045); }
+        .folder-row {
+            padding: var(--s-2) var(--s-3) var(--s-2) calc(var(--s-3) - 3px);
+            min-height: 46px;
+        }
+        .folder-list li.selected > .folder-row { border-top-color: transparent; }
+        .folder-row-main { gap: 2px; }
+        .folder-desc { font-size: 12px; }
+        .tree-children { margin-left: var(--s-3) !important; }
     </style>
     <script>(function(){var c=localStorage.getItem('rustguac_theme_colors');if(c){try{var o=JSON.parse(c),r=document.documentElement.style;for(var k in o)r.setProperty('--'+k.replace(/_/g,'-'),o[k]);if(o.bg_pattern&&o.bg_pattern!=='none'){var s=document.createElement('style');s.id='bg-pattern-style';s.textContent='body{background-image:'+o.bg_pattern+';background-attachment:fixed}';document.head.appendChild(s)}}catch(e){}}})();</script>
-    <script src="/theme-switcher.js"></script>
 </head>
 <body>
     <div class="brand-row">
@@ -326,16 +645,20 @@
     </div>
     <nav>
         <a href="/connections.html" class="active">Connections</a>
-        <a href="/sessions.html" id="sessions-link">Sessions</a>
+        <a href="/sessions.html" id="sessions-link" data-min-role="poweruser">Sessions</a>
         <a href="/recordings.html">Recordings</a>
-        <a href="/reports.html" id="reports-link" style="display:none">Reports</a>
+        <a href="/reports.html" id="reports-link" data-min-role="poweruser">Reports</a>
         <a href="/docs.html">Docs</a>
-        <a href="/tokens.html" id="tokens-link" style="display:none">Tokens</a>
-        <a href="/admin.html" id="admin-link" style="display:none">Admin</a>
-        <a href="#" id="my-creds-nav" title="Manage your saved credential variables">&#128273; Credentials</a>
-        <span id="user-menu-wrapper"><div id="theme-switcher"></div><span id="user-menu-btn" title="Preferences">&#9881; Settings</span><a href="#" id="logout-item">Logout</a></span>
+        <a href="/tokens.html" id="tokens-link" data-min-role="operator">Tokens</a>
+        <a href="/admin.html" id="admin-link" data-min-role="admin">Admin</a>
+        <a href="#" id="my-creds-nav" title="Manage your saved credential variables"><span class="nav-key">&#128273;</span> Credentials</a>
+        <span id="user-menu-wrapper">
+            <a href="#" id="logout-item">Logout</a>
+            <span id="user-menu-btn" title="Preferences">&#9881; Settings</span>
             <div id="user-menu">
-                
+                <div class="um-section-label">Theme</div>
+                <div id="um-theme-list"></div>
+                <div class="um-divider"></div>
                 <div class="um-item" id="my-creds-item">&#128273; My Credentials</div>
                 <div class="um-item" id="show-tour-item">&#9432; Welcome Tour</div>
             </div>
@@ -377,31 +700,52 @@
         </div>
         <div class="layout">
             <div class="sidebar">
-                <div class="sidebar-header">
-                    <strong>Folders</strong>
-                    <button class="btn-add admin-only" id="btn-new-folder" style="display:none" title="Create new folder">+ folder</button>
+                <div class="sidebar-pin">
+                    <div class="sidebar-header">
+                        <strong>Folders</strong>
+                        <button class="btn-add admin-only" id="btn-new-folder" style="display:none" title="Create new folder">+ folder</button>
+                    </div>
+                    <!-- Slot for sidebar tools (folder filter box etc.); stays pinned with the header -->
+                    <div id="sidebar-tools"></div>
                 </div>
                 <ul class="folder-list" id="folder-list"></ul>
             </div>
             <div class="main">
                 <div id="entries-header" style="display:none">
                     <div class="folder-actions">
-                        <strong id="entries-title"></strong>
-                        <span id="entries-desc" class="desc"></span>
-                        <input type="search" id="connections-search" class="connections-search" placeholder="Search connections..." autocomplete="off" disabled />
-                        <button class="btn-add admin-only" id="btn-new-entry" style="display:none">+ add entry</button>
-                        <button class="btn-add admin-only" id="btn-new-subfolder" style="display:none" title="Create subfolder under this folder">+ subfolder</button>
-                        <button class="btn-small admin-only" id="btn-edit-folder" style="display:none" title="Edit folder settings">edit folder</button>
-                        <button class="btn-small admin-only" id="btn-delete-folder" style="display:none" title="Delete folder and all entries">delete folder</button>
+                        <div class="entries-heading">
+                            <div class="entries-title-row">
+                                <strong id="entries-title"></strong>
+                                <span id="entries-desc" class="desc"></span>
+                            </div>
+                            <span id="entries-key" class="entries-key"></span>
+                        </div>
+                    </div>
+                    <div class="entries-toolbar">
+                        <div id="entries-filters" class="list-tools"></div>
+                        <div class="folder-actions-btns">
+                            <button class="btn-add admin-only" id="btn-new-entry" style="display:none">+ add entry</button>
+                            <button class="btn-add admin-only" id="btn-new-subfolder" style="display:none" title="Create subfolder under this folder">+ subfolder</button>
+                            <button class="btn-small admin-only" id="btn-edit-folder" style="display:none" title="Edit folder settings">edit folder</button>
+                            <button class="btn-small admin-only" id="btn-delete-folder" style="display:none" title="Delete folder and all entries">delete folder</button>
+                        </div>
                     </div>
                 </div>
                 <div id="entries-content">
                     <p class="empty">Select a folder to view entries.</p>
                 </div>
+                <div id="bulk-bar">
+                    <span class="bulk-count" id="bulk-count"></span>
+                    <button class="btn-add" id="bulk-move">Move to&hellip;</button>
+                    <button class="btn-add" id="bulk-copy">Copy to&hellip;</button>
+                    <button class="btn-small" id="bulk-delete">Delete</button>
+                    <button class="btn-small" id="bulk-clear">Clear</button>
+                </div>
             </div>
         </div>
     </div>
 
+    <!-- Search results overlay: floats over an untouched folder view -->
     <!-- Folder create/edit modal -->
     <div class="modal-overlay" id="folder-modal">
         <div class="modal">
@@ -410,6 +754,9 @@
                 <input type="text" id="fm-name" placeholder="e.g. infra-servers" pattern="[a-zA-Z0-9_.-]+" maxlength="64">
             </label>
             <div class="field-hint">Alphanumeric, hyphens, underscores, dots only.</div>
+            <label>Display name <span class="hint">(optional: shown as the title, with the name beneath)</span>
+                <input type="text" id="fm-display" placeholder="e.g. Dani &amp; Fiori's Gourmet Pizzeria" maxlength="120">
+            </label>
             <label>Description
                 <input type="text" id="fm-desc" placeholder="e.g. Infrastructure servers">
             </label>
@@ -424,12 +771,22 @@
                     <button type="button" class="btn-add" id="fm-groups-add">Add</button>
                 </div>
             </div>
-            <div class="field-hint">OIDC groups that can see this folder. Leave empty for admin-only access. Type to filter known groups or enter a custom one; Enter or Add to attach; &times; on a chip to remove.</div>
+            <div class="field-hint">OIDC groups that can see this folder. Type to filter known groups or enter a custom one; Enter or Add to attach; &times; on a chip to remove.</div>
+            <label for="fm-users">Allowed users</label>
+            <textarea id="fm-users" rows="3" placeholder="jsmith@example.com" spellcheck="false" autocomplete="off"></textarea>
+            <div class="field-hint">Individual users who can see this folder, by login email, one per line. They don't need to have logged in yet. Leave both lists empty for admin-only access.</div>
             <label style="display:flex;align-items:center;gap:0.5em;cursor:pointer">
                 <input type="checkbox" id="fm-inherit" style="width:auto">
                 Inherit permissions from parent folder
             </label>
             <div class="field-hint">When ticked, if this folder's own groups list doesn't grant a user access, the check walks up to the parent (and further ancestors if they also inherit). Uncheck to enforce this folder's groups list on its own. Top-level folders have no parent so this has no effect.</div>
+            <details class="fm-defaults" id="fm-defaults">
+                <summary>Default credentials</summary>
+                <div class="field-hint">Lent to entries in this folder that have no password or key of their own, per session type, so an entry created without secrets (a NetBox webhook, an import) connects straight away. An entry's own credentials always win; subfolders inherit per type, but only those that inherit permissions from this folder and share it with nobody extra. A web entry's default password is typed into the page, where the user can read it. Secrets are write-only: leave a field blank to keep what is stored, tick clear to drop a type.</div>
+                <table class="fm-defaults-table">
+                    <tbody id="fm-defaults-rows"></tbody>
+                </table>
+            </details>
             <label>Scope
                 <select id="fm-scope">
                     <option value="shared">shared (all instances)</option>
@@ -482,6 +839,10 @@
                 <label>Private key (PEM)
                     <textarea id="em-private-key" rows="3" style="resize:vertical;font-size:0.85em" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
                 </label>
+                <label>Terminal font size <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                    <input type="number" id="em-ssh-font-size" min="6" max="72" placeholder="12">
+                </label>
+                <div class="field-hint">Points. Leave blank for the default (12). Increase or decrease to tune readability — the terminal size no longer scales with display DPI.</div>
                 <label style="margin-top:0.8em">
                     <input type="checkbox" id="em-ssh-prompt-creds" style="display:inline;width:auto;margin-right:0.4em"> Prompt for credentials at connect time
                 </label>
@@ -562,6 +923,9 @@
                 <label>Port
                     <input type="number" id="em-vnc-port" value="5900">
                 </label>
+                <label>Username <span style="color:var(--text-muted);font-size:0.85em">(optional, for VeNCrypt / RealVNC / macOS)</span>
+                    <input type="text" id="em-vnc-username">
+                </label>
                 <label>Password
                     <div class="pw-wrap"><input type="password" id="em-vnc-password"><button type="button" class="pw-toggle" onclick="togglePw(this)" title="Show/hide">&#9679;</button></div>
                 </label>
@@ -577,7 +941,7 @@
                 <label style="margin-top:0.8em">
                     <input type="checkbox" id="em-vnc-prompt-creds" style="display:inline;width:auto;margin-right:0.4em"> Prompt for credentials at connect time
                 </label>
-                <div class="field-hint">When enabled, users will be asked for a password even if one is stored.</div>
+                <div class="field-hint">When enabled, users will be asked for credentials even if they are stored.</div>
             </div>
             <div id="em-spice-fields" style="display:none">
                 <label>Hostname
@@ -840,6 +1204,31 @@
                     <button type="button" class="btn-add" id="em-add-hop" style="margin-top:8px">+ Add Jump Host</button>
                 </div>
             </div>
+            <div id="em-wol-section" style="display:none;margin-top:1em;padding-top:0.8em;border-top:1px solid var(--border)">
+                <label style="cursor:pointer;color:var(--accent);font-size:0.95em" id="em-wol-toggle">
+                    <span id="em-wol-arrow">&#9654;</span> Wake-on-LAN
+                </label>
+                <div id="em-wol-fields" style="display:none">
+                    <div class="field-hint" style="margin-bottom:0.5em">Send a Wake-on-LAN magic packet to power on the target before connecting. The host's NIC must have WoL enabled, and the packet must be able to reach its subnet.</div>
+                    <label style="text-transform:none;letter-spacing:0;cursor:pointer">
+                        <input type="checkbox" id="em-wol-enabled" style="display:inline;width:auto;margin-right:0.5em">
+                        Send magic packet before connecting
+                    </label>
+                    <label>MAC address
+                        <input type="text" id="em-wol-mac" placeholder="00:11:22:33:44:55">
+                    </label>
+                    <label>Broadcast address <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="text" id="em-wol-broadcast" placeholder="255.255.255.255">
+                    </label>
+                    <label>UDP port <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="number" id="em-wol-port" placeholder="9">
+                    </label>
+                    <label>Wait time (seconds) <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="number" id="em-wol-wait" placeholder="0">
+                    </label>
+                    <div class="field-hint">Seconds to wait after sending the packet before connecting, giving the host time to boot.</div>
+                </div>
+            </div>
             <div id="em-sharing-section" style="margin-top:1em;padding-top:0.8em;border-top:1px solid var(--border)">
                 <label style="text-transform:none;letter-spacing:0;cursor:pointer">
                     <input type="checkbox" id="em-allow-sharing" style="display:inline;width:auto;margin-right:0.5em">
@@ -911,6 +1300,29 @@
     </div>
 
     <!-- Share session modal -->
+    <!-- Bulk move / copy / delete -->
+    <div class="modal-overlay" id="bulk-modal">
+        <div class="modal" style="max-width:560px;min-width:380px">
+            <h3 id="bulk-title"></h3>
+            <div id="bulk-pick">
+                <label for="bulk-folder-filter">Target folder</label>
+                <input type="search" id="bulk-folder-filter" placeholder="Filter folders..." autocomplete="off">
+                <div class="bulk-folder-list" id="bulk-folder-list"></div>
+            </div>
+            <div class="bulk-preview" id="bulk-preview"></div>
+            <div class="bulk-conflict" id="bulk-conflict" style="display:none;margin-top:var(--s-2)">
+                <label><input type="radio" name="bulk-conflict" value="skip" checked> Leave those where they are</label>
+                <label><input type="radio" name="bulk-conflict" value="rename"> Give them a new name (name-2, name-3, ...)</label>
+            </div>
+            <div class="bulk-results" id="bulk-results" style="display:none"></div>
+            <div id="bulk-error" style="color:var(--primary);margin-top:0.5em"></div>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="bulk-cancel">Cancel</button>
+                <button class="btn-add" id="bulk-confirm" disabled></button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="share-modal">
         <div class="modal">
             <h3>Share Session</h3>
@@ -939,9 +1351,10 @@
 
     <!-- Onboarding wizard -->
     <div class="modal-overlay" id="onboarding-modal">
-        <div class="modal" style="max-width:520px;min-width:380px">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.3em">
-                <h3 id="onboard-title" style="margin:0"></h3>
+        <div class="modal" style="max-width:520px;min-width:380px;position:relative">
+            <button id="onboard-close" title="Skip the tour" style="position:absolute;top:0.4em;right:0.5em;background:none;border:none;color:var(--text-dim);font-size:1.7em;line-height:1;cursor:pointer;font-family:monospace;padding:0 0.2em;z-index:1">&times;</button>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.3em;gap:0.6em;padding-right:1.6em">
+                <h3 id="onboard-title" style="margin:0;flex:1"></h3>
                 <span id="onboard-step-indicator" style="color:var(--text-dim);font-size:0.85em"></span>
             </div>
             <div id="onboard-body" style="color:var(--text);font-size:0.92em;line-height:1.65;min-height:80px"></div>
@@ -981,19 +1394,14 @@
         </div>
     </div>
 
-    <script>
+<script src="/filters.js"></script>
+        <script>
         function togglePw(btn){var inp=btn.previousElementSibling;if(inp.type==='password'){inp.type='text';btn.textContent='\u25CB'}else{inp.type='password';btn.textContent='\u25CF'}}
         function applyThemeColors(colors){var r=document.documentElement.style;for(var k in colors)r.setProperty('--'+k.replace(/_/g,'-'),colors[k]);var s=document.getElementById('bg-pattern-style');if(!s){s=document.createElement('style');s.id='bg-pattern-style';document.head.appendChild(s)}s.textContent=colors.bg_pattern&&colors.bg_pattern!=='none'?'body{background-image:'+colors.bg_pattern+';background-attachment:fixed}':'';localStorage.setItem('rustguac_theme_colors',JSON.stringify(colors))}
         var _themePresets={},_adminPreset='aurora';
         var _themeDescriptions={dark:'Navy & cyan \u2014 the default',light:'Clean white & blue','high-contrast':'Maximum readability',terminal:'Retro green-on-black',nord:'Arctic, muted blues',corporate:'Slate & steel blue',aurora:'Midnight blue with ambient glow',jaguar:'Racing green & gold'};
-        function initTheme(t){
-    if(t && t.logo_url){
-        var l = document.getElementById('site-logo');
-        if(l){ if(l.src !== t.logo_url && !l.src.endsWith(t.logo_url)) l.src = t.logo_url; l.style.display = ''; }
-    }
-    if(window.renderThemeSwitcher) window.renderThemeSwitcher('theme-switcher');
-}
-        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();if(window.openSettingsModal)window.openSettingsModal();});
+        function initTheme(t){if(!t)return;_themePresets=t.presets||{};_adminPreset=t.admin_preset||'aurora';var u=localStorage.getItem('rustguac_theme'),active=u&&_themePresets[u]?u:_adminPreset,colors=(active===_adminPreset)?t.admin_colors:_themePresets[active];if(colors)applyThemeColors(colors);if(t.logo_url){var l=document.getElementById('site-logo');if(l){if(l.src!==t.logo_url&&!l.src.endsWith(t.logo_url))l.src=t.logo_url;l.style.display=''}}var menu=document.getElementById('um-theme-list');if(menu){menu.innerHTML='';Object.keys(_themePresets).forEach(function(name){var item=document.createElement('div');item.className='um-item'+(name===active?' active':'');var sw=document.createElement('span');sw.className='um-swatch';var p=_themePresets[name];sw.style.background='linear-gradient(135deg,'+p.primary+' 50%,'+p.accent+' 50%)';item.appendChild(sw);var info=document.createElement('div');info.className='um-theme-info';var nm=document.createElement('span');nm.className='um-theme-name';nm.textContent=name;info.appendChild(nm);var desc=document.createElement('span');desc.className='um-theme-desc';desc.textContent=_themeDescriptions[name]||'';info.appendChild(desc);item.appendChild(info);item.addEventListener('click',function(){localStorage.setItem('rustguac_theme',name);applyThemeColors(_themePresets[name]);menu.querySelectorAll('.um-item').forEach(function(el){el.classList.remove('active')});item.classList.add('active');document.getElementById('user-menu').style.display='none'});menu.appendChild(item)})}}
+        var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.stopPropagation();var m=document.getElementById('user-menu');m.style.display=m.style.display==='block'?'none':'block'});document.addEventListener('click',function(){var m=document.getElementById('user-menu');if(m)m.style.display='none'});
         var _driveConfigured = false;
         fetch('/api/auth/status').then(function(r){return r.json()}).then(function(d){
             if(d.site_title){document.title=d.site_title+' - Connections';document.querySelector('h1').textContent=d.site_title;}
@@ -1033,15 +1441,13 @@
         var lastEntriesRender = null; // { entries, scope, folder } — re-render when cred status arrives
         var folderEntryCounts = {}; // "scope|path" -> count
         var folderEntries = {};    // "scope|path" -> entries array
+        var bulkSel = { key: null, names: new Set() }; // bulk selection, per folder
+        var bulkLastIndex = null;  // last checkbox clicked, for shift-click ranges
+        var bulkState = null;      // open bulk dialog: { action, items, source, target, folders }
         var subfolderCache = {};   // "scope|path" -> [FolderInfo] (lazy-loaded children)
         var expandedPaths = {};    // "scope|path" -> true (tree expansion state; persisted)
         var EXPANDED_STORAGE_KEY = 'rustguac_connections_expanded';
         var SELECTED_STORAGE_KEY = 'rustguac_connections_selected';
-        // Quick-find search state
-        var searchIndex = null;        // [{scope, folderPath, entry, label, host, haystack}]
-        var searchIndexLoading = false;
-        var searchQuery = '';          // current query (lowercased & trimmed)
-        var searchActive = false;      // entries-content showing results, not folder entries
         function folderKey(scope, path) { return scope + '|' + path; }
         function folderPath(f) { return f.path || f.name; }
 
@@ -1311,7 +1717,7 @@
                 method: 'POST',
                 headers: Object.assign({'Content-Type': 'application/json'}, apiHeaders()),
                 credentials: 'same-origin',
-                body: JSON.stringify({ width: window.innerWidth, height: window.innerHeight })
+                body: JSON.stringify({ width: window.innerWidth, height: window.innerHeight, screen_width: screen.width, screen_height: screen.height })
             })
             .then(function(res) { return res.json(); })
             .then(function(data) {
@@ -1383,6 +1789,9 @@
                 isAdmin = data.role === 'admin';
                 currentUserRole = data.role || 'viewer';
                 var level = roleLevel[data.role] || 0;
+                // Reconcile the server-written nav gate (see rustguac.css): the page
+                // GET carried no API key, so key users arrive on the anonymous variant.
+                document.documentElement.setAttribute('data-role-level', String((typeof apiKey !== 'undefined' && apiKey) ? 4 : level));
                 if (level < 3) {
                     document.getElementById('sessions-link').style.display = 'none';
                 }
@@ -1398,6 +1807,8 @@
                     document.getElementById('tokens-link').style.display = '';
                 }
                 if (apiKey) {
+                    // A key is never on the page GET, so the server served the anonymous variant.
+                    document.documentElement.setAttribute('data-role-level', '4');
                     document.getElementById('admin-link').style.display = '';
                     document.getElementById('tokens-link').style.display = '';
                 }
@@ -1416,7 +1827,10 @@
                     }
                     return;
                 }
-                loadFolders();
+                // The first poll records the version this page is about to
+                // load; issued before the load so nothing in between is missed.
+                startLiveRefresh();
+                loadFolders(function() { rgHashOpen(); });
                 loadCredStatus();
                 loadActiveSessions();
                 setInterval(loadActiveSessions, 10000);
@@ -1554,20 +1968,22 @@
                             ev.stopPropagation();
                             var sid = termBtn.getAttribute('data-terminate');
                             var label = termBtn.getAttribute('data-name') || sid;
-                            if (!confirm('Terminate session "' + label + '"? Any unsaved work will be lost.')) return;
-                            termBtn.disabled = true;
-                            termBtn.textContent = 'Ending...';
-                            fetch('/api/sessions/' + sid, {
-                                method: 'DELETE',
-                                headers: apiHeaders(),
-                                credentials: 'same-origin'
-                            }).then(function(res) {
-                                if (!res.ok) return res.text().then(function(t) { throw new Error(t || 'terminate failed'); });
-                                loadActiveSessions();
-                            }).catch(function(err) {
-                                termBtn.disabled = false;
-                                termBtn.textContent = 'Terminate';
-                                showError('Terminate failed: ' + err.message);
+                            rgConfirm('Terminate session "' + label + '"? Any unsaved work will be lost.', { danger: true, confirmText: 'Terminate' }).then(function(ok) {
+                                if (!ok) return;
+                                termBtn.disabled = true;
+                                termBtn.textContent = 'Ending...';
+                                fetch('/api/sessions/' + sid, {
+                                    method: 'DELETE',
+                                    headers: apiHeaders(),
+                                    credentials: 'same-origin'
+                                }).then(function(res) {
+                                    if (!res.ok) return res.text().then(function(t) { throw new Error(t || 'terminate failed'); });
+                                    loadActiveSessions();
+                                }).catch(function(err) {
+                                    termBtn.disabled = false;
+                                    termBtn.textContent = 'Terminate';
+                                    showError('Terminate failed: ' + err.message);
+                                });
                             });
                         });
                     }
@@ -1605,7 +2021,7 @@
                                     method: 'POST',
                                     headers: Object.assign({'Content-Type': 'application/json'}, apiHeaders()),
                                     credentials: 'same-origin',
-                                    body: JSON.stringify({ width: window.innerWidth, height: window.innerHeight })
+                                    body: JSON.stringify({ width: window.innerWidth, height: window.innerHeight, screen_width: screen.width, screen_height: screen.height })
                                 }).then(function(res) { return res.json(); }).then(function(data) {
                                     if (data.session_id) window.open('/client/' + data.session_id, '_blank');
                                     else showError(data.error || 'Failed to reconnect');
@@ -1646,6 +2062,7 @@
                         name: f.name,
                         scope: f.scope,
                         description: f.description || '',
+                        display_name: f.display_name || '',
                         path: f.path || f.name,
                         has_children: !!f.has_children
                     };
@@ -1654,6 +2071,10 @@
                 folderEntryCounts = {};
                 allFolders.forEach(function(f) {
                     var key = folderKey(f.scope, f.path || f.name);
+                    // A path-only folder is listed because something below it
+                    // is shared with you; its own entries are not. Leave it
+                    // uncached so opening it asks the server, which says so.
+                    if (f.path_only) return;
                     folderEntries[key] = f.entries || [];
                     folderEntryCounts[key] = (f.entries || []).length;
                 });
@@ -1693,11 +2114,10 @@
                         }
                         maybeAutoOpenSingleton();
                     });
-                    loadSearchIndex();
                     return;
                 }
                 maybeAutoOpenSingleton();
-                loadSearchIndex();
+                if (done) done();
             })
             .catch(function(err) {
                 showError('Failed to load folders: ' + err.message);
@@ -1770,32 +2190,47 @@
             var row = document.createElement('div');
             row.className = 'folder-row';
 
-            var chevron = document.createElement('span');
-            chevron.className = 'tree-chevron';
             var isExpanded = !!expandedPaths[key];
             if (f.has_children) {
+                // Chevron column exists only for folders that can expand; leaves
+                // render no placeholder so their names start flush left (#254).
                 // Full-size triangles (U+25BC/U+25B6), matching every other
                 // collapsible on the page; the small variants (U+25BE/U+25B8)
-                // rendered as faint, hard-to-see ink even at 20px.
+                // rendered as faint, hard-to-see ink.
+                var chevron = document.createElement('span');
+                chevron.className = 'tree-chevron';
                 chevron.textContent = isExpanded ? '\u25BC' : '\u25B6';
+                chevron.title = isExpanded ? 'Collapse' : 'Expand';
                 if (isExpanded) chevron.classList.add('expanded');
                 chevron.addEventListener('click', function(ev) {
                     ev.stopPropagation();
                     toggleFolder(f);
                 });
-            } else {
-                chevron.classList.add('leaf');
-                chevron.textContent = '\u25B6';
+                row.appendChild(chevron);
             }
-            row.appendChild(chevron);
 
             var main = document.createElement('div');
             main.className = 'folder-row-main';
             var nameRow = document.createElement('div');
             nameRow.className = 'folder-name-row';
             var nameSpan = document.createElement('span');
-            nameSpan.textContent = f.name;
+            nameSpan.className = 'folder-name';
+            // Title is the display name when one is set (e.g. the NetBox tenant
+            // name); the folder key then goes on the subline. Without one the
+            // key is the title and the description the subline.
+            nameSpan.textContent = f.display_name || f.name;
+            nameSpan.title = f.display_name ? f.name + (f.description ? ' \u2014 ' + f.description : '') : (f.description || f.name);
             nameRow.appendChild(nameSpan);
+            if (folderEntryCounts[key] !== undefined) {
+                // Entry count as a small right-aligned pill on the name line.
+                var count = folderEntryCounts[key];
+                var countSpan = document.createElement('span');
+                countSpan.className = 'folder-count';
+                countSpan.setAttribute('data-count', count);
+                countSpan.textContent = count;
+                countSpan.title = count + (count === 1 ? ' entry' : ' entries');
+                nameRow.appendChild(countSpan);
+            }
             if (showScope) {
                 var scopeBadge = document.createElement('span');
                 scopeBadge.className = 'folder-scope';
@@ -1806,16 +2241,10 @@
                 nameRow.appendChild(scopeBadge);
             }
             main.appendChild(nameRow);
-            if (folderEntryCounts[key] !== undefined) {
-                var countSpan = document.createElement('span');
-                countSpan.className = 'folder-count';
-                countSpan.textContent = folderEntryCounts[key] + ' entries';
-                main.appendChild(countSpan);
-            }
-            if (f.description) {
+            if (f.display_name || f.description) {
                 var desc = document.createElement('span');
-                desc.className = 'folder-desc';
-                desc.textContent = f.description;
+                desc.className = 'folder-desc' + (f.display_name ? ' folder-key' : '');
+                desc.textContent = f.display_name ? f.name : f.description;
                 main.appendChild(desc);
             }
             row.appendChild(main);
@@ -1891,6 +2320,7 @@
                         name: sf.name,
                         scope: sf.scope,
                         description: sf.description || '',
+                        display_name: sf.display_name || '',
                         path: sf.path || (path + '/' + sf.name),
                         has_children: !!sf.has_children
                     };
@@ -1918,159 +2348,308 @@
             return null;
         }
 
-        // ── Quick-find search ──────────────────────────────────────────────
-        // Index is fetched once after loadFolders() and after any mutation that
-        // already triggers a refresh. Search runs entirely client-side against
-        // the in-memory haystack.
+        // ── Live refresh ──
+        // GET /api/addressbook/version?since=N answers from memory with what
+        // rustguac changed in the address book after version N: which folders,
+        // and whether it was their entries or the folder itself. It is polled
+        // every few seconds while the tab is visible and no dialog is open,
+        // and a tab acts only on what it shows:
+        //   entries changed in the open folder   -> that folder is re-read
+        //   entries changed elsewhere            -> the cached copy is forgotten;
+        //                                           nothing is read until opened
+        //   a folder created, deleted or changed -> the folder list is re-read
+        //                                           (no entries), plus the open
+        //                                           folder if it was in that subtree
+        //   the search index                     -> marked stale and rebuilt the
+        //                                           next time the box is used;
+        //                                           while results are showing, only
+        //                                           the changed folder's rows are
+        //                                           re-read and patched in
+        // So one change costs a tab at most one folder's entries plus one
+        // folder list, never the whole book, and a poll costs no Vault read.
+        // `changes: null` (first poll, or the tab fell further behind than
+        // the server's log reaches, or the server restarted) refreshes what
+        // is shown, once. Nothing is reloaded on a timer. A hidden tab does
+        // not poll and catches up the moment it is shown; a tab with a
+        // dialog open does not poll either, so a change waits for the dialog
+        // instead of being missed. A user's own credential variables are not
+        // address-book changes and never arrive here: the tab that saved them
+        // reloads its own status (saveMyCredentials).
+        var LIVE_POLL_MS = 3000;
+        var liveVersion = null;   // the version this tab's view reflects
+        var liveEpoch = null;     // which server process that version came from
+        var liveTimer = null;
+        var liveBusy = false;
 
-        function loadSearchIndex() {
-            var input = document.getElementById('connections-search');
-            if (!input) return;
-            searchIndexLoading = true;
-            input.placeholder = 'Indexing...';
-            input.disabled = true;
-            fetch('/api/addressbook/search-index', { headers: apiHeaders(), credentials: 'same-origin' })
+
+
+        // ── Live refresh ──
+        // GET /api/addressbook/version?since=N answers from memory with what
+        // rustguac changed in the address book after version N: which folders,
+        // and whether it was their entries or the folder itself. It is polled
+        // every few seconds while the tab is visible and no dialog is open,
+        // and a tab acts only on what it shows:
+        //   entries changed in the open folder   -> that folder is re-read
+        //   entries changed elsewhere            -> the cached copy is forgotten;
+        //                                           nothing is read until opened
+        //   a folder created, deleted or changed -> the folder list is re-read
+        //                                           (no entries), plus the open
+        //                                           folder if it was in that subtree
+        //   the search index (search.js)         -> told to check the version
+        //                                           now rather than at its next poll
+        // So one change costs a tab at most one folder's entries plus one
+        // folder list, never the whole book, and a poll costs no Vault read.
+        // `changes: null` (first poll, or the tab fell further behind than
+        // the server's log reaches, or the server restarted) refreshes what
+        // is shown, once. Nothing is reloaded on a timer. A hidden tab does
+        // not poll and catches up the moment it is shown; a tab with a
+        // dialog open does not poll either, so a change waits for the dialog
+        // instead of being missed. A user's own credential variables are not
+        // address-book changes and never arrive here: the tab that saved them
+        // reloads its own status (saveMyCredentials).
+        var LIVE_POLL_MS = 3000;
+        var liveVersion = null;   // the version this tab's view reflects
+        var liveEpoch = null;     // which server process that version came from
+        var liveTimer = null;
+        var liveBusy = false;
+
+        // What a batch of changes means for this tab. Pure, so it is tested
+        // without a browser (tests/connections-live.mjs).
+        //   changes: [{scope, folder, kind: 'entries'|'tree'|'all'}], or null
+        //            to refresh everything shown
+        //   view:    { selectedKey, searchActive, indexLoaded, cachedKeys }
+        // Returns { tree, treeAll, treeKeys, fetch: [key], drop: [key],
+        //           index: 'keep'|'stale'|'rebuild' }: `fetch` is re-read now
+        //           (the open folder, or a folder whose index rows to patch),
+        //           `drop` is forgotten until opened.
+        function livePlan(changes, view) {
+            var plan = { tree: false, treeAll: false, treeKeys: [], fetch: [], drop: [], index: 'keep' };
+            var all = !changes;
+            var stale = false;
+            var touched = {};
+            var under = function(k, key) { return k === key || k.indexOf(key + '/') === 0; };
+            // A tree row without a folder means a folder changed somewhere
+            // this user may not be told about (the server never names a
+            // folder they cannot open): refresh what is shown, as for `all`.
+            (changes || []).forEach(function(c) {
+                if (c.kind === 'all' || (c.kind === 'tree' && !c.folder)) all = true;
+            });
+            if (!all) changes.forEach(function(c) {
+                var key = c.scope + '|' + c.folder;
+                if (c.kind === 'tree') {
+                    plan.tree = true;
+                    plan.treeKeys.push(key);
+                    stale = true;   // paths or visibility moved: only a walk knows
+                    // Whatever was cached below the folder went with it.
+                    view.cachedKeys.forEach(function(k) { if (under(k, key)) touched[k] = 'drop'; });
+                    if (view.selectedKey && under(view.selectedKey, key)) touched[view.selectedKey] = 'fetch';
+                } else if (key === view.selectedKey) {
+                    touched[key] = 'fetch';
+                } else if (view.searchActive && view.indexLoaded) {
+                    touched[key] = touched[key] || 'patch';
+                } else {
+                    touched[key] = touched[key] || 'drop';
+                    stale = true;
+                }
+            });
+            if (all) {
+                plan.tree = true;
+                plan.treeAll = true;
+                stale = true;
+                view.cachedKeys.forEach(function(k) { touched[k] = 'drop'; });
+                if (view.selectedKey) touched[view.selectedKey] = 'fetch';
+            }
+            if (stale) plan.index = (view.searchActive && view.indexLoaded) ? 'rebuild' : 'stale';
+            Object.keys(touched).forEach(function(k) {
+                var what = touched[k];
+                // While searching the open folder is not on screen: patch the
+                // index from it, or just forget it when the index is being
+                // rebuilt anyway.
+                if (what === 'fetch' && view.searchActive) what = 'patch';
+                if (what === 'patch' && plan.index === 'rebuild') what = 'drop';
+                if (what === 'drop') plan.drop.push(k); else plan.fetch.push(k);
+            });
+            return plan;
+        }
+
+        // What a poll answer means, given the version and epoch this tab
+        // last saw. Pure, tested in tests/connections-live.mjs. Returns
+        // undefined when there is nothing to do, null to refresh what is
+        // shown, or the list of changes. A different epoch is a restarted
+        // server: its version counter started again, so its changes are not
+        // the ones after ours, whatever the numbers say.
+        function liveChanges(data, version, epoch) {
+            if (data.epoch !== epoch) return null;
+            if (data.version === version && data.changes) return undefined;
+            return data.changes;
+        }
+
+        function liveView() {
+            return {
+                selectedKey: selectedFolder ? folderKey(selectedFolder.scope, folderPath(selectedFolder)) : null,
+                // Search is an overlay from search.js over an untouched folder
+                // view, so the open folder is always the one on screen.
+                searchActive: false,
+                indexLoaded: false,
+                cachedKeys: Object.keys(folderEntries)
+            };
+        }
+
+        function liveApply(plan) {
+            plan.drop.forEach(function(k) { delete folderEntries[k]; delete folderEntryCounts[k]; });
+            if (plan.index !== 'keep' && typeof window.rgSearchRecheck === 'function') window.rgSearchRecheck();
+            var fetchFolders = function() {
+                plan.fetch.forEach(function(k) {
+                    var sep = k.indexOf('|');
+                    var scope = k.slice(0, sep), path = k.slice(sep + 1);
+                    if (liveView().selectedKey === k) {
+                        loadEntries(scope, path, true);
+                    } else {
+                        refetchFolderEntries(scope, path);
+                    }
+                });
+            };
+            if (plan.tree) reloadFolderList(plan, fetchFolders); else fetchFolders();
+        }
+
+        // Re-read one folder's entries into the cache without showing it.
+        function refetchFolderEntries(scope, path) {
+            var key = folderKey(scope, path);
+            fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(path) + '/entries', {
+                headers: apiHeaders(),
+                credentials: 'same-origin'
+            })
+            .then(function(res) { return res.ok ? res.json() : []; })
+            .then(function(entries) {
+                if (Array.isArray(entries) && entries.length) {
+                    folderEntries[key] = entries;
+                    folderEntryCounts[key] = entries.length;
+                } else {
+                    delete folderEntries[key];
+                    delete folderEntryCounts[key];
+                    entries = [];
+                }
+                renderFolders();
+            })
+            .catch(function() {});
+        }
+
+        // Re-read the folder list alone (no entries) after a folder came,
+        // went or changed, then the subfolder listings that change made
+        // stale: the changed folder's parent (it came or went there), its
+        // own, and its subtree's. The open folder is re-resolved; if it is
+        // gone the first folder is shown, as after deleting one here.
+        function reloadFolderList(plan, cb) {
+            fetch('/api/addressbook/folders', { headers: apiHeaders(), credentials: 'same-origin' })
             .then(function(res) {
                 if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
                 return res.json();
             })
-            .then(function(data) {
-                var rows = (data && data.entries) || [];
-                searchIndex = rows.map(function(r) {
-                    var e = r.entry;
-                    var label = e.display_name || e.name;
-                    var host = e.session_type === 'web' ? (e.url || '')
-                             : e.session_type === 'vdi' ? (e.container_image || '')
-                             : e.session_type === 'proxmox' ? ((e.proxmox_url || '') + (e.proxmox_vmid ? ' · VM ' + e.proxmox_vmid : ''))
-                             : (e.hostname || '');
-                    var haystack = [
-                        e.name,
-                        e.display_name || '',
-                        host,
-                        e.username || '',
-                        e.proxmox_token_id || '',
-                        e.url || '',
-                        e.domain || '',
-                        e.session_type,
-                        r.folder_path
-                    ].join(' ').toLowerCase();
+            .then(function(list) {
+                folders = (list || []).map(function(f) {
                     return {
-                        scope: r.scope,
-                        folderPath: r.folder_path,
-                        entry: e,
-                        label: label,
-                        host: host,
-                        haystack: haystack
+                        name: f.name,
+                        scope: f.scope,
+                        description: f.description || '',
+                        path: f.path || f.name,
+                        has_children: !!f.has_children
                     };
                 });
-                searchIndexLoading = false;
-                input.placeholder = 'Search ' + searchIndex.length + ' connection' + (searchIndex.length === 1 ? '' : 's') + '... (press / )';
-                input.disabled = false;
-                if (searchQuery) runSearch();
-                // The full entry set is now known — refresh the proactive
-                // "credentials to set up" banner against it.
-                updateCredBanner();
+                var parentOf = function(key) { var i = key.lastIndexOf('/'); return i < 0 ? null : key.slice(0, i); };
+                Object.keys(subfolderCache).forEach(function(k) {
+                    var stale = plan.treeAll || plan.treeKeys.some(function(key) {
+                        return k === key || k === parentOf(key) || k.indexOf(key + '/') === 0;
+                    });
+                    if (stale) delete subfolderCache[k];
+                });
+                var emptyEl = document.getElementById('empty-state');
+                var mainEl = document.getElementById('main-content');
+                if (folders.length === 0 && unavailableScopes.length === 0 && isAdmin) {
+                    emptyEl.style.display = '';
+                    mainEl.style.display = 'none';
+                } else {
+                    emptyEl.style.display = 'none';
+                    mainEl.style.display = '';
+                }
+                restoreExpandedTree(function() {
+                    resolveSelectedFolder(function(sel) {
+                        if (selectedFolder && !sel) {
+                            var goneKey = folderKey(selectedFolder.scope, folderPath(selectedFolder));
+                            plan.fetch = plan.fetch.filter(function(k) { return k !== goneKey; });
+                            selectedFolder = folders[0] || null;
+                            saveSelectedFolder();
+                            if (selectedFolder) {
+                                loadEntries(selectedFolder.scope, folderPath(selectedFolder));
+                            } else if (!selectedFolder) {
+                                document.getElementById('entries-header').style.display = 'none';
+                                document.getElementById('entries-content').innerHTML = '<p class="empty">Select a folder to view entries.</p>';
+                            }
+                        } else if (sel) {
+                            selectedFolder = sel;
+                        }
+                        renderFolders();
+                        if (cb) cb();
+                    });
+                });
             })
             .catch(function(err) {
-                searchIndexLoading = false;
-                input.placeholder = 'Search unavailable';
-                input.disabled = false;
-                if (window.console) console.warn('Search index failed:', err.message);
+                showError('Failed to refresh folders: ' + err.message);
+                if (cb) cb();
             });
         }
 
-        function runSearch() {
-            var input = document.getElementById('connections-search');
-            if (!input) return;
-            var q = (input.value || '').trim().toLowerCase();
-            searchQuery = q;
-            if (!q) {
-                if (searchActive) {
-                    searchActive = false;
-                    if (selectedFolder) {
-                        loadEntries(selectedFolder.scope, folderPath(selectedFolder));
-                    } else {
-                        document.getElementById('entries-content').innerHTML =
-                            '<p class="empty">Select a folder to view entries.</p>';
+        // The open folder's object in the rebuilt tree, loading the listings
+        // of collapsed ancestors it hides behind; null if it no longer exists.
+        function resolveSelectedFolder(cb) {
+            if (!selectedFolder) { cb(null); return; }
+            var scope = selectedFolder.scope, path = folderPath(selectedFolder);
+            var parts = path.split('/');
+            var ancestors = [];
+            for (var i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join('/'));
+            var idx = 0;
+            (function next() {
+                if (idx >= ancestors.length) { cb(findFolder(scope, path)); return; }
+                var p = ancestors[idx++];
+                if (!findFolder(scope, p)) { cb(null); return; }
+                if (subfolderCache[folderKey(scope, p)]) next(); else loadSubfolders(scope, p, next);
+            })();
+        }
+
+        function livePoll() {
+            if (liveBusy) return;
+            // The baseline is taken whatever the tab's state, or a page loaded
+            // in a background tab would miss what changed before it was shown.
+            // After that a hidden tab does not poll, and a dialog may be
+            // editing what just changed: the poll waits for it, and the change
+            // is picked up once it closes.
+            if (liveVersion !== null && (document.hidden || document.querySelector('.modal-overlay.active'))) return;
+            liveBusy = true;
+            var url = '/api/addressbook/version' + (liveVersion === null ? '' : '?since=' + liveVersion);
+            fetch(url, { headers: apiHeaders(), credentials: 'same-origin' })
+                .then(function(res) { return res.ok ? res.json() : null; })
+                .then(function(data) {
+                    if (!data || typeof data.version !== 'number') return;
+                    if (liveVersion === null) {
+                        // Baseline: the page is loading this version now.
+                        liveVersion = data.version;
+                        liveEpoch = data.epoch;
+                        return;
                     }
-                }
-                return;
-            }
-            searchActive = true;
-            if (!searchIndex) {
-                document.getElementById('entries-content').innerHTML =
-                    '<p class="empty">Indexing connections, please wait...</p>';
-                return;
-            }
-            var tokens = q.split(/\s+/).filter(Boolean);
-            var matches = [];
-            for (var i = 0; i < searchIndex.length; i++) {
-                var row = searchIndex[i];
-                var ok = true;
-                for (var t = 0; t < tokens.length; t++) {
-                    if (row.haystack.indexOf(tokens[t]) === -1) { ok = false; break; }
-                }
-                if (!ok) continue;
-                var first = tokens[0];
-                var lcLabel = row.label.toLowerCase();
-                var lcName = row.entry.name.toLowerCase();
-                var score = 0;
-                if (lcLabel.indexOf(first) === 0 || lcName.indexOf(first) === 0) score += 100;
-                else if (lcLabel.indexOf(first) !== -1 || lcName.indexOf(first) !== -1) score += 50;
-                if ((row.host || '').toLowerCase().indexOf(first) !== -1) score += 20;
-                if (row.folderPath.toLowerCase().indexOf(first) !== -1) score += 10;
-                matches.push({ row: row, score: score });
-            }
-            matches.sort(function(a, b) {
-                if (b.score !== a.score) return b.score - a.score;
-                if (a.row.folderPath !== b.row.folderPath) return a.row.folderPath.localeCompare(b.row.folderPath);
-                return a.row.label.localeCompare(b.row.label);
-            });
-            renderSearchResults(matches, q, tokens);
+                    var changes = liveChanges(data, liveVersion, liveEpoch);
+                    liveVersion = data.version;
+                    liveEpoch = data.epoch;
+                    if (changes === undefined) return;
+                    liveApply(livePlan(changes, liveView()));
+                })
+                .catch(function() {})
+                .then(function() { liveBusy = false; });
         }
-
-        function renderSearchResults(matches, query, tokens) {
-            var content = document.getElementById('entries-content');
-            if (matches.length === 0) {
-                content.innerHTML = '<div class="empty-state" style="padding:2em;margin:1em 0">' +
-                    '<p style="color:var(--text-dim);margin:0">No matches for ' + escapeHtml(query) + '</p>' +
-                    '</div>';
-                return;
-            }
-            var maxResults = 50;
-            var more = matches.length - maxResults;
-            var shown = matches.slice(0, maxResults);
-            var html = '<table class="entries-table"><thead><tr>' +
-                '<th>Name</th><th>Type</th><th>Host</th><th>User</th><th>Folder</th><th></th><th></th>' +
-                '</tr></thead><tbody>';
-            shown.forEach(function(m) {
-                var r = m.row;
-                var e = r.entry;
-                var typeLabel = e.session_type.toUpperCase();
-                var typeCls = 'type-' + e.session_type;
-                var needsPrompt = (e.prompt_credentials || !e.has_credentials) && e.session_type !== 'web' && e.session_type !== 'proxmox';
-                var connectLabel = needsPrompt ? 'Login...' : 'Connect';
-                var userCol = e.session_type === 'proxmox'
-                    ? highlight(e.proxmox_token_id || '', tokens)
-                    : (e.username ? highlight(e.username, tokens) : '');
-                if (needsPrompt && userCol) userCol += ' <span style="color:#888;font-size:0.8em" title="Credentials prompted at connect">[prompt]</span>';
-                var scopeIcon = r.scope === 'shared' ? '⊕' : '▣';
-                html += '<tr>';
-                html += '<td>' + highlight(r.label, tokens) + '</td>';
-                html += '<td><span class="type-badge ' + typeCls + '">' + typeLabel + '</span></td>';
-                html += '<td>' + highlight(r.host || '', tokens) + '</td>';
-                html += '<td>' + userCol + '</td>';
-                html += '<td><span class="search-folder-cell"><span class="folder-scope">' + scopeIcon + '</span> ' + highlight(r.folderPath, tokens) + '</span></td>';
-                html += '<td class="connect-cell"><button class="btn-connect" data-connect="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(r.scope) + '" data-folder="' + escapeAttr(r.folderPath) + '">' + connectLabel + '</button>'
-                    + '<button class="btn-connect btn-connect-win" title="Open in a new window" data-connect-win="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(r.scope) + '" data-folder="' + escapeAttr(r.folderPath) + '">&#x29c9;</button></td>';
-                html += '<td><a href="#" class="search-open-folder" data-open-scope="' + escapeAttr(r.scope) + '" data-open-folder="' + escapeAttr(r.folderPath) + '" title="Open this folder">↗ open folder</a></td>';
-                html += '</tr>';
-            });
-            html += '</tbody></table>';
-            if (more > 0) {
-                html += '<div class="search-more">+' + more + ' more match' + (more === 1 ? '' : 'es') + ' — refine your search to narrow results</div>';
-            }
-            content.innerHTML = html;
+        function startLiveRefresh() {
+            if (liveTimer) return;
+            livePoll();
+            liveTimer = setInterval(livePoll, LIVE_POLL_MS);
+            document.addEventListener('visibilitychange', function() { if (!document.hidden) livePoll(); });
+            window.addEventListener('focus', livePoll);
         }
 
         function highlight(text, tokens) {
@@ -2084,12 +2663,23 @@
             return safe.replace(re, '<mark>$1</mark>');
         }
 
-        function openFolderFromSearch(scope, targetPath) {
-            var input = document.getElementById('connections-search');
-            if (input) input.value = '';
-            searchQuery = '';
-            searchActive = false;
+        // Open a folder requested via the URL hash (#open=scope/path), used
+        // when the global search on another page links here.
+        function rgHashOpen() {
+            var m = /^#open=(.+)$/.exec(location.hash || '');
+            if (!m) return;
+            var decoded = decodeURIComponent(m[1]);
+            var slash = decoded.indexOf('/');
+            if (slash < 0) return;
+            var scope = decoded.slice(0, slash), path = decoded.slice(slash + 1);
+            try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+            window.rgSelectFolder(scope, path);
+        }
 
+        // Select a folder in the sidebar: expand its ancestors, highlight it and
+        // load its entries. Exposed for the global search (search.js) and the
+        // #open=scope/path URL hash, so a folder can be opened from any page.
+        window.rgSelectFolder = function(scope, targetPath) {
             var parts = targetPath.split('/');
             var ancestors = [];
             for (var i = 1; i < parts.length; i++) {
@@ -2130,48 +2720,75 @@
                 }
             }
             loadNext();
-        }
+        };
 
         function loadEntries(scope, folderPath, forceRefresh) {
             var header = document.getElementById('entries-header');
             header.style.display = '';
-            document.getElementById('entries-title').textContent = folderPath;
             var f = findFolder(scope, folderPath);
+            var dn = f && f.display_name ? f.display_name : '';
+            document.getElementById('entries-title').textContent = dn || folderPath;
+            document.getElementById('entries-key').textContent = dn ? folderPath : '';
             document.getElementById('entries-desc').textContent = f && f.description ? f.description : '';
 
             var cacheKey = folderKey(scope, folderPath);
             var cached = folderEntries[cacheKey];
+            // UX (#254): jump to the entries header and flash the title, but
+            // only when the shown folder actually changed (not on initial
+            // load, live refresh, forceRefresh after a mutation, or search
+            // clear re-rendering the same folder).
+            announceFolderShown(cacheKey, header);
 
             // Use cache if available and not forcing refresh (e.g. after mutation)
             if (cached && !forceRefresh) {
                 currentEntries = cached;
                 folderEntryCounts[cacheKey] = cached.length;
-                renderFolders();
+                updateFolderCount(scope, folderPath, cached.length);
                 renderEntries(cached, scope, folderPath);
                 return;
             }
 
             var content = document.getElementById('entries-content');
-            content.innerHTML = '<p class="empty">Loading...</p>';
+            content.innerHTML = entriesSkeletonHtml();
 
             fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folderPath) + '/entries', {
                 headers: apiHeaders(),
                 credentials: 'same-origin'
             })
             .then(function(res) {
+                // A folder can be in the tree only because something below
+                // it is shared with you; its own entries are not. Say so
+                // rather than showing the raw refusal.
+                if (res.status === 403) return null;
                 if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
                 return res.json();
             })
             .then(function(entries) {
+                if (entries === null) {
+                    currentEntries = [];
+                    bulkSyncSelection([], scope, folderPath);
+                    updateBulkBar();
+                    content.innerHTML = '<p class="empty">You don\'t have access to this folder itself. Open a folder inside it to see what has been shared with you.</p>';
+                    return;
+                }
                 currentEntries = entries;
                 folderEntries[cacheKey] = entries;
                 folderEntryCounts[cacheKey] = entries.length;
-                renderFolders(); // Update count badge
+                updateFolderCount(scope, folderPath, entries.length); // in-place badge update
                 renderEntries(entries, scope, folderPath);
             })
             .catch(function(err) {
                 content.innerHTML = '<p class="empty">' + escapeHtml(err.message) + '</p>';
             });
+        }
+
+        // "host (Tenant)" display names, as the NetBox sync writes them, read as
+        // the host over a quieter tenant line. `tokens` highlights search hits.
+        function entryNameHtml(label, tokens) {
+            var esc = tokens ? function(t) { return highlight(t, tokens); } : escapeHtml;
+            var m = /^(.*\S)\s+\(([^()]+)\)$/.exec(label || '');
+            if (!m) return esc(label || '');
+            return '<span class="entry-name">' + esc(m[1]) + '</span><span class="entry-sub">' + esc(m[2]) + '</span>';
         }
 
         // Credential variables an entry references that the user hasn't set
@@ -2219,8 +2836,8 @@
             if (!banner) return;
             if (!setCredVars) { banner.style.display = 'none'; return; }
             var entries = [];
-            if (searchIndex) {
-                entries = searchIndex.map(function(r) { return r.entry; });
+            if (window.rgSearchIndex) {
+                entries = window.rgSearchIndex.map(function(r) { return r.entry; });
             } else {
                 Object.keys(folderEntries).forEach(function(k) {
                     (folderEntries[k] || []).forEach(function(e) { entries.push(e); });
@@ -2247,15 +2864,41 @@
         }
 
         function refreshEntriesView() {
-            if (lastEntriesRender && !searchActive) {
+            if (lastEntriesRender) {
                 renderEntries(lastEntriesRender.entries, lastEntriesRender.scope, lastEntriesRender.folder);
             }
         }
 
-        function renderEntries(entries, scope, folder) {
-            lastEntriesRender = { entries: entries, scope: scope, folder: folder };
+        // Shared facet filters (filters.js) above the entries table: Type in a
+        // folder, Type and Folder across search results. Selections persist in
+        // sessionStorage for this tab; the Folder facet only applies while
+        // searching.
+        // Folder-view filter (Type), shown in the folder header.
+        var typeFacet = { key: 'type', label: 'Type',
+            value: function(x) { var e = x.entry || x; return e.session_type; },
+            render: function(v) { return '<span class="type-badge type-' + escapeAttr(v) + '">' + escapeHtml(v) + '</span>'; } };
+        var entryFilters = rgFilters.create({
+            mount: document.getElementById('entries-filters'),
+            id: 'connections',
+            facets: [ typeFacet ],
+            onChange: function() {
+                if (lastEntriesRender) renderEntries(lastEntriesRender.entries, lastEntriesRender.scope, lastEntriesRender.folder);
+            }
+        });
+
+        function renderEntries(allEntries, scope, folder) {
+            lastEntriesRender = { entries: allEntries, scope: scope, folder: folder };
+            bulkSyncSelection(allEntries, scope, folder);
             var content = document.getElementById('entries-content');
+            entryFilters.update(allEntries);
+            var entries = entryFilters.apply(allEntries);
+            if (entries.length === 0 && allEntries.length > 0) {
+                updateBulkBar();
+                content.innerHTML = '<p class="empty">No entries match the current filters.</p>';
+                return;
+            }
             if (entries.length === 0) {
+                updateBulkBar();
                 if (isAdmin) {
                     content.innerHTML = '<div class="empty-state" style="padding:2em;margin:1em 0">' +
                         '<p style="color:#888;margin:0 0 1em 0">No entries in this folder.</p>' +
@@ -2270,12 +2913,13 @@
                 return;
             }
 
-            var html = '<table class="entries-table"><thead><tr>' +
-                '<th>Name</th><th>Type</th><th>Host</th><th>User</th><th></th>';
-            if (isAdmin) html += '<th></th><th></th><th></th>';
+            var html = '<table class="entries-table"><thead><tr>';
+            if (isAdmin) html += '<th class="sel-cell"><input type="checkbox" id="sel-all" title="Select all"></th>';
+            html += '<th>Name</th><th>Type</th><th>Host</th><th>User</th><th></th>';
+            if (isAdmin) html += '<th></th>';
             html += '</tr></thead><tbody>';
 
-            entries.forEach(function(e) {
+            entries.forEach(function(e, idx) {
                 var label = e.display_name || e.name;
                 var hostBase = e.session_type === 'web' ? (e.url || '')
                              : e.session_type === 'vdi' ? (e.container_image || '')
@@ -2289,13 +2933,18 @@
                 }
                 var typeCls = 'type-' + e.session_type;
 
-                html += '<tr>';
+                var isSel = isAdmin && bulkSel.names.has(e.name);
+                html += isSel ? '<tr class="selected">' : '<tr>';
+                if (isAdmin) {
+                    html += '<td class="sel-cell"><input type="checkbox" class="sel-entry" data-sel-index="' + idx + '" data-sel-name="' + escapeAttr(e.name) + '"' + (isSel ? ' checked' : '') + ' title="Select"></td>';
+                }
                 var unsetVars = entryUnsetVars(e);
                 var credPill = unsetVars.length > 0
                     ? ' <span title="Set these first: ' + escapeAttr(unsetVars.join(', ')) + '" style="background:var(--status-pending);color:var(--bg);border-radius:8px;padding:0.05em 0.5em;font-size:0.72em;font-weight:bold;white-space:nowrap;vertical-align:middle">credentials needed</span>'
                     : '';
-                html += '<td>' + escapeHtml(label) + credPill + '</td>';
+                html += '<td>' + entryNameHtml(label) + credPill + '</td>';
                 var typeLabel = e.session_type.toUpperCase();
+                if (e.auth_pkg) typeLabel += ' <span style="font-size:0.75em;color:#888">(' + escapeHtml(e.auth_pkg) + ')</span>';
                 html += '<td><span class="type-badge ' + typeCls + '">' + typeLabel + '</span></td>';
                 html += '<td>' + escapeHtml(hostBase) + hostSuffix + '</td>';
                 var userCol = e.session_type === 'proxmox'
@@ -2303,20 +2952,27 @@
                     : (e.username ? escapeHtml(e.username) : '');
                 var needsPrompt = (e.prompt_credentials || !e.has_credentials) && e.session_type !== 'web' && e.session_type !== 'proxmox';
                 if (needsPrompt) userCol += ' <span style="color:#888;font-size:0.8em" title="Credentials will be prompted at connect time">[prompt]</span>';
+                if (e.inherited_credentials) userCol += ' <span style="color:#888;font-size:0.8em" title="Uses the folder\'s default credentials">[folder]</span>';
                 html += '<td>' + userCol + '</td>';
                 var connectLabel = needsPrompt ? 'Login...' : 'Connect';
                 html += '<td class="connect-cell"><button class="btn-connect" data-connect="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">' + connectLabel + '</button>'
                     + '<button class="btn-connect btn-connect-win" title="Open in a new window" data-connect-win="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">&#x29c9;</button></td>';
                 if (isAdmin) {
-                    html += '<td><button class="btn-small" data-edit-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '" data-type="' + escapeAttr(e.session_type) + '">Edit</button></td>';
-                    html += '<td><button class="btn-small" data-clone-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">Clone</button></td>';
-                    html += '<td><button class="btn-small" data-delete-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">Delete</button></td>';
+                    // One cell for the three admin actions: three cells cost
+                    // two extra runs of cell padding on every row, which is
+                    // what pushed "delete" off the right edge at 1710px wide.
+                    html += '<td class="actions-cell">'
+                        + '<button class="btn-small" data-edit-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '" data-type="' + escapeAttr(e.session_type) + '">edit</button>'
+                        + '<button class="btn-small" data-clone-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">clone</button>'
+                        + '<button class="btn-small" data-delete-entry="' + escapeAttr(e.name) + '" data-scope="' + escapeAttr(scope) + '" data-folder="' + escapeAttr(folder) + '">delete</button>'
+                        + '</td>';
                 }
                 html += '</tr>';
             });
 
             html += '</tbody></table>';
             content.innerHTML = html;
+            updateBulkBar();
         }
 
         function escapeHtml(s) {
@@ -2329,21 +2985,368 @@
             return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
+        // ── Bulk selection: move / copy / delete many entries ───────
+        //
+        // Selection is per folder: changing folder clears it. The work is
+        // done by POST /api/addressbook/bulk, which copies each entry as
+        // stored (credentials included, never overwriting) and reports a
+        // result per entry, so this page only chooses and reports.
+        function bulkSyncSelection(entries, scope, folder) {
+            var key = scope + '|' + folder;
+            if (bulkSel.key !== key) {
+                bulkSel.key = key;
+                bulkSel.names.clear();
+                bulkLastIndex = null;
+                return;
+            }
+            // Same folder re-rendered: drop names that are no longer there.
+            var present = new Set(entries.map(function(e) { return e.name; }));
+            Array.from(bulkSel.names).forEach(function(n) {
+                if (!present.has(n)) bulkSel.names.delete(n);
+            });
+        }
+
+        function updateBulkBar() {
+            var n = bulkSel.names.size;
+            var bar = document.getElementById('bulk-bar');
+            bar.classList.toggle('active', isAdmin && n > 0);
+            document.getElementById('bulk-count').textContent = n + (n === 1 ? ' entry selected' : ' entries selected');
+            var all = document.getElementById('sel-all');
+            if (all) {
+                var boxes = document.querySelectorAll('#entries-content .sel-entry');
+                all.checked = boxes.length > 0 && n === boxes.length;
+                all.indeterminate = n > 0 && n < boxes.length;
+            }
+        }
+
+        function bulkSetBox(box, checked) {
+            box.checked = checked;
+            var name = box.getAttribute('data-sel-name');
+            if (checked) bulkSel.names.add(name); else bulkSel.names.delete(name);
+            var tr = box.closest('tr');
+            if (tr) tr.classList.toggle('selected', checked);
+        }
+
+        document.getElementById('entries-content').addEventListener('click', function(e) {
+            var t = e.target;
+            if (t.id === 'sel-all') {
+                document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) {
+                    bulkSetBox(b, t.checked);
+                });
+                bulkLastIndex = null;
+                updateBulkBar();
+                return;
+            }
+            if (!t.classList || !t.classList.contains('sel-entry')) return;
+            var idx = parseInt(t.getAttribute('data-sel-index'), 10);
+            if (e.shiftKey && bulkLastIndex !== null) {
+                // Range: everything between the last click and this one takes
+                // this box's new state.
+                var lo = Math.min(bulkLastIndex, idx), hi = Math.max(bulkLastIndex, idx);
+                document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) {
+                    var i = parseInt(b.getAttribute('data-sel-index'), 10);
+                    if (i >= lo && i <= hi) bulkSetBox(b, t.checked);
+                });
+            } else {
+                bulkSetBox(t, t.checked);
+            }
+            bulkLastIndex = idx;
+            updateBulkBar();
+        });
+
+        document.getElementById('bulk-clear').addEventListener('click', function() {
+            bulkSel.names.clear();
+            document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) { bulkSetBox(b, false); });
+            bulkLastIndex = null;
+            updateBulkBar();
+        });
+        document.getElementById('bulk-move').addEventListener('click', function() { openBulk('move'); });
+        document.getElementById('bulk-copy').addEventListener('click', function() { openBulk('copy'); });
+        document.getElementById('bulk-delete').addEventListener('click', function() { openBulk('delete'); });
+
+        function bulkNoun(n) { return n + (n === 1 ? ' entry' : ' entries'); }
+
+        function bulkNameList(names, max) {
+            var shown = names.slice(0, max).join(', ');
+            return names.length > max ? shown + ' and ' + (names.length - max) + ' more' : shown;
+        }
+
+        function openBulk(action) {
+            if (!selectedFolder || bulkSel.names.size === 0) return;
+            var source = { scope: selectedFolder.scope, folder: folderPath(selectedFolder) };
+            var names = Array.from(bulkSel.names).sort();
+            bulkState = {
+                action: action,
+                source: source,
+                items: names.map(function(n) { return { scope: source.scope, folder: source.folder, name: n }; }),
+                target: null,
+                folders: null
+            };
+            var verb = { move: 'Move', copy: 'Copy', 'delete': 'Delete' }[action];
+            document.getElementById('bulk-title').textContent = verb + ' ' + bulkNoun(names.length);
+            document.getElementById('bulk-error').textContent = '';
+            document.getElementById('bulk-results').style.display = 'none';
+            document.getElementById('bulk-conflict').style.display = 'none';
+            document.querySelector('input[name="bulk-conflict"][value="skip"]').checked = true;
+            var confirmBtn = document.getElementById('bulk-confirm');
+            confirmBtn.style.display = '';
+            confirmBtn.textContent = verb;
+            confirmBtn.classList.toggle('bulk-danger', action === 'delete');
+            document.getElementById('bulk-cancel').textContent = 'Cancel';
+            var preview = document.getElementById('bulk-preview');
+
+            if (action === 'delete') {
+                document.getElementById('bulk-pick').style.display = 'none';
+                preview.innerHTML = '';
+                var p = document.createElement('p');
+                p.textContent = 'Permanently delete ' + bulkNoun(names.length) + ' from ' + source.folder + ': ' + bulkNameList(names, 15) + '.';
+                preview.appendChild(p);
+                var w = document.createElement('p');
+                w.className = 'bulk-warn';
+                w.textContent = 'Their stored credentials are deleted with them. This cannot be undone.';
+                preview.appendChild(w);
+                confirmBtn.disabled = false;
+            } else {
+                document.getElementById('bulk-pick').style.display = '';
+                document.getElementById('bulk-folder-filter').value = '';
+                preview.textContent = '';
+                confirmBtn.disabled = true;
+                var list = document.getElementById('bulk-folder-list');
+                list.innerHTML = '<p class="empty" style="padding:0.5em">Loading folders...</p>';
+                fetch('/api/addressbook/folder-paths', { headers: apiHeaders(), credentials: 'same-origin' })
+                    .then(function(res) {
+                        if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                        return res.json();
+                    })
+                    .then(function(data) {
+                        if (!bulkState) return;
+                        bulkState.folders = data.folders || [];
+                        renderBulkFolders();
+                    })
+                    .catch(function(err) {
+                        list.innerHTML = '';
+                        document.getElementById('bulk-error').textContent = 'Could not load folders: ' + err.message;
+                    });
+            }
+            document.getElementById('bulk-modal').classList.add('active');
+        }
+
+        function renderBulkFolders() {
+            var list = document.getElementById('bulk-folder-list');
+            var q = document.getElementById('bulk-folder-filter').value.trim().toLowerCase();
+            list.innerHTML = '';
+            var shown = 0;
+            bulkState.folders.forEach(function(f, i) {
+                if (q && f.path.toLowerCase().indexOf(q) < 0) return;
+                var isSource = f.scope === bulkState.source.scope && f.path === bulkState.source.folder;
+                // Moving into the folder it is already in does nothing.
+                if (isSource && bulkState.action === 'move') return;
+                var label = document.createElement('label');
+                var radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = 'bulk-target';
+                radio.value = String(i);
+                if (bulkState.target === f) radio.checked = true;
+                radio.addEventListener('change', function() { chooseBulkTarget(f); });
+                label.appendChild(radio);
+                var name = document.createElement('span');
+                name.textContent = f.path;
+                if (isSource) name.className = 'bulk-current';
+                label.appendChild(name);
+                var tag = document.createElement('span');
+                tag.className = 'scope-tag';
+                tag.textContent = (isSource ? 'this folder, ' : '') + f.scope;
+                label.appendChild(tag);
+                list.appendChild(label);
+                shown++;
+            });
+            if (shown === 0) list.innerHTML = '<p class="empty" style="padding:0.5em">No matching folders.</p>';
+        }
+        document.getElementById('bulk-folder-filter').addEventListener('input', function() {
+            if (bulkState && bulkState.folders) renderBulkFolders();
+        });
+
+        function chooseBulkTarget(f) {
+            bulkState.target = f;
+            var confirmBtn = document.getElementById('bulk-confirm');
+            confirmBtn.disabled = true;
+            var preview = document.getElementById('bulk-preview');
+            preview.textContent = 'Checking ' + f.path + '...';
+            var base = '/api/addressbook/folders/';
+            var get = function(url) {
+                return fetch(url, { headers: apiHeaders(), credentials: 'same-origin' }).then(function(res) {
+                    if (res.status === 404) return null;
+                    if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    return res.json();
+                });
+            };
+            Promise.all([
+                get(base + encodeURIComponent(f.scope) + '/' + encodeURIComponent(f.path) + '/entries'),
+                get(base + encodeURIComponent(f.scope) + '/' + encodeURIComponent(f.path) + '/config'),
+                get(base + encodeURIComponent(bulkState.source.scope) + '/' + encodeURIComponent(bulkState.source.folder) + '/config')
+            ]).then(function(r) {
+                if (!bulkState || bulkState.target !== f) return; // a later choice won
+                var existing = new Set((r[0] || []).map(function(e) { return e.name; }));
+                var clashes = bulkState.items.filter(function(i) { return existing.has(i.name); }).map(function(i) { return i.name; });
+                var verb = bulkState.action === 'move' ? 'moved' : 'copied';
+                preview.innerHTML = '';
+                var p = document.createElement('p');
+                p.textContent = bulkNoun(bulkState.items.length) + ' will be ' + verb + ' to ' + f.path + ' (' + f.scope + '). Stored credentials go with them.';
+                preview.appendChild(p);
+                if (clashes.length) {
+                    var c = document.createElement('p');
+                    c.className = 'bulk-warn';
+                    c.textContent = clashes.length + ' already ' + (clashes.length === 1 ? 'exists' : 'exist') + ' there: ' + bulkNameList(clashes, 10) + '. Existing entries are never overwritten.';
+                    preview.appendChild(c);
+                }
+                document.getElementById('bulk-conflict').style.display = clashes.length ? '' : 'none';
+                if (f.scope !== bulkState.source.scope) {
+                    var s = document.createElement('p');
+                    s.className = 'bulk-warn';
+                    s.textContent = 'This crosses from ' + bulkState.source.scope + ' to ' + f.scope + ', which changes which rustguac instances can see these entries.';
+                    preview.appendChild(s);
+                }
+                // Groups match case-sensitively, emails do not.
+                var norm = function(cfg, key) {
+                    var list = (cfg && cfg[key]) || [];
+                    if (key === 'allowed_users') list = list.map(function(x) { return x.toLowerCase(); });
+                    return list.slice().sort().join(', ');
+                };
+                var srcGroups = norm(r[2], 'allowed_groups'), dstGroups = norm(r[1], 'allowed_groups');
+                var srcUsers = norm(r[2], 'allowed_users'), dstUsers = norm(r[1], 'allowed_users');
+                if (srcGroups !== dstGroups || srcUsers !== dstUsers) {
+                    var g = document.createElement('p');
+                    g.className = 'bulk-warn';
+                    var desc = function(groups, users) {
+                        var parts = [];
+                        parts.push('groups: ' + (groups || 'none'));
+                        if (users) parts.push('users: ' + users);
+                        return parts.join('; ');
+                    };
+                    g.textContent = 'The target folder grants access differently (here: ' + desc(srcGroups, srcUsers) + '. There: ' + desc(dstGroups, dstUsers) + '), so who can see and connect to these entries will change.';
+                    preview.appendChild(g);
+                }
+                confirmBtn.disabled = false;
+            }).catch(function(err) {
+                preview.textContent = '';
+                document.getElementById('bulk-error').textContent = 'Could not check the target folder: ' + err.message;
+            });
+        }
+
+        document.getElementById('bulk-confirm').addEventListener('click', function() {
+            if (!bulkState) return;
+            var confirmBtn = this;
+            var body = { action: bulkState.action, items: bulkState.items };
+            if (bulkState.action !== 'delete') {
+                if (!bulkState.target) return;
+                body.target = { scope: bulkState.target.scope, folder: bulkState.target.path };
+                body.on_conflict = document.querySelector('input[name="bulk-conflict"]:checked').value;
+            }
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = 'Working...';
+            document.getElementById('bulk-error').textContent = '';
+            fetch('/api/addressbook/bulk', {
+                method: 'POST',
+                headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                credentials: 'same-origin',
+                body: JSON.stringify(body)
+            })
+            .then(function(res) {
+                if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                return res.json();
+            })
+            .then(function(data) { showBulkResults(data); })
+            .catch(function(err) {
+                document.getElementById('bulk-error').textContent = err.message;
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = 'Retry';
+            });
+        });
+
+        function showBulkResults(data) {
+            var labels = {
+                moved: 'moved', copied: 'copied', deleted: 'deleted', skipped: 'skipped',
+                failed: 'failed', copied_not_removed: 'copied but not removed from here'
+            };
+            var counts = data.summary || {};
+            var parts = Object.keys(counts).map(function(k) { return counts[k] + ' ' + (labels[k] || k); });
+            var box = document.getElementById('bulk-results');
+            box.innerHTML = '';
+            var p = document.createElement('p');
+            p.textContent = parts.join(', ') + '.';
+            box.appendChild(p);
+            var notable = (data.results || []).filter(function(r) {
+                var plain = r.status === 'moved' || r.status === 'copied' || r.status === 'deleted';
+                return !plain || !!r.new_name;
+            });
+            if (notable.length) {
+                var ul = document.createElement('ul');
+                notable.forEach(function(r) {
+                    var li = document.createElement('li');
+                    var bad = r.status === 'failed' || r.status === 'copied_not_removed';
+                    if (bad) li.className = 'bulk-bad';
+                    li.textContent = r.name + ': ' + (r.new_name ? 'saved as ' + r.new_name : (r.error || labels[r.status] || r.status));
+                    ul.appendChild(li);
+                });
+                box.appendChild(ul);
+            }
+            box.style.display = '';
+            document.getElementById('bulk-pick').style.display = 'none';
+            document.getElementById('bulk-conflict').style.display = 'none';
+            document.getElementById('bulk-preview').innerHTML = '';
+            document.getElementById('bulk-confirm').style.display = 'none';
+            document.getElementById('bulk-cancel').textContent = 'Close';
+            bulkState.done = true;
+        }
+
+        function closeBulk() {
+            var st = bulkState;
+            bulkState = null;
+            document.getElementById('bulk-modal').classList.remove('active');
+            if (!st || !st.done) return;
+            // Refresh what changed: the source always, the target if cached.
+            bulkSel.names.clear();
+            if (st.target) {
+                var tk = folderKey(st.target.scope, st.target.path);
+                delete folderEntries[tk];
+                delete folderEntryCounts[tk];
+            }
+            loadEntries(st.source.scope, st.source.folder, true);
+        }
+        document.getElementById('bulk-cancel').addEventListener('click', closeBulk);
+        document.getElementById('bulk-modal').addEventListener('click', function(ev) {
+            if (ev.target === this) closeBulk();
+        });
+
         // Connect to an entry (with optional credential prompt)
         var pendingConnect = null; // { scope, folder, name, btn }
 
         function doConnect(scope, folder, name, btn, extraBody, newWindow) {
             var isWinBtn = !!(btn.getAttribute && btn.getAttribute('data-connect-win'));
             btn.disabled = true;
-            if (!isWinBtn) btn.textContent = 'Connecting...';
+            if (!isWinBtn) btn.classList.add('loading');
             clearError();
-            // A window opened AFTER the async connect fetch is popup-blocked (no
-            // user gesture), so open it synchronously now (we are still inside the
-            // click gesture) and navigate it once the session exists.
-            var targetWin = null;
+            // Open the target window synchronously now, while we are still
+            // inside the click gesture: a window opened after the async fetch
+            // is popup-blocked, and — the reason it matters for a
+            // fullscreen-on-connect entry — a window opened within the gesture
+            // carries the user activation, so the client can enter fullscreen
+            // on load with no second click. The ⧉ button gets a sized popup;
+            // a plain Connect gets a tab.
+            var targetWin = null, popup = null;
             if (newWindow) {
-                targetWin = window.open('', '_blank',
-                    'width=1280,height=800,menubar=no,toolbar=no,location=no,status=no');
+                // Measured popup (search.js rgOpenSessionWindow): the splash
+                // page reports its laid-out viewport, and the session is
+                // created at exactly that size so nothing resizes on load.
+                if (typeof window.rgOpenSessionWindow === 'function') {
+                    popup = window.rgOpenSessionWindow(name);
+                    targetWin = popup.win;
+                } else {
+                    targetWin = window.open('', '_blank',
+                        'width=1280,height=800,menubar=no,toolbar=no,location=no,status=no');
+                }
+            } else {
+                targetWin = window.open('', '_blank');
             }
             var body = extraBody || {};
             // Send browser dimensions so RDP sessions start at correct resolution
@@ -2351,13 +3354,16 @@
             if (!body.width && bw > 0 && bh > 0) {
                 body.width = bw;
                 body.height = bh;
-                if (!body.dpi) body.dpi = Math.round((window.devicePixelRatio || 1) * 96);
             }
-            fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name) + '/connect', {
-                method: 'POST',
-                headers: apiHeaders({ 'Content-Type': 'application/json' }),
-                credentials: 'same-origin',
-                body: JSON.stringify(body)
+            if (!body.dpi) body.dpi = Math.round((window.devicePixelRatio || 1) * 96);
+            (popup ? popup.size : Promise.resolve(null)).then(function(sz) {
+                if (sz) { body.width = sz.width; body.height = sz.height; }
+                return fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name) + '/connect', {
+                    method: 'POST',
+                    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                    credentials: 'same-origin',
+                    body: JSON.stringify(body)
+                });
             })
             .then(function(res) {
                 if (!res.ok) {
@@ -2373,7 +3379,14 @@
                 return res.json();
             })
             .then(function(data) {
-                var url = data.client_url + '?name=' + encodeURIComponent(name);
+                // Carry the fullscreen-on-connect flag so the client can go
+                // fullscreen immediately, using the activation from this click.
+                var _e0 = null;
+                for (var _k = 0; _k < currentEntries.length; _k++) { if (currentEntries[_k].name === name) { _e0 = currentEntries[_k]; break; } }
+                // A new window (⧉) is explicitly windowed: fs=0 tells the
+                // client not to fullscreen-on-connect even if the entry asks.
+                var url = data.client_url + '?name=' + encodeURIComponent(name)
+                    + (newWindow ? '&fs=0' : (_e0 && _e0.fullscreen_on_connect ? '&fs=1' : ''));
                 if (targetWin && !targetWin.closed) targetWin.location.href = url;
                 else window.open(url, '_blank');
             })
@@ -2396,7 +3409,7 @@
             })
             .finally(function() {
                 btn.disabled = false;
-                if (!isWinBtn) btn.textContent = 'Connect';
+                btn.classList.remove('loading');
             });
         }
 
@@ -2407,15 +3420,13 @@
             var isRdp = entry.session_type === 'rdp';
             var isVnc = entry.session_type === 'vnc';
             document.getElementById('cred-domain-row').style.display = isRdp ? '' : 'none';
-            // VNC has password only — hide username row
-            document.getElementById('cred-username-row').style.display = isVnc ? 'none' : '';
-            // Pre-fill username if the entry has one stored
-            document.getElementById('cred-username').value = isVnc ? '' : (entry.username || '');
+            // Pre-fill username if the entry has one stored (optional for VNC)
+            document.getElementById('cred-username').value = entry.username || '';
             document.getElementById('cred-password').value = '';
             document.getElementById('cred-domain').value = entry.domain || '';
             document.getElementById('cred-error').textContent = '';
             document.getElementById('cred-modal').classList.add('active');
-            // Focus password if username is pre-filled or VNC, otherwise focus username
+            // Focus password if username is pre-filled or optional (VNC), otherwise focus username
             if (entry.username || isVnc) {
                 document.getElementById('cred-password').focus();
             } else {
@@ -2427,8 +3438,7 @@
             document.getElementById('cred-modal').classList.remove('active');
             if (pendingConnect && pendingConnect.btn) {
                 pendingConnect.btn.disabled = false;
-                if (!pendingConnect.btn.getAttribute('data-connect-win'))
-                    pendingConnect.btn.textContent = 'Connect';
+                pendingConnect.btn.classList.remove('loading');
             }
             pendingConnect = null;
         });
@@ -2455,19 +3465,9 @@
             if (e.key === 'Enter') document.getElementById('cred-connect').click();
         });
 
-        document.getElementById('entries-content').addEventListener('click', function(e) {
+        // Connect / clone / delete / edit actions for the folder entries table.
+        function handleEntryActionsClick(e) {
             var btn = e.target;
-
-            // Open folder from a search result row
-            var openLink = btn.closest && btn.closest('.search-open-folder');
-            if (openLink) {
-                e.preventDefault();
-                openFolderFromSearch(
-                    openLink.getAttribute('data-open-scope'),
-                    openLink.getAttribute('data-open-folder')
-                );
-                return;
-            }
 
             if (btn.getAttribute('data-connect') || btn.getAttribute('data-connect-win')) {
                 var newWindow = !!btn.getAttribute('data-connect-win');
@@ -2476,27 +3476,20 @@
                 var folder = btn.getAttribute('data-folder');
                 clearError();
 
-                // Find the entry data. When the table is showing search results,
-                // currentEntries is the previously-selected folder's entries —
-                // look in searchIndex instead.
+                // Find the entry in the current folder's entries.
                 var entry = null;
-                if (searchActive && searchIndex) {
-                    for (var si = 0; si < searchIndex.length; si++) {
-                        var r = searchIndex[si];
-                        if (r.scope === scope && r.folderPath === folder && r.entry.name === name) {
-                            entry = r.entry; break;
-                        }
-                    }
-                } else {
-                    for (var i = 0; i < currentEntries.length; i++) {
-                        if (currentEntries[i].name === name) { entry = currentEntries[i]; break; }
-                    }
+                for (var i = 0; i < currentEntries.length; i++) {
+                    if (currentEntries[i].name === name) { entry = currentEntries[i]; break; }
                 }
 
                 // Prompt for credentials if prompt_credentials is set or no stored creds
                 // (RDP and SSH entries without passwords/keys)
                 if (entry && (entry.prompt_credentials || !entry.has_credentials) && entry.session_type !== 'web' && entry.session_type !== 'vdi' && entry.session_type !== 'proxmox') {
                     showCredPrompt(entry, scope, folder, btn, newWindow);
+                } else if (entry && entry.fullscreen_on_connect && !newWindow && typeof window.rgLaunchFullscreen === 'function') {
+                    // Zero-click fullscreen: fullscreen this tab on the click and
+                    // load the session in a full-viewport iframe (search.js).
+                    window.rgLaunchFullscreen(scope, folder, name, btn);
                 } else {
                     doConnect(scope, folder, name, btn, undefined, newWindow);
                 }
@@ -2508,14 +3501,16 @@
                 var name = btn.getAttribute('data-delete-entry');
                 var scope = btn.getAttribute('data-scope');
                 var folder = btn.getAttribute('data-folder');
-                if (!confirm('Delete entry "' + name + '"?')) return;
-                fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name), {
-                    method: 'DELETE',
-                    headers: apiHeaders(),
-                    credentials: 'same-origin'
-                }).then(function(res) {
-                    if (!res.ok) return res.text().then(function(t) { showError(t); });
-                    loadEntries(scope, folder, true);
+                rgConfirm('Delete entry "' + name + '"?', { danger: true, confirmText: 'Delete' }).then(function(ok) {
+                    if (!ok) return;
+                    fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name), {
+                        method: 'DELETE',
+                        headers: apiHeaders(),
+                        credentials: 'same-origin'
+                    }).then(function(res) {
+                        if (!res.ok) return res.text().then(function(t) { showError(t); });
+                        loadEntries(scope, folder, true);
+                    });
                 });
                 return;
             }
@@ -2531,6 +3526,7 @@
                 openEditEntry(name, scope, folder, entry.session_type);
                 // Switch to create mode: enable name field, clear edit mode, set copy name
                 entryEditMode = null;
+                cloneSource = { scope: scope, folder: folder, name: name };
                 document.getElementById('entry-modal-title').textContent = 'Clone: ' + name;
                 var nameField = document.getElementById('em-name');
                 nameField.disabled = false;
@@ -2550,11 +3546,13 @@
                     btn.getAttribute('data-type')
                 );
             }
-        });
+        }
+        document.getElementById('entries-content').addEventListener('click', handleEntryActionsClick);
 
         // ── Folder modal ──
 
         var folderEditMode = null; // null = create, {scope, name, path} = edit
+        var fmUsersLoaded = false; // edit mode: has the folder's allowed_users arrived yet?
         var subfolderParent = null; // null, or { scope, path } when creating a subfolder
 
         function openNewFolder() {
@@ -2564,13 +3562,17 @@
             document.getElementById('fm-name').value = '';
             document.getElementById('fm-name').disabled = false;
             document.getElementById('fm-desc').value = '';
+            document.getElementById('fm-display').value = '';
             document.getElementById('fm-scope').value = 'shared';
             document.getElementById('fm-scope').disabled = false;
             document.getElementById('fm-error').textContent = '';
             document.getElementById('fm-groups-input').value = '';
             document.getElementById('fm-inherit').checked = false;
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = true;
             fmGroups = [];
             renderFmGroupChips();
+            renderFmDefaults({});
             loadKnownGroups(populateFmGroupOptions);
             document.getElementById('folder-modal').classList.add('active');
         }
@@ -2583,11 +3585,14 @@
             document.getElementById('fm-name').value = '';
             document.getElementById('fm-name').disabled = false;
             document.getElementById('fm-desc').value = '';
+            document.getElementById('fm-display').value = '';
             document.getElementById('fm-scope').value = subfolderParent.scope;
             document.getElementById('fm-scope').disabled = true;
             document.getElementById('fm-error').textContent = '';
             document.getElementById('fm-groups-input').value = '';
             document.getElementById('fm-inherit').checked = true;
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = true;
             fmGroups = [];
             renderFmGroupChips();
             loadKnownGroups(populateFmGroupOptions);
@@ -2606,12 +3611,15 @@
             document.getElementById('fm-name').value = selectedFolder.name;
             document.getElementById('fm-name').disabled = true;
             document.getElementById('fm-desc').value = selectedFolder.description || '';
+            document.getElementById('fm-display').value = selectedFolder.display_name || '';
             document.getElementById('fm-scope').value = selectedFolder.scope;
             document.getElementById('fm-scope').disabled = true;
             document.getElementById('fm-error').textContent = '';
 
             // Reset chip state and kick off known-groups load, then fetch current config.
             document.getElementById('fm-groups-input').value = '';
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = false;
             fmGroups = [];
             renderFmGroupChips();
             loadKnownGroups(populateFmGroupOptions);
@@ -2628,7 +3636,18 @@
                     populateFmGroupOptions();
                 }
                 document.getElementById('fm-inherit').checked = !!(data && data.inherit_from_parent);
+                if (data && Array.isArray(data.allowed_users)) {
+                    document.getElementById('fm-users').value = data.allowed_users.join('\n');
+                    fmUsersLoaded = true;
+                }
             }).catch(function() {});
+            renderFmDefaults({});
+            fetch('/api/addressbook/folders/' + encodeURIComponent(selectedFolder.scope) + '/' + encodeURIComponent(selPath) + '/defaults', {
+                headers: apiHeaders(),
+                credentials: 'same-origin'
+            }).then(function(res) { return res.ok ? res.json() : null; })
+              .then(function(data) { if (data && data.defaults) renderFmDefaults(data.defaults); })
+              .catch(function() {});
 
             document.getElementById('folder-modal').classList.add('active');
         });
@@ -2671,12 +3690,76 @@
             });
         })();
 
+        // ── Folder default credentials (admin) ──
+        var FM_DEFAULT_TYPES = ['ssh', 'rdp', 'vnc', 'web'];
+        var fmDefaultsLoaded = {};   // type -> {username, domain, has_password, has_private_key}
+        function renderFmDefaults(summary) {
+            fmDefaultsLoaded = summary || {};
+            var rows = document.getElementById('fm-defaults-rows');
+            rows.innerHTML = '';
+            var any = false;
+            FM_DEFAULT_TYPES.forEach(function(t) {
+                var d = fmDefaultsLoaded[t];
+                if (d) any = true;
+                rows.insertAdjacentHTML('beforeend',
+                    '<tr data-type="' + t + '"><th>' + t + '</th>' +
+                    '<td><input class="fmd-user" placeholder="username" autocomplete="off" value="' + escapeAttr((d && d.username) || '') + '"></td>' +
+                    '<td><input type="password" class="fmd-pass" autocomplete="new-password" placeholder="' + (d && d.has_password ? '(stored)' : 'password') + '"></td>' +
+                    '<td>' + (t === 'ssh'
+                        ? '<textarea class="fmd-key" rows="1" spellcheck="false" placeholder="' + (d && d.has_private_key ? '(stored)' : 'private key') + '"></textarea>'
+                        : t === 'rdp'
+                        ? '<input class="fmd-domain" placeholder="domain" autocomplete="off" value="' + escapeAttr((d && d.domain) || '') + '">'
+                        : '') + '</td>' +
+                    '<td><label class="fmd-clear-label"><input type="checkbox" class="fmd-clear"> clear</label></td></tr>');
+            });
+            document.getElementById('fm-defaults').open = any;
+        }
+        // The PUT body: only what changed. A ticked clear sends null for the
+        // type; a typed secret sets it; a changed username sets it (empty
+        // clears). Nothing typed means no request at all.
+        function fmDefaultsPatch() {
+            var patch = {};
+            document.querySelectorAll('#fm-defaults-rows tr').forEach(function(tr) {
+                var t = tr.getAttribute('data-type');
+                var d = fmDefaultsLoaded[t];
+                if (tr.querySelector('.fmd-clear').checked) {
+                    if (d) patch[t] = null;
+                    return;
+                }
+                var part = {};
+                var user = tr.querySelector('.fmd-user').value.trim();
+                if (user !== ((d && d.username) || '')) part.username = user;
+                var domEl = tr.querySelector('.fmd-domain');
+                if (domEl && domEl.value.trim() !== ((d && d.domain) || '')) part.domain = domEl.value.trim();
+                var pass = tr.querySelector('.fmd-pass').value;
+                if (pass) part.password = pass;
+                var keyEl = tr.querySelector('.fmd-key');
+                if (keyEl && keyEl.value.trim()) part.private_key = keyEl.value.trim();
+                if (Object.keys(part).length) patch[t] = part;
+            });
+            return patch;
+        }
+        function saveFmDefaults(scope, path) {
+            var patch = fmDefaultsPatch();
+            if (!Object.keys(patch).length) return Promise.resolve();
+            return fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(path) + '/defaults', {
+                method: 'PUT',
+                headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                credentials: 'same-origin',
+                body: JSON.stringify(patch)
+            }).then(function(res) {
+                if (!res.ok) return res.text().then(function(t) { throw new Error('Default credentials: ' + t); });
+            });
+        }
+
         document.getElementById('fm-save').addEventListener('click', function() {
             var name = document.getElementById('fm-name').value.trim();
             var desc = document.getElementById('fm-desc').value.trim();
+            var displayName = document.getElementById('fm-display').value.trim();
             // Include anything still typed in the group input but not chipped yet
             addFmGroupFromInput();
             var groups = fmGroups.slice();
+            var users = document.getElementById('fm-users').value.split(/[\s,;]+/).filter(function(u) { return u; });
             var scope = document.getElementById('fm-scope').value;
             var errEl = document.getElementById('fm-error');
 
@@ -2695,13 +3778,21 @@
                     method: 'PUT',
                     headers: apiHeaders({ 'Content-Type': 'application/json' }),
                     credentials: 'same-origin',
-                    body: JSON.stringify({ allowed_groups: groups, description: desc, inherit_from_parent: document.getElementById('fm-inherit').checked })
+                    body: JSON.stringify(Object.assign(
+                        { allowed_groups: groups, description: desc, display_name: displayName, inherit_from_parent: document.getElementById('fm-inherit').checked },
+                        // Only send the list once it has loaded: an omitted
+                        // field keeps the stored list, an empty one clears it.
+                        fmUsersLoaded ? { allowed_users: users } : {}
+                    ))
                 })
                 .then(function(res) {
                     if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    return saveFmDefaults(folderEditMode.scope, folderEditMode.path || folderEditMode.name);
+                })
+                .then(function() {
                     document.getElementById('folder-modal').classList.remove('active');
                     // Update selected folder description
-                    if (selectedFolder) selectedFolder.description = desc;
+                    if (selectedFolder) { selectedFolder.description = desc; selectedFolder.display_name = displayName; }
                     loadFolders();
                 })
                 .catch(function(err) { errEl.textContent = err.message; })
@@ -2713,10 +3804,13 @@
                     method: 'POST',
                     headers: apiHeaders({ 'Content-Type': 'application/json' }),
                     credentials: 'same-origin',
-                    body: JSON.stringify({ name: fullPath, allowed_groups: groups, description: desc, scope: postScope, inherit_from_parent: document.getElementById('fm-inherit').checked })
+                    body: JSON.stringify({ name: fullPath, allowed_groups: groups, allowed_users: users, description: desc, display_name: displayName, scope: postScope, inherit_from_parent: document.getElementById('fm-inherit').checked })
                 })
                 .then(function(res) {
                     if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    return saveFmDefaults(postScope, fullPath);
+                })
+                .then(function() {
                     document.getElementById('folder-modal').classList.remove('active');
                     if (subfolderParent) {
                         // Expand parent so the new child shows, then invalidate cache and reload.
@@ -2728,7 +3822,7 @@
                         delete subfolderCache[parentKey];
                         var parent = findFolder(parentScope, parentPath);
                         if (parent) parent.has_children = true;
-                        selectedFolder = { name: name, scope: postScope, description: desc, path: fullPath, has_children: false };
+                        selectedFolder = { name: name, scope: postScope, description: desc, display_name: displayName, path: fullPath, has_children: false };
                         saveSelectedFolder();
                         subfolderParent = null;
                         loadSubfolders(parentScope, parentPath, function() {
@@ -2736,7 +3830,7 @@
                             loadEntries(selectedFolder.scope, fullPath, true);
                         });
                     } else {
-                        selectedFolder = { name: name, scope: scope, description: desc, path: name, has_children: false };
+                        selectedFolder = { name: name, scope: scope, description: desc, display_name: displayName, path: name, has_children: false };
                         saveSelectedFolder();
                         loadFolders();
                     }
@@ -2753,8 +3847,9 @@
             var warning = hasSubtree
                 ? 'Delete folder "' + selPath + '" AND all its subfolders and entries?\n\nThis recursively removes the entire subtree and cannot be undone.'
                 : 'Delete folder "' + selPath + '" and all its entries?\n\nThis cannot be undone.';
-            if (!confirm(warning)) return;
-            fetch('/api/addressbook/folders/' + encodeURIComponent(selectedFolder.scope) + '/' + encodeURIComponent(selPath), {
+            rgConfirm(warning, { title: 'Delete folder', danger: true, confirmText: 'Delete' }).then(function(ok) {
+              if (!ok) return;
+              fetch('/api/addressbook/folders/' + encodeURIComponent(selectedFolder.scope) + '/' + encodeURIComponent(selPath), {
                 method: 'DELETE',
                 headers: apiHeaders(),
                 credentials: 'same-origin'
@@ -2776,12 +3871,14 @@
                 document.getElementById('entries-header').style.display = 'none';
                 document.getElementById('entries-content').innerHTML = '<p class="empty">Select a folder to view entries.</p>';
                 loadFolders();
+              });
             });
         });
 
         // ── Entry modal ──
 
         var entryEditMode = null; // null = create, {scope, folder, name} = edit
+        var cloneSource = null;   // {scope, folder, name} while the create form is a clone
         var entryTypeSelect = document.getElementById('em-type');
 
         entryTypeSelect.addEventListener('change', function() {
@@ -2815,6 +3912,23 @@
             document.getElementById('em-recording-section').style.display = '';
             // Typescript recording is SSH-only (#159)
             document.getElementById('em-typescript-row').style.display = val === 'ssh' ? '' : 'none';
+            // SSH terminal font size is SSH-only
+            document.getElementById('em-ssh-font-size').parentElement.style.display = val === 'ssh' ? '' : 'none';
+            // Wake-on-LAN applies to SSH/RDP/VNC (guacd passes the magic packet)
+            document.getElementById('em-wol-section').style.display = (val === 'ssh' || val === 'rdp' || val === 'vnc') ? '' : 'none';
+        });
+
+        // Toggle Wake-on-LAN fields visibility
+        document.getElementById('em-wol-toggle').addEventListener('click', function() {
+            var fields = document.getElementById('em-wol-fields');
+            var arrow = document.getElementById('em-wol-arrow');
+            if (fields.style.display === 'none') {
+                fields.style.display = '';
+                arrow.innerHTML = '&#9660;';
+            } else {
+                fields.style.display = 'none';
+                arrow.innerHTML = '&#9654;';
+            }
         });
 
         // Toggle tunnel fields visibility
@@ -3094,7 +4208,7 @@
         function probeHostKey(hopIndex) {
             var hop = hopList[hopIndex];
             if (!hop || !hop.hostname || !hop.hostname.trim()) {
-                alert('Enter a hostname first.');
+                rgAlert('Enter a hostname first.');
                 return;
             }
             var btn = document.querySelector('.hop-verify-btn[data-hop="' + hopIndex + '"]');
@@ -3108,22 +4222,23 @@
             }).then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
             .then(function(res) {
                 if (!res.ok) {
-                    alert('Probe failed: ' + (res.data.error || 'unknown error'));
+                    rgAlert('Probe failed: ' + (res.data.error || 'unknown error'));
                     if (btn) { btn.disabled = false; btn.textContent = hop.host_key ? 'Re-verify' : 'Verify Host Key'; }
                     return;
                 }
-                var msg = 'Host key for ' + hop.hostname.trim() + ':' + (hop.port || 22) + ':\n\n' +
-                    res.data.fingerprint + ' (' + res.data.algorithm + ')\n\n' +
-                    'Trust this key?';
-                if (confirm(msg)) {
-                    hopList[hopIndex].host_key = res.data.host_key;
-                    hopList[hopIndex].host_key_fingerprint = res.data.fingerprint;
-                    renderHops();
-                } else {
-                    if (btn) { btn.disabled = false; btn.textContent = hop.host_key ? 'Re-verify' : 'Verify Host Key'; }
-                }
+                var msg = hop.hostname.trim() + ':' + (hop.port || 22) + '\n\n' +
+                    res.data.fingerprint + ' (' + res.data.algorithm + ')';
+                rgConfirm(msg, { title: 'Trust host key?', confirmText: 'Trust', safe: true }).then(function(ok) {
+                    if (ok) {
+                        hopList[hopIndex].host_key = res.data.host_key;
+                        hopList[hopIndex].host_key_fingerprint = res.data.fingerprint;
+                        renderHops();
+                    } else {
+                        if (btn) { btn.disabled = false; btn.textContent = hop.host_key ? 'Re-verify' : 'Verify Host Key'; }
+                    }
+                });
             }).catch(function(e) {
-                alert('Probe failed: ' + e.message);
+                rgAlert('Probe failed: ' + e.message);
                 if (btn) { btn.disabled = false; btn.textContent = hop.host_key ? 'Re-verify' : 'Verify Host Key'; }
             });
         }
@@ -3196,6 +4311,7 @@
         function openNewEntry() {
             if (!selectedFolder) return;
             entryEditMode = null;
+            cloneSource = null;
             document.getElementById('entry-modal-title').textContent = 'New Entry in ' + folderPath(selectedFolder);
             document.getElementById('em-name').value = '';
             document.getElementById('em-name').disabled = false;
@@ -3231,6 +4347,7 @@
             document.getElementById('em-ssh-prompt-creds').checked = false;
             document.getElementById('em-vnc-hostname').value = '';
             document.getElementById('em-vnc-port').value = '5900';
+            document.getElementById('em-vnc-username').value = '';
             document.getElementById('em-vnc-password').value = '';
             document.getElementById('em-vnc-color-depth').value = '';
             document.getElementById('em-vnc-prompt-creds').checked = false;
@@ -3254,6 +4371,14 @@
             document.getElementById('em-proxmox-color-depth').value = '';
             document.getElementById('em-proxmox-monitors').value = '1';
             document.getElementById('em-proxmox-verify-tls').checked = false;
+            document.getElementById('em-ssh-font-size').value = '';
+            document.getElementById('em-wol-enabled').checked = false;
+            document.getElementById('em-wol-mac').value = '';
+            document.getElementById('em-wol-broadcast').value = '';
+            document.getElementById('em-wol-port').value = '';
+            document.getElementById('em-wol-wait').value = '';
+            document.getElementById('em-wol-fields').style.display = 'none';
+            document.getElementById('em-wol-arrow').innerHTML = '&#9654;';
             document.getElementById('em-url').value = '';
             document.getElementById('em-banner').value = '';
             document.getElementById('em-web-username').value = '';
@@ -3315,6 +4440,7 @@
 
         function openEditEntry(name, scope, folder, type) {
             entryEditMode = { scope: scope, folder: folder, name: name };
+            cloneSource = null;
             document.getElementById('entry-modal-title').textContent = 'Edit: ' + name;
             document.getElementById('em-name').value = name;
             document.getElementById('em-name').disabled = true;
@@ -3363,6 +4489,7 @@
                     document.getElementById('em-hostname').value = entryData.hostname || '';
                     document.getElementById('em-port').value = entryData.port || '22';
                     document.getElementById('em-username').value = entryData.username || '';
+                    document.getElementById('em-ssh-font-size').value = entryData.ssh_font_size || '';
                     document.getElementById('em-ssh-prompt-creds').checked = !!entryData.prompt_credentials;
                 } else if (type === 'rdp') {
                     document.getElementById('em-rdp-hostname').value = entryData.hostname || '';
@@ -3381,6 +4508,7 @@
                 } else if (type === 'vnc') {
                     document.getElementById('em-vnc-hostname').value = entryData.hostname || '';
                     document.getElementById('em-vnc-port').value = entryData.port || '5900';
+                    document.getElementById('em-vnc-username').value = entryData.username || '';
                     document.getElementById('em-vnc-color-depth').value = entryData.color_depth ? String(entryData.color_depth) : '';
                     document.getElementById('em-vnc-prompt-creds').checked = !!entryData.prompt_credentials;
                 } else if (type === 'spice') {
@@ -3518,6 +4646,18 @@
                 document.getElementById('em-fullscreen-on-connect').checked = !!entryData.fullscreen_on_connect;
                 // Populate autohide-side-tabs flag
                 document.getElementById('em-autohide-side-tabs').checked = !!entryData.autohide_side_tabs;
+                // Populate Wake-on-LAN fields (SSH/RDP/VNC)
+                if (type === 'ssh' || type === 'rdp' || type === 'vnc') {
+                    document.getElementById('em-wol-enabled').checked = !!entryData.wol_send_packet;
+                    document.getElementById('em-wol-mac').value = entryData.wol_mac_addr || '';
+                    document.getElementById('em-wol-broadcast').value = entryData.wol_broadcast_addr || '';
+                    document.getElementById('em-wol-port').value = entryData.wol_udp_port || '';
+                    document.getElementById('em-wol-wait').value = entryData.wol_wait_time || '';
+                    if (entryData.wol_send_packet || entryData.wol_mac_addr) {
+                        document.getElementById('em-wol-fields').style.display = '';
+                        document.getElementById('em-wol-arrow').innerHTML = '&#9660;';
+                    }
+                }
                 // Populate hop list from jump_hosts array
                 if (entryData.jump_hosts && entryData.jump_hosts.length > 0) {
                     hopList = entryData.jump_hosts.map(function(h) {
@@ -3563,6 +4703,8 @@
                 if (pw) entry.password = pw;
                 var pk = document.getElementById('em-private-key').value.trim();
                 if (pk) entry.private_key = pk;
+                var fs = parseInt(document.getElementById('em-ssh-font-size').value);
+                if (fs > 0) entry.ssh_font_size = fs;
                 if (document.getElementById('em-ssh-prompt-creds').checked) entry.prompt_credentials = true;
             } else if (type === 'rdp') {
                 var h = document.getElementById('em-rdp-hostname').value.trim();
@@ -3592,6 +4734,8 @@
                 if (h) entry.hostname = h;
                 var p = parseInt(document.getElementById('em-vnc-port').value);
                 if (p) entry.port = p;
+                var u = document.getElementById('em-vnc-username').value.trim();
+                if (u) entry.username = u;
                 var pw = document.getElementById('em-vnc-password').value;
                 if (pw) entry.password = pw;
                 var cd = document.getElementById('em-vnc-color-depth').value;
@@ -3734,6 +4878,19 @@
             // Auto-hide the clipboard/files side tabs when idle
             if (document.getElementById('em-autohide-side-tabs').checked) entry.autohide_side_tabs = true;
 
+            // Wake-on-LAN (SSH/RDP/VNC)
+            if (type === 'ssh' || type === 'rdp' || type === 'vnc') {
+                if (document.getElementById('em-wol-enabled').checked) entry.wol_send_packet = true;
+                var wolMac = document.getElementById('em-wol-mac').value.trim();
+                if (wolMac) entry.wol_mac_addr = wolMac;
+                var wolBc = document.getElementById('em-wol-broadcast').value.trim();
+                if (wolBc) entry.wol_broadcast_addr = wolBc;
+                var wolPort = parseInt(document.getElementById('em-wol-port').value);
+                if (wolPort > 0) entry.wol_udp_port = wolPort;
+                var wolWait = parseInt(document.getElementById('em-wol-wait').value);
+                if (wolWait > 0) entry.wol_wait_time = wolWait;
+            }
+
             // Tunnel / jump host settings — multi-hop (all types)
             if (type === 'ssh' || type === 'rdp' || type === 'vnc' || type === 'web') {
                 var hops = hopList.filter(function(h) { return h.hostname && h.hostname.trim(); });
@@ -3774,26 +4931,21 @@
 
                 updatePromise.then(function() {
                     if (moveTarget) {
-                        // Move = create in new folder + delete from old
+                        // The server moves the entry as stored, secrets
+                        // included. This page never holds them, so building
+                        // the copy here dropped every password, key and
+                        // $variable reference (#232).
                         var sep = moveTarget.indexOf('|');
                         var targetScope = sep >= 0 ? moveTarget.slice(0, sep) : moveTarget;
                         var targetFolder = sep >= 0 ? moveTarget.slice(sep + 1) : '';
-                        var body = { name: entryEditMode.name };
-                        for (var k in entry) body[k] = entry[k];
 
-                        return fetch('/api/addressbook/folders/' + encodeURIComponent(targetScope) + '/' + encodeURIComponent(targetFolder) + '/entries', {
+                        return fetch('/api/addressbook/folders/' + encodeURIComponent(entryEditMode.scope) + '/' + encodeURIComponent(entryEditMode.folder) + '/entries/' + encodeURIComponent(entryEditMode.name) + '/move', {
                             method: 'POST',
                             headers: apiHeaders({ 'Content-Type': 'application/json' }),
                             credentials: 'same-origin',
-                            body: JSON.stringify(body)
+                            body: JSON.stringify({ target_scope: targetScope, target_folder: targetFolder })
                         }).then(function(res) {
                             if (!res.ok) return res.text().then(function(t) { throw new Error('Move failed: ' + t); });
-                            // Delete from original folder
-                            return fetch('/api/addressbook/folders/' + encodeURIComponent(entryEditMode.scope) + '/' + encodeURIComponent(entryEditMode.folder) + '/entries/' + encodeURIComponent(entryEditMode.name), {
-                                method: 'DELETE',
-                                headers: apiHeaders(),
-                                credentials: 'same-origin'
-                            });
                         }).then(function() {
                             // Switch to the target folder
                             selectedFolder = findFolder(targetScope, targetFolder) || selectedFolder;
@@ -3805,6 +4957,37 @@
                     document.getElementById('entry-modal').classList.remove('active');
                     entryTypeSelect.disabled = false;
                     loadEntries(selectedFolder.scope, folderPath(selectedFolder), true);
+                })
+                .catch(function(err) { errEl.textContent = err.message; })
+                .finally(function() { saveBtn.disabled = false; saveBtn.textContent = 'Save'; });
+            } else if (cloneSource) {
+                // Clone: the server copies the source entry as stored, secrets
+                // included (this page never holds them), and the form's edits
+                // are then applied as an ordinary update, which keeps any
+                // stored secret it is not given (#232).
+                var src = cloneSource;
+                var entryUrl = '/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name);
+                fetch('/api/addressbook/folders/' + encodeURIComponent(src.scope) + '/' + encodeURIComponent(src.folder) + '/entries/' + encodeURIComponent(src.name) + '/copy', {
+                    method: 'POST',
+                    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ target_scope: scope, target_folder: folder, new_name: name })
+                })
+                .then(function(res) {
+                    if (!res.ok) return res.text().then(function(t) { throw new Error('Clone failed: ' + t); });
+                    return fetch(entryUrl, {
+                        method: 'PUT',
+                        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                        credentials: 'same-origin',
+                        body: JSON.stringify(entry)
+                    });
+                })
+                .then(function(res) {
+                    if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    cloneSource = null;
+                    document.getElementById('entry-modal').classList.remove('active');
+                    entryTypeSelect.disabled = false;
+                    loadEntries(scope, folder, true);
                 })
                 .catch(function(err) { errEl.textContent = err.message; })
                 .finally(function() { saveBtn.disabled = false; saveBtn.textContent = 'Save'; });
@@ -3849,38 +5032,6 @@
             }
         });
 
-        // Quick-find: '/' focuses search, Esc clears + blurs.
-        // Skip when typing in any input/textarea or when a modal is open.
-        var _searchInput = document.getElementById('connections-search');
-        if (_searchInput) {
-            _searchInput.addEventListener('input', runSearch);
-            _searchInput.addEventListener('keydown', function(e) {
-                if (e.key === 'Escape') {
-                    if (_searchInput.value) {
-                        _searchInput.value = '';
-                        runSearch();
-                    } else {
-                        _searchInput.blur();
-                    }
-                    e.stopPropagation();
-                }
-            });
-        }
-        document.addEventListener('keydown', function(e) {
-            if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
-            var t = document.activeElement;
-            if (t) {
-                var tag = t.tagName;
-                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return;
-            }
-            if (document.querySelector('.modal-overlay.active')) return;
-            var input = document.getElementById('connections-search');
-            if (input && !input.disabled) {
-                e.preventDefault();
-                input.focus();
-                input.select();
-            }
-        });
 
         // ── My Credentials ──
         // Callback to run after a successful credential save (used by the
@@ -4272,6 +5423,12 @@
                 renderOnboardStep();
             }
         });
+        document.getElementById('onboard-close').addEventListener('click', function() {
+            // Corner "×" skips the intro entirely and won't show again until
+            // re-triggered via Settings → Welcome Tour.
+            localStorage.setItem('rustguac_onboarding_dismissed', '1');
+            closeOnboarding();
+        });
         document.getElementById('onboarding-modal').addEventListener('click', function(e) {
             if (e.target === this) closeOnboarding();
         });
@@ -4282,7 +5439,558 @@
             startOnboarding(currentUserRole);
         });
 
+        // ── UX (#254): selection feedback & sidebar render hygiene ──────────
+        // Everything here wraps existing functions or post-processes the DOM;
+        // renderFolders() itself is untouched.
+
+        var prefersReducedMotion = (function() {
+            try { return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+            catch (e) { return false; }
+        })();
+        var lastShownFolderKey = null;    // "scope|path" last passed to loadEntries()
+        var sidebarRevealPending = false; // set by loadFolders(); consumed by the renderFolders wrapper
+
+        // Nearest scrollable ancestor of el, stopping at (and including) the
+        // sidebar. null when the sidebar is not its own scroll container,
+        // in which case the page scroll already handles visibility.
+        function sidebarScrollContainer(el) {
+            var sidebar = document.querySelector('.sidebar');
+            var node = el ? el.parentElement : null;
+            while (node) {
+                var oy = getComputedStyle(node).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight) return node;
+                if (node === sidebar) break;
+                node = node.parentElement;
+            }
+            return null;
+        }
+
+        // scrollIntoView({ block: 'nearest' }) confined to the sidebar's own
+        // scroll container: moves container.scrollTop only, never the page.
+        function revealSidebarRow(li) {
+            if (!li) return;
+            var box = sidebarScrollContainer(li);
+            if (!box) return;
+            var row = li.querySelector('.folder-row') || li;
+            var cr = box.getBoundingClientRect();
+            var lr = row.getBoundingClientRect();
+            if (lr.top < cr.top) box.scrollTop -= (cr.top - lr.top);
+            else if (lr.bottom > cr.bottom) box.scrollTop += Math.min(lr.bottom - cr.bottom, lr.top - cr.top);
+        }
+
+        function selectedFolderLi() {
+            return document.querySelector('#folder-list li.selected');
+        }
+
+        // Bring the entries header to the top of the viewport when it is not
+        // comfortably in view (above the viewport after scrolling a long
+        // sidebar, or pushed into the lower half by the strips above it).
+        function jumpToEntriesHeader(header) {
+            if (!header) return;
+            // Scroll the entries pane only. scrollIntoView() would also scroll
+            // every scrollable ancestor, and a body with overflow hidden can
+            // still be scrolled by script: that pushed the brand row and the
+            // nav off the top of the page.
+            var pane = header.closest('.main');
+            if (pane && pane.scrollHeight > pane.clientHeight) {
+                try {
+                    pane.scrollTo({ top: 0, behavior: prefersReducedMotion ? 'auto' : 'smooth' });
+                } catch (e) {
+                    pane.scrollTop = 0;
+                }
+            }
+        }
+
+        // Replay the .changed animation on the entries header.
+        function flashEntriesHeader(header) {
+            if (!header) return;
+            header.classList.remove('changed');
+            void header.offsetWidth; // restart keyframes
+            header.classList.add('changed');
+            clearTimeout(header._rgChangedTimer);
+            // Fallback clear: with reduced motion the animation is disabled so
+            // no animationend fires; otherwise animationend clears it earlier.
+            header._rgChangedTimer = setTimeout(function() { header.classList.remove('changed'); }, 900);
+        }
+        (function() {
+            var header = document.getElementById('entries-header');
+            if (!header) return;
+            header.addEventListener('animationend', function(e) {
+                // The title finishes first; clear when the (longer) border
+                // flash ends so both animations complete.
+                if (e.animationName === 'rg-header-flash') header.classList.remove('changed');
+            });
+        })();
+
+        // Called by loadEntries() for every folder it shows. Only a change of
+        // folder (after one has already been shown) gets the jump + flash.
+        function announceFolderShown(key, header) {
+            var prev = lastShownFolderKey;
+            lastShownFolderKey = key;
+            if (prev === null || prev === key) return;
+            flashEntriesHeader(header);
+            jumpToEntriesHeader(header);
+            revealSidebarRow(selectedFolderLi());
+        }
+
+        // Skeleton placeholder shown while entries are fetched (never for the
+        // cached path). Same table class and column count as renderEntries().
+        function entriesSkeletonHtml() {
+            var cols = ['Name', 'Type', 'Host', 'User', ''];
+            var html = '<table class="entries-table skeleton" aria-busy="true" aria-label="Loading entries"><thead><tr>';
+            if (isAdmin) html += '<th class="sel-cell"><span class="sk-bar sk-check"></span></th>';
+            cols.forEach(function(c) { html += '<th>' + c + '</th>'; });
+            if (isAdmin) html += '<th></th><th></th><th></th>';
+            html += '</tr></thead><tbody>';
+            for (var i = 0; i < 4; i++) {
+                html += '<tr>';
+                if (isAdmin) html += '<td class="sel-cell"><span class="sk-bar sk-check"></span></td>';
+                html += '<td><span class="sk-bar"></span></td>' +
+                        '<td><span class="sk-bar sk-badge"></span></td>' +
+                        '<td><span class="sk-bar"></span></td>' +
+                        '<td><span class="sk-bar"></span></td>' +
+                        '<td class="connect-cell"><span class="sk-bar sk-btn"></span></td>';
+                if (isAdmin) html += '<td></td><td></td><td></td>';
+                html += '</tr>';
+            }
+            return html + '</tbody></table>';
+        }
+
+        function cssAttrEscape(s) {
+            if (window.CSS && CSS.escape) return CSS.escape(s);
+            return String(s).replace(/["\\]/g, '\\$&');
+        }
+
+        // Update one folder's count badge in place instead of rebuilding the
+        // whole sidebar. Keeps whatever text format renderFolders() produced
+        // (only the number is swapped). Falls back to a full render when the
+        // row or its badge does not exist yet.
+        function updateFolderCount(scope, path, n) {
+            folderEntryCounts[folderKey(scope, path)] = n;
+            var li = document.querySelector('#folder-list li[data-scope="' + cssAttrEscape(scope) + '"][data-path="' + cssAttrEscape(path) + '"]');
+            var badge = null;
+            if (li) {
+                var all = li.querySelectorAll('.folder-count');
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].closest('li') === li) { badge = all[i]; break; }
+                }
+            }
+            if (!badge || !/\d/.test(badge.textContent)) { renderFolders(); return; }
+            badge.textContent = badge.textContent.replace(/\d[\d,]*/, String(n));
+            badge.setAttribute('data-count', String(n));
+            badge.title = n + ' entr' + (n === 1 ? 'y' : 'ies');
+        }
+
+        // Wrap renderFolders(): preserve the sidebar's scroll position across
+        // a rebuild, and reveal the selected row (within the sidebar only)
+        // when the selection changed or a tree reload asked for it.
+        var __renderFolders = renderFolders;
+        var __lastRenderedSelKey = null;
+        renderFolders = function() {
+            var boxes = [];
+            var node = document.getElementById('folder-list');
+            while (node) {
+                if (node.scrollTop) boxes.push({ el: node, top: node.scrollTop });
+                if (node.classList && node.classList.contains('sidebar')) break;
+                node = node.parentElement;
+            }
+            var result = __renderFolders.apply(this, arguments);
+            boxes.forEach(function(b) { b.el.scrollTop = b.top; });
+            var selKey = selectedFolder ? folderKey(selectedFolder.scope, folderPath(selectedFolder)) : null;
+            var li = selectedFolderLi();
+            if (li && (sidebarRevealPending || selKey !== __lastRenderedSelKey)) {
+                sidebarRevealPending = false;
+                revealSidebarRow(li);
+            }
+            __lastRenderedSelKey = selKey;
+            return result;
+        };
+
+        // Wrap loadFolders(): after a tree (re)build the selected row should
+        // be visible in the sidebar. Arguments pass through untouched.
+        var __loadFolders = loadFolders;
+        loadFolders = function() {
+            sidebarRevealPending = true;
+            return __loadFolders.apply(this, arguments);
+        };
+        // ── end UX (#254) ────────────────────────────────────────────────────
+
+        // ── UX (#254): folder filter + keyboard navigation ──────────────────
+        // Post-processes the tree that renderFolders() builds (it never edits
+        // it): a live filter box mounted in #sidebar-tools, tree/treeitem ARIA
+        // roles with a roving tabindex, arrow-key navigation, and an `f`
+        // shortcut mirroring the `/` quick-find one above.
+        var FOLDER_FILTER_KEY = 'rustguac_folder_filter';
+        var _ffWrap = null, _ffInput = null, _ffCount = null;
+
+        (function mountFolderFilter() {
+            var tools = document.getElementById('sidebar-tools');
+            if (!tools) return;
+            _ffWrap = document.createElement('div');
+            _ffWrap.className = 'folder-filter-wrap';
+            _ffInput = document.createElement('input');
+            _ffInput.type = 'search';
+            _ffInput.id = 'folder-filter';
+            _ffInput.placeholder = 'Filter folders';
+            _ffInput.autocomplete = 'off';
+            _ffInput.spellcheck = false;
+            _ffInput.setAttribute('aria-label', 'Filter folders');
+            _ffInput.setAttribute('aria-controls', 'folder-list');
+            _ffInput.title = 'Filter folders (f). Arrow down to move into the list.';
+            _ffCount = document.createElement('span');
+            _ffCount.id = 'folder-filter-count';
+            _ffCount.setAttribute('aria-live', 'polite');
+            var clear = document.createElement('button');
+            clear.type = 'button';
+            clear.id = 'folder-filter-clear';
+            clear.title = 'Clear filter (Esc)';
+            clear.setAttribute('aria-label', 'Clear folder filter');
+            clear.textContent = '×';
+            clear.tabIndex = -1;
+            _ffWrap.appendChild(_ffInput);
+            _ffWrap.appendChild(_ffCount);
+            _ffWrap.appendChild(clear);
+            tools.appendChild(_ffWrap);
+
+            try { _ffInput.value = sessionStorage.getItem(FOLDER_FILTER_KEY) || ''; } catch (e) {}
+
+            _ffInput.addEventListener('input', function() {
+                try {
+                    if (_ffInput.value) sessionStorage.setItem(FOLDER_FILTER_KEY, _ffInput.value);
+                    else sessionStorage.removeItem(FOLDER_FILTER_KEY);
+                } catch (e) {}
+                applyFolderFilter();
+            });
+            clear.addEventListener('click', function() {
+                clearFolderFilter();
+                _ffInput.focus();
+            });
+            _ffInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                    if (_ffInput.value) clearFolderFilter();
+                    else _ffInput.blur();
+                    e.stopPropagation();
+                    e.preventDefault();
+                } else if (e.key === 'ArrowDown') {
+                    var rows = visibleFolderRows();
+                    if (rows.length) { e.preventDefault(); focusFolderRow(rows[0]); }
+                } else if (e.key === 'Enter') {
+                    // Exactly one match: open it. Otherwise step into the list.
+                    var vis = visibleFolderRows();
+                    if (!vis.length) return;
+                    e.preventDefault();
+                    focusFolderRow(vis[0]);
+                    if (vis.length === 1) vis[0].click();
+                }
+            });
+        })();
+
+        function clearFolderFilter() {
+            if (!_ffInput) return;
+            _ffInput.value = '';
+            try { sessionStorage.removeItem(FOLDER_FILTER_KEY); } catch (e) {}
+            applyFolderFilter();
+        }
+
+        // The folder <li>s renderFolders() emits (placeholders carry no data-path).
+        function folderLis(container) {
+            var out = [];
+            for (var i = 0; i < container.children.length; i++) {
+                var li = container.children[i];
+                if (li.tagName === 'LI' && li.hasAttribute('data-path')) out.push(li);
+            }
+            return out;
+        }
+        function folderRowOf(li) {
+            var row = li.firstElementChild;
+            return row && row.classList.contains('folder-row') ? row : null;
+        }
+        function folderChildList(li) {
+            for (var i = 0; i < li.children.length; i++) {
+                if (li.children[i].tagName === 'UL') return li.children[i];
+            }
+            return null;
+        }
+        function folderLiHaystack(li) {
+            var parts = [li.getAttribute('data-path') || ''];
+            var row = folderRowOf(li);
+            if (row) {
+                var name = row.querySelector('.folder-name-row > span:first-child, .folder-name');
+                if (name) parts.push(name.textContent);
+                var desc = row.querySelector('.folder-desc');
+                if (desc) parts.push(desc.textContent);
+            }
+            return parts.join(' ').toLowerCase();
+        }
+        // Loaded-but-collapsed descendants (subfolderCache) count as matches
+        // too, so a parent stays visible when something under it matches.
+        function cachedDescendantMatches(scope, path, tokens, depth) {
+            var kids = subfolderCache[folderKey(scope, path)];
+            if (!kids || depth > 12) return false;
+            for (var i = 0; i < kids.length; i++) {
+                var k = kids[i];
+                var hay = (folderPath(k) + ' ' + k.name + ' ' + (k.description || '')).toLowerCase();
+                if (matchesTokens(hay, tokens)) return true;
+                if (k.has_children && cachedDescendantMatches(k.scope, folderPath(k), tokens, depth + 1)) return true;
+            }
+            return false;
+        }
+        function matchesTokens(hay, tokens) {
+            for (var t = 0; t < tokens.length; t++) {
+                if (hay.indexOf(tokens[t]) === -1) return false;
+            }
+            return true;
+        }
+
+        function applyFolderFilter() {
+            var ul = document.getElementById('folder-list');
+            if (!ul) return;
+            var q = _ffInput ? (_ffInput.value || '').trim().toLowerCase() : '';
+            var tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+            var total = 0, shown = 0;
+
+            // Returns true if anything in this <ul> stays visible.
+            function walk(list, parentSelfMatch, depth) {
+                var anyVisible = false;
+                for (var i = 0; i < list.children.length; i++) {
+                    var li = list.children[i];
+                    if (li.tagName !== 'LI') continue;
+                    if (!li.hasAttribute('data-path')) {
+                        // Placeholders: "Loading...", "(empty)", unavailable scope, "No folders".
+                        var keep = !tokens.length || depth === 0 || parentSelfMatch;
+                        li.classList.toggle('filtered-out', !keep);
+                        continue;
+                    }
+                    total++;
+                    var selfMatch = !tokens.length || matchesTokens(folderLiHaystack(li), tokens);
+                    var childUl = folderChildList(li);
+                    var childVisible = childUl ? walk(childUl, selfMatch, depth + 1) : false;
+                    var visible = selfMatch || childVisible;
+                    if (!visible && tokens.length && !childUl) {
+                        var row = folderRowOf(li);
+                        var chev = row && row.querySelector('.tree-chevron');
+                        if (chev && !chev.classList.contains('leaf')) {
+                            visible = cachedDescendantMatches(li.getAttribute('data-scope'), li.getAttribute('data-path'), tokens, 0);
+                        }
+                    }
+                    li.classList.toggle('filtered-out', !visible);
+                    if (visible) { shown++; anyVisible = true; }
+                }
+                return anyVisible;
+            }
+            walk(ul, true, 0);
+
+            if (_ffWrap) {
+                // No folders at all (empty / no-vault states): nothing to filter.
+                _ffWrap.style.display = total === 0 && !tokens.length ? 'none' : '';
+                _ffWrap.classList.toggle('filtering', tokens.length > 0);
+                if (tokens.length) {
+                    _ffCount.textContent = shown + ' of ' + total;
+                    _ffCount.classList.toggle('no-match', shown === 0);
+                    _ffInput.style.paddingRight = (_ffCount.offsetWidth + 34) + 'px';
+                } else {
+                    _ffCount.textContent = '';
+                    _ffCount.classList.remove('no-match');
+                    _ffInput.style.paddingRight = '';
+                }
+            }
+            decorateFolderTree(ul);
+        }
+
+        // ARIA roles + roving tabindex. Cheap enough to redo on every render.
+        function decorateFolderTree(ul) {
+            ul.setAttribute('role', 'tree');
+            ul.setAttribute('aria-label', 'Folders');
+            var rows = [];
+            function visit(list, level) {
+                if (list !== ul) list.setAttribute('role', 'group');
+                folderLis(list).forEach(function(li) {
+                    var row = folderRowOf(li);
+                    if (!row) return;
+                    row.setAttribute('role', 'treeitem');
+                    row.setAttribute('aria-level', String(level));
+                    row.setAttribute('aria-selected', li.classList.contains('selected') ? 'true' : 'false');
+                    var chev = row.querySelector('.tree-chevron');
+                    if (chev && !chev.classList.contains('leaf')) {
+                        row.setAttribute('aria-expanded', chev.classList.contains('expanded') ? 'true' : 'false');
+                    } else {
+                        row.removeAttribute('aria-expanded');
+                    }
+                    row.tabIndex = -1;
+                    rows.push(row);
+                    var childUl = folderChildList(li);
+                    if (childUl) visit(childUl, level + 1);
+                });
+            }
+            visit(ul, 1);
+            var vis = visibleFolderRows();
+            var tabStop = null;
+            for (var i = 0; i < vis.length; i++) {
+                if (vis[i].getAttribute('aria-selected') === 'true') { tabStop = vis[i]; break; }
+            }
+            if (!tabStop && vis.length) tabStop = vis[0];
+            if (tabStop) tabStop.tabIndex = 0;
+        }
+
+        function visibleFolderRows() {
+            var ul = document.getElementById('folder-list');
+            if (!ul) return [];
+            var out = [];
+            var all = ul.querySelectorAll('li[data-path] > .folder-row');
+            for (var i = 0; i < all.length; i++) {
+                if (!all[i].closest('.filtered-out')) out.push(all[i]);
+            }
+            return out;
+        }
+
+        function focusFolderRow(row) {
+            if (!row) return;
+            var ul = document.getElementById('folder-list');
+            if (ul) {
+                var rows = ul.querySelectorAll('li[data-path] > .folder-row');
+                for (var i = 0; i < rows.length; i++) rows[i].tabIndex = -1;
+            }
+            row.tabIndex = 0;
+            try { row.focus({ preventScroll: true }); } catch (e) { row.focus(); }
+            try { row.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+        }
+
+        function folderRowKey(row) {
+            var li = row && row.parentElement;
+            if (!li || !li.hasAttribute('data-path')) return null;
+            return folderKey(li.getAttribute('data-scope'), li.getAttribute('data-path'));
+        }
+        function folderRowByKey(key) {
+            var ul = document.getElementById('folder-list');
+            if (!ul || !key) return null;
+            var rows = ul.querySelectorAll('li[data-path] > .folder-row');
+            for (var i = 0; i < rows.length; i++) {
+                if (folderRowKey(rows[i]) === key) return rows[i];
+            }
+            return null;
+        }
+
+        (function wireFolderTreeKeys() {
+            var ul = document.getElementById('folder-list');
+            if (!ul) return;
+            ul.addEventListener('focusin', function(e) {
+                var row = e.target.closest && e.target.closest('li[data-path] > .folder-row');
+                if (!row) return;
+                var rows = ul.querySelectorAll('li[data-path] > .folder-row');
+                for (var i = 0; i < rows.length; i++) rows[i].tabIndex = -1;
+                row.tabIndex = 0;
+            });
+            ul.addEventListener('keydown', function(e) {
+                if (e.ctrlKey || e.metaKey || e.altKey) return;
+                var row = e.target.closest && e.target.closest('li[data-path] > .folder-row');
+                if (!row) return;
+                var rows = visibleFolderRows();
+                var idx = rows.indexOf(row);
+                var li = row.parentElement;
+                var chev = row.querySelector('.tree-chevron');
+                var expandable = chev && !chev.classList.contains('leaf');
+                var expanded = expandable && chev.classList.contains('expanded');
+                switch (e.key) {
+                    case 'ArrowDown':
+                        e.preventDefault();
+                        if (idx < rows.length - 1) focusFolderRow(rows[idx + 1]);
+                        break;
+                    case 'ArrowUp':
+                        e.preventDefault();
+                        if (idx > 0) focusFolderRow(rows[idx - 1]);
+                        else if (_ffInput && _ffWrap && _ffWrap.style.display !== 'none') { _ffInput.focus(); _ffInput.select(); }
+                        break;
+                    case 'Home':
+                        e.preventDefault();
+                        if (rows.length) focusFolderRow(rows[0]);
+                        break;
+                    case 'End':
+                        e.preventDefault();
+                        if (rows.length) focusFolderRow(rows[rows.length - 1]);
+                        break;
+                    case 'Enter':
+                    case ' ':
+                        e.preventDefault();
+                        row.click();
+                        break;
+                    case 'ArrowRight':
+                        e.preventDefault();
+                        if (!expandable) break;
+                        if (!expanded) { chev.click(); break; }
+                        var childUl = folderChildList(li);
+                        if (childUl) {
+                            var kids = folderLis(childUl).map(folderRowOf).filter(function(r) {
+                                return r && !r.closest('.filtered-out');
+                            });
+                            if (kids.length) focusFolderRow(kids[0]);
+                        }
+                        break;
+                    case 'ArrowLeft':
+                        e.preventDefault();
+                        if (expanded) { chev.click(); break; }
+                        var parentLi = li.parentElement && li.parentElement.closest('li[data-path]');
+                        var parentRow = parentLi && folderRowOf(parentLi);
+                        if (parentRow && !parentRow.closest('.filtered-out')) focusFolderRow(parentRow);
+                        break;
+                    case 'Escape':
+                        if (_ffInput && _ffInput.value) { e.stopPropagation(); clearFolderFilter(); }
+                        break;
+                }
+            });
+        })();
+
+        // Wrap renderFolders(): keep the filter and keyboard focus across the
+        // full rebuilds it does (callers resolve the binding at call time).
+        var __renderFoldersBase = renderFolders;
+        renderFolders = function() {
+            var ul = document.getElementById('folder-list');
+            var focusedKey = null;
+            if (ul && document.activeElement && ul.contains(document.activeElement)) {
+                var r = document.activeElement.closest('li[data-path] > .folder-row');
+                focusedKey = r ? folderRowKey(r) : null;
+            }
+            __renderFoldersBase();
+            applyFolderFilter();
+            if (focusedKey) {
+                var back = folderRowByKey(focusedKey);
+                if (back && !back.closest('.filtered-out')) focusFolderRow(back);
+            }
+        };
+
+        // `f` focuses the folder filter; same guards as the `/` quick-find above.
+        document.addEventListener('keydown', function(e) {
+            if (e.key !== 'f' || e.ctrlKey || e.metaKey || e.altKey) return;
+            var t = document.activeElement;
+            if (t) {
+                var tag = t.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return;
+            }
+            if (document.querySelector('.modal-overlay.active')) return;
+            if (!_ffInput || !_ffWrap || _ffWrap.style.display === 'none') return;
+            var main = document.getElementById('main-content');
+            if (main && main.style.display === 'none') return;
+            e.preventDefault();
+            _ffInput.focus();
+            _ffInput.select();
+        });
+
+
         init();
+        // Other pages link here as /connections.html#my-credentials.
+        if (location.hash === '#my-credentials') {
+            history.replaceState(null, '', location.pathname + location.search);
+            setTimeout(function() { openMyCredentials(); }, 250);
+        }
+    </script>
+    <script src="/ui.js"></script>
+    <script src="/search.js"></script>
+    <script>
+        // The global search (search.js) loads the full address-book index; the
+        // credentials banner reads it (window.rgSearchIndex) for a complete
+        // view, so refresh it whenever the index is ready or changes.
+        document.addEventListener('rg-search-index-ready', function() {
+            try { if (typeof updateCredBanner === 'function') updateCredBanner(); } catch (e) {}
+        });
     </script>
 </body>
 </html>

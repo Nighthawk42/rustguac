@@ -31,6 +31,12 @@ rustguac add-admin --name ci-bot \
   --expires "2026-12-31T00:00:00Z"
 ```
 
+`--if-none` creates the admin only when no admin account exists yet, and otherwise exits successfully without creating anything. It is meant for first-run provisioning, such as a container entrypoint, and works wherever `db_path` points:
+
+```bash
+rustguac add-admin --name docker-admin --if-none
+```
+
 ### User API tokens
 
 User API tokens authenticate as the OIDC user who owns the token, with an effective role capped by the token's `max_role`. Tokens use the same `Authorization: Bearer <token>` header as admin API keys — rustguac tries admin keys first, then user tokens. See [User API tokens](#user-api-tokens) below for details.
@@ -42,6 +48,34 @@ OIDC users are assigned a role through three mechanisms (in order of precedence)
 1. **Group-to-role mappings** — evaluated on every OIDC login. If the user's OIDC groups match any mappings, the highest matching role is applied.
 2. **Manual role assignment** — admins can set a user's role via CLI, API, or the Admin page.
 3. **Default role** — new users get the `default_role` from OIDC config on first login (default: `operator`).
+
+#### Only users you have added
+
+With `auto_create_users = false` in `[oidc]`, rustguac does not create accounts on login: a user must be added first with `rustguac add-user --email <email> --role <role>`, `POST /api/users`, or **Add User** on the Admin page. Anyone else who authenticates with the identity provider is sent back to the login page with "You do not have an account here". The role the admin chose is kept; `default_role` is not applied, but group-to-role mappings still are.
+
+```bash
+rustguac add-user --email jsmith@example.com --role operator --name "J Smith"
+```
+
+Emails are matched ignoring case, so it does not matter whether the provider sends `JSmith@Example.com` or `jsmith@example.com`, and two users cannot differ only in case.
+
+#### How a login is matched to a user
+
+Users are found by email, but an email on its own is not proof of who someone is: some identity providers let people set or change their own address. So the first time a user logs in, rustguac records their provider account's **subject** (the OIDC `sub` claim, a permanent ID the provider never reuses), and from then on that user can only be signed in as by that same provider account. A login with the same email but a different subject is refused with "This sign-in does not match the account used here before", and logged as a warning. This applies whether or not `auto_create_users` is on.
+
+A user an admin added who has not logged in yet has no subject, so their first login records it.
+
+rustguac also refuses a login when the provider explicitly marks the email as unverified (`email_verified: false`). Providers that do not send the claim are trusted as before.
+
+#### Moving to a different identity provider
+
+Every user's subject changes when you switch providers (for example from JumpCloud to Entra ID), so after the switch everyone would be refused. Clear each user's recorded subject and their next login records the new one:
+
+```bash
+rustguac reset-oidc-subject --email jsmith@example.com
+```
+
+Their role, group mappings, tokens and credentials are kept. This is CLI-only on purpose: it needs shell access to the rustguac host, and each use is written to the CLI audit log. The same command fixes a single user whose provider account was deleted and recreated.
 
 ## Endpoint access control
 
@@ -81,6 +115,7 @@ OIDC users are assigned a role through three mechanisms (in order of precedence)
 | Endpoint | Required role |
 |----------|--------------|
 | `GET /api/users` | admin |
+| `POST /api/users` | admin |
 | `PUT /api/users/:email/role` | admin |
 | `DELETE /api/users/:email` | admin |
 | `POST /api/users/:email/disable` | admin |
@@ -125,24 +160,40 @@ Operators can view their tokens (created by an admin on their behalf) but cannot
 
 ## Folder access control
 
-Connections folders have group-based access control. Each folder has an `allowed_groups` list stored in its `.config` entry in Vault.
+Each Connections folder decides who can see it, in its `.config` entry in Vault:
 
-- **Admins** bypass group checks and see all folders
-- **Operators and powerusers** see only folders where their OIDC groups intersect with the folder's `allowed_groups`
-- If `allowed_groups` is empty, all authenticated users can see the folder
+- `allowed_groups`: OIDC groups that can see the folder.
+- `allowed_users`: individual users who can see the folder, by login email (compared without regard to case). A user does not need to have logged in before being listed: access is checked from their identity when they use rustguac.
+
+A user can see a folder if any of their groups is in `allowed_groups` **or** their email is in `allowed_users`.
+
+- **Admins** bypass these checks and see all folders.
+- **Operators and powerusers** see only folders that grant them access.
+- If both lists are empty, the folder is **admin-only**.
 - Folders the user cannot access are **hidden** from the tree, not shown-then-denied. This applies at every level, including subfolders.
-- A folder the user cannot access directly is still shown if they can access one of its descendants, so a deeper grant is never orphaned out of the tree. Access of a child can be granted independently of its parent (see Inheritance below).
+- A folder the user cannot access is still shown if it leads to a subfolder they can, so a deeper grant is never orphaned out of the tree. Its own entries stay hidden; the user opens the subfolder. For example, a folder `users/jsmith` shared with `jsmith@example.com` shows `users` in jsmith's tree even if `users` itself is admin-only.
+- The list of allowed users is only shown to admins. A user who can open a folder does not see who else can.
+
+Because folder settings live in Vault, they apply on every rustguac instance sharing that Vault.
 
 ### Inheritance
 
-A subfolder created with `inherit_from_parent: true` (the default for new subfolders) grants access to anyone who can access its parent. A subfolder with its own non-empty `allowed_groups` and `inherit_from_parent: false` is gated solely by its own list, independent of the parent.
+A subfolder created with `inherit_from_parent: true` (the default for new subfolders) grants access to anyone who can access its parent. A subfolder with `inherit_from_parent: false` is gated solely by its own `allowed_groups` and `allowed_users`, independent of the parent.
 
-### Example
+The same rules bound [folder default credentials](credential-variables.md#folder-default-credentials): defaults set on a parent flow only into a subfolder that inherits and grants no groups or users of its own. Isolating a folder, or sharing it with anyone the parent doesn't include, keeps the parent's secrets out of it.
+
+### Examples
 
 A folder with `allowed_groups: ["engineering", "devops"]`:
 - A user with OIDC groups `["engineering", "marketing"]` **can** access it (engineering matches)
 - A user with OIDC groups `["marketing", "sales"]` **cannot** access it (no match)
 - An admin **can** always access it regardless of groups
+
+A folder per user, for example a personal VM:
+```json
+{ "allowed_groups": [], "allowed_users": ["jsmith@example.com"] }
+```
+Only jsmith (and admins) can see it. Create it with `POST /api/addressbook/folders`, add the VM as an entry, and jsmith finds it in Connections on their first login.
 
 ## Group-to-role mappings
 
@@ -228,6 +279,14 @@ This means:
 ```bash
 # List all OIDC users
 rustguac list-users
+
+# Add a user ahead of their first login (needed with auto_create_users = false)
+rustguac add-user --email user@example.com --role operator --name "A User"
+
+# Forget the identity provider account a user is bound to, after a provider
+# migration or a recreated provider account (see "Moving to a different
+# identity provider" above)
+rustguac reset-oidc-subject --email user@example.com
 
 # Set a user's role
 rustguac set-role --email user@example.com --role poweruser

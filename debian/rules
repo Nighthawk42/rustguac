@@ -34,6 +34,7 @@ override_dh_auto_install:
 
 	# guacd binary and libraries from staging
 	install -m 755 debian/staging/opt/rustguac/sbin/guacd debian/rustguac/opt/rustguac/sbin/guacd
+	install -m 755 debian/staging/opt/rustguac/bin/guacenc debian/rustguac/opt/rustguac/bin/guacenc
 	cp -a debian/staging/opt/rustguac/lib/*.so* debian/rustguac/opt/rustguac/lib/
 
 	# FreeRDP plugin for RDPDR/RDPSND channels (drive redirection, audio, printing)

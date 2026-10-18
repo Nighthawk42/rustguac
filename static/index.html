@@ -19,6 +19,19 @@
             font-weight: bold;
         }
         #sso-btn:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+        #sso-btn:disabled, #sso-btn:disabled:hover {
+            background: var(--surface);
+            border-color: var(--border);
+            color: var(--text-muted);
+            cursor: not-allowed;
+        }
+        #sso-error { 
+            margin-top: var(--s-2);
+            font-size: var(--fz-sm);
+            color: var(--text-muted);
+            text-align: center;
+        }
+        #sso-error:empty { display: none; }
         .api-key-toggle {
             color: var(--text-muted);
             font-size: var(--fz-sm);
@@ -66,6 +79,7 @@
     <div class="login-container">
         <div id="sso-section">
             <button id="sso-btn">Sign in with SSO</button>
+            <div id="sso-error" role="alert"></div>
         </div>
 
         <div class="api-key-toggle" id="api-key-toggle">
@@ -83,9 +97,23 @@
     </div>
 
     <script>
+        // Messages shown under the SSO button. Keys other than `unavailable`
+        // match the sso_error codes the OIDC callback redirects with.
+        var ssoMessages = {
+            failed: 'SSO login failed — please try again.',
+            no_account: 'You do not have an account here. Ask an administrator to add you.',
+            account_mismatch: 'This sign-in does not match the account used here before. Ask an administrator.',
+            email_unverified: 'Your identity provider has not verified your email address.',
+            disabled: 'Your account is disabled. Contact an administrator.',
+            unavailable: 'SSO provider is temporarily unavailable — retrying…'
+        };
+        var ssoErrorEl = document.getElementById('sso-error');
+
         // Show SSO error if redirected back from a failed callback
-        if (new URLSearchParams(window.location.search).get('sso_error')) {
-            document.getElementById('error').textContent = 'SSO login failed — please try again.';
+        var ssoError = new URLSearchParams(window.location.search).get('sso_error');
+        if (ssoError) {
+            ssoErrorEl.textContent = Object.prototype.hasOwnProperty.call(ssoMessages, ssoError)
+                ? ssoMessages[ssoError] : ssoMessages.failed;
             history.replaceState(null, '', '/');
         }
 
@@ -108,6 +136,35 @@
         var apiKeyToggle = document.getElementById('api-key-toggle');
         var chevron = document.getElementById('api-key-chevron');
 
+        var ssoBtn = document.getElementById('sso-btn');
+        var ssoPollTimer = null;
+
+        // Reflect live SSO availability: when the OIDC provider is reachable the
+        // button is active; when it's down (e.g. provider not yet up after a
+        // restart) the button is disabled with a notice, and we poll until the
+        // provider recovers — no page reload or click needed.
+        function applySsoAvailability(available) {
+            if (available) {
+                ssoBtn.disabled = false;
+                ssoBtn.textContent = 'Sign in with SSO';
+                // Clear only our own notice; keep a login error from the callback.
+                if (ssoErrorEl.textContent === ssoMessages.unavailable) ssoErrorEl.textContent = '';
+                if (ssoPollTimer) { clearInterval(ssoPollTimer); ssoPollTimer = null; }
+            } else {
+                ssoBtn.disabled = true;
+                ssoBtn.textContent = 'SSO unavailable';
+                ssoErrorEl.textContent = ssoMessages.unavailable;
+                if (!ssoPollTimer) {
+                    ssoPollTimer = setInterval(function() {
+                        fetch('/api/auth/status')
+                        .then(function(res) { return res.json(); })
+                        .then(function(d) { applySsoAvailability(!!d.oidc_available); })
+                        .catch(function() {});
+                    }, 5000);
+                }
+            }
+        }
+
         // Check if OIDC is enabled
         fetch('/api/auth/status')
         .then(function(res) { return res.json(); })
@@ -117,6 +174,7 @@
                 apiKeyToggle.style.display = 'block';
                 // Hide API key form by default when SSO is available
                 loginForm.style.display = 'none';
+                applySsoAvailability(!!data.oidc_available);
             }
             if (data.site_title) {
                 document.title = data.site_title;
@@ -125,7 +183,8 @@
             initTheme(data.theme);
         });
 
-        document.getElementById('sso-btn').addEventListener('click', function() {
+        ssoBtn.addEventListener('click', function() {
+            if (ssoBtn.disabled) return;
             window.location.href = '/auth/login';
         });
 
