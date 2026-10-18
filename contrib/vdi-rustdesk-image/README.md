@@ -19,6 +19,7 @@ variables override the baked-in server configuration:
 - `RUSTDESK_ID_SERVER`
 - `RUSTDESK_RELAY_SERVER`
 - `RUSTDESK_KEY`
+- `RUSTDESK_TARGET_ID` (open the connection window for this peer on login)
 
 RustDesk is AGPL-3.0. Distributing an image containing its binary carries the
 corresponding source-offer obligations. The source for the pinned package is
