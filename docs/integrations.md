@@ -465,6 +465,77 @@ JWT mode rereads the file on login and reauthentication, including after a 403.
 A missing, empty or rejected JWT does not trigger AppRole fallback. Use the same
 nested block under `vault_shared` or `vault_local` for additional backends.
 
+#### Other identity sources
+
+The same `[vault.jwt_auth]` block works with any issuer Vault or OpenBao can verify.
+Point the auth mount at that issuer's discovery URL or keys, bind the role to the
+workload's identity, and give rustguac the token through `path` or `token_command`.
+
+**Nomad.** Run rustguac as a Nomad job with a workload identity written to a file,
+and trust Nomad's JWKS (`https://<nomad>/.well-known/jwks.json`) on the auth mount.
+Nomad renews the token at roughly half its TTL.
+
+```hcl
+identity {
+  name     = "vault_default"
+  aud      = ["vault"]
+  ttl      = "1h"
+  file     = true
+  filepath = "secrets/vault.jwt"
+}
+```
+
+`filepath` is relative to the task's working directory; give rustguac the path
+as the task sees it (with the `docker` and `exec` drivers the secrets directory
+is `/secrets`):
+
+```toml
+[vault.jwt_auth]
+mount = "nomad-jwt"
+role = "rustguac"
+path = "/secrets/vault.jwt"
+```
+
+**SPIRE.** On a machine running a SPIRE agent, `spiffe-helper` keeps a JWT-SVID
+for an audience in a file and refreshes it before it expires. Trust the SPIRE
+server's OIDC discovery provider on the auth mount and bind the role to
+rustguac's SPIFFE ID.
+
+```
+# spiffe-helper helper.conf
+agent_address = "/run/spire/agent/public/api.sock"
+daemon_mode = true
+jwt_svids = [{ jwt_audience = "vault", jwt_svid_file_name = "/run/rustguac/vault.jwt" }]
+jwt_svid_file_mode = 0600
+```
+
+```toml
+[vault.jwt_auth]
+mount = "spire-jwt"
+role = "rustguac"
+path = "/run/rustguac/vault.jwt"
+```
+
+SPIRE can identify a machine without any stored secret, for example with a TPM
+(`tpm_devid` node attestation), which includes Proxmox VMs with a virtual TPM.
+We are working towards a documented Proxmox vTPM setup.
+
+**Cloud VMs.** Where the platform hands a VM a signed identity token on request
+(Azure managed identity, GCP's metadata server), a small script can fetch it.
+It must print the token and nothing else:
+
+```toml
+[vault.jwt_auth]
+mount = "azure-jwt"
+role = "rustguac"
+token_command = ["/opt/rustguac/bin/fetch-vault-jwt"]
+```
+
+**What JWT login does and doesn't remove.** It removes the long-lived AppRole
+secret ID from the rustguac host only when the platform itself vouches for the
+workload (Kubernetes, Nomad, SPIRE attestation, a cloud provider). Fetching a JWT
+with a client secret from an identity provider just moves the secret elsewhere.
+
 ### Token management
 
 rustguac manages Vault tokens automatically:

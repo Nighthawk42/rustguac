@@ -853,18 +853,62 @@ pub struct VaultClient {
     jwt_auth: Option<crate::config::VaultJwtAuth>,
 }
 
+/// The workload identity JWT for a login: read from `path`, or printed by
+/// `token_command`. Errors never include the token or the command's output,
+/// which could carry it.
+async fn fetch_workload_jwt(cfg: &crate::config::VaultJwtAuth) -> Result<String, VaultError> {
+    let raw = if let Some(path) = cfg.path.as_deref().filter(|p| !p.trim().is_empty()) {
+        tokio::fs::read_to_string(path).await.map_err(|e| {
+            VaultError::Auth(format!("cannot read workload identity token: {}", e.kind()))
+        })?
+    } else if let Some([program, args @ ..]) = cfg.token_command.as_deref() {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let timeout = std::time::Duration::from_secs(cfg.token_command_timeout_secs.max(1));
+        let out = match tokio::time::timeout(timeout, cmd.output()).await {
+            Err(_) => {
+                return Err(VaultError::Auth(format!(
+                    "jwt_auth.token_command did not finish within {}s",
+                    timeout.as_secs()
+                )))
+            }
+            Ok(Err(e)) => {
+                return Err(VaultError::Auth(format!(
+                    "jwt_auth.token_command could not run: {}",
+                    e.kind()
+                )))
+            }
+            Ok(Ok(out)) => out,
+        };
+        if !out.status.success() {
+            return Err(VaultError::Auth(format!(
+                "jwt_auth.token_command failed ({})",
+                out.status
+            )));
+        }
+        String::from_utf8(out.stdout)
+            .map_err(|_| VaultError::Auth("jwt_auth.token_command printed non-UTF-8".into()))?
+    } else {
+        return Err(VaultError::Auth(
+            "jwt_auth needs path or token_command".into(),
+        ));
+    };
+    let jwt = raw.trim();
+    if jwt.is_empty() {
+        return Err(VaultError::Auth("workload identity token is empty".into()));
+    }
+    Ok(jwt.to_string())
+}
+
 impl VaultClient {
     /// Create a new Vault client and perform initial login.
     pub async fn new(config: &VaultConfig, secret_id: &str) -> Result<Self, VaultError> {
         if let Some(ref jwt_auth) = config.jwt_auth {
-            if jwt_auth.mount.trim().is_empty()
-                || jwt_auth.role.trim().is_empty()
-                || jwt_auth.path.trim().is_empty()
-            {
-                return Err(VaultError::Auth(
-                    "JWT authentication requires mount, role and token path".into(),
-                ));
-            }
+            jwt_auth.validate().map_err(VaultError::Auth)?;
         } else if config.role_id.trim().is_empty() {
             return Err(VaultError::Auth(
                 "AppRole role_id is required when jwt_auth is not configured".into(),
@@ -897,18 +941,15 @@ impl VaultClient {
         Ok(client)
     }
 
-    /// Reopen projected JWTs at each login so kubelet rotation is respected.
+    /// Log in and return (token, ttl_seconds). With `jwt_auth` the JWT is
+    /// fetched again every time, so a rotated token (kubelet, Nomad,
+    /// spiffe-helper, a metadata service) is always the one sent.
     async fn login(&self) -> Result<(String, u64), VaultError> {
         let (url, body) = if let Some(ref jwt_auth) = self.jwt_auth {
-            let jwt = tokio::fs::read_to_string(&jwt_auth.path)
-                .await
-                .map_err(|_| VaultError::Auth("cannot read workload identity token".into()))?;
-            if jwt.trim().is_empty() {
-                return Err(VaultError::Auth("workload identity token is empty".into()));
-            }
+            let jwt = fetch_workload_jwt(jwt_auth).await?;
             (
                 format!("{}/v1/auth/{}/login", self.addr, jwt_auth.mount),
-                serde_json::json!({ "role": jwt_auth.role, "jwt": jwt.trim() }),
+                serde_json::json!({ "role": jwt_auth.role, "jwt": jwt }),
             )
         } else {
             (
@@ -2124,6 +2165,97 @@ mod tests {
         assert_eq!(json["allowed_users"][0], "a@b.c");
     }
 
+    /// JWT login from a token file on the `workload-jwt` mount.
+    fn jwt_file_auth(path: &std::path::Path) -> crate::config::VaultJwtAuth {
+        crate::config::VaultJwtAuth {
+            mount: "workload-jwt".into(),
+            role: "rustguac".into(),
+            path: Some(path.to_str().unwrap().into()),
+            token_command: None,
+            token_command_timeout_secs: 10,
+        }
+    }
+
+    #[test]
+    fn jwt_auth_settings_are_checked() {
+        let mut j = jwt_file_auth(std::path::Path::new("/run/token"));
+        assert!(j.validate().is_ok());
+        // The mount goes into the login URL: plain segments only.
+        for mount in ["auth-k8s/jwt", "jwt", "nomad.workloads"] {
+            j.mount = mount.into();
+            assert!(j.validate().is_ok(), "{mount}");
+        }
+        for mount in [
+            "",
+            "../sys",
+            "jwt/../../sys",
+            "a//b",
+            "/jwt",
+            "jwt/",
+            "j?x=1",
+            "j wt",
+        ] {
+            j.mount = mount.into();
+            assert!(j.validate().is_err(), "{mount:?} should be refused");
+        }
+        j.mount = "jwt".into();
+        // Exactly one source for the token.
+        j.token_command = Some(vec!["true".into()]);
+        assert!(j.validate().is_err(), "path and token_command together");
+        j.path = None;
+        assert!(j.validate().is_ok());
+        j.token_command = None;
+        assert!(j.validate().is_err(), "neither");
+        j.token_command = Some(vec![]);
+        assert!(j.validate().is_err(), "an empty command");
+    }
+
+    fn jwt_command_auth(argv: &[&str], timeout: u64) -> crate::config::VaultJwtAuth {
+        crate::config::VaultJwtAuth {
+            mount: "workload-jwt".into(),
+            role: "rustguac".into(),
+            path: None,
+            token_command: Some(argv.iter().map(|a| a.to_string()).collect()),
+            token_command_timeout_secs: timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_token_command_runs_at_every_login() {
+        // A cloud metadata service or SPIRE hands out a fresh token each
+        // time; the command is run again at every login, never cached.
+        let file = std::env::temp_dir().join(format!("rustguac-jwtcmd-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&file, "token-one\n").await.unwrap();
+        let cfg = jwt_command_auth(&["cat", file.to_str().unwrap()], 10);
+        assert_eq!(fetch_workload_jwt(&cfg).await.unwrap(), "token-one");
+        tokio::fs::write(&file, "token-two").await.unwrap();
+        assert_eq!(fetch_workload_jwt(&cfg).await.unwrap(), "token-two");
+        tokio::fs::remove_file(&file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jwt_token_command_failures_refuse_without_leaking_output() {
+        // Whatever the command printed may be (part of) a token: it never
+        // appears in the error.
+        let failing = jwt_command_auth(&["sh", "-c", "echo secret-jwt-material; exit 3"], 10);
+        let e = fetch_workload_jwt(&failing).await.unwrap_err().to_string();
+        assert!(!e.contains("secret-jwt-material"), "{e}");
+        assert!(e.contains("failed"), "{e}");
+
+        let hanging = jwt_command_auth(&["sleep", "30"], 1);
+        let started = std::time::Instant::now();
+        let e = fetch_workload_jwt(&hanging).await.unwrap_err().to_string();
+        assert!(e.contains("did not finish"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let empty = jwt_command_auth(&["true"], 10);
+        assert!(fetch_workload_jwt(&empty).await.is_err());
+
+        let missing = jwt_command_auth(&["/nonexistent/rustguac-token-helper"], 10);
+        let e = fetch_workload_jwt(&missing).await.unwrap_err().to_string();
+        assert!(e.contains("could not run"), "{e}");
+    }
+
     #[tokio::test]
     async fn workload_jwt_login_rereads_rotation_and_never_falls_back() {
         use axum::{routing::post, Json, Router};
@@ -2147,14 +2279,10 @@ mod tests {
             .unwrap();
         let mut config = base_config();
         config.addr = format!("http://{addr}");
-        config.jwt_auth = Some(crate::config::VaultJwtAuth {
-            mount: "workload-jwt".into(),
-            role: "rustguac".into(),
-            path: path.to_str().unwrap().into(),
-        });
+        config.jwt_auth = Some(jwt_file_auth(&path));
         assert_eq!(
             config
-                .secret_id_from_env("RUSTGUAC_TEST_ABSENT_SECRET_ID")
+                .login_secret("RUSTGUAC_TEST_ABSENT_SECRET_ID")
                 .unwrap(),
             ""
         );
@@ -2203,11 +2331,7 @@ mod tests {
             .unwrap();
         let mut config = base_config();
         config.addr = format!("http://{addr}");
-        config.jwt_auth = Some(crate::config::VaultJwtAuth {
-            mount: "workload-jwt".into(),
-            role: "rustguac".into(),
-            path: path.to_str().unwrap().into(),
-        });
+        config.jwt_auth = Some(jwt_file_auth(&path));
         let error = match VaultClient::new(&config, "legacy-secret").await {
             Err(error) => error,
             Ok(_) => panic!("JWT denial must fail closed"),
@@ -2266,11 +2390,7 @@ mod tests {
         tokio::fs::write(&path, "jwt-one").await.unwrap();
         let mut config = base_config();
         config.addr = format!("http://{addr}");
-        config.jwt_auth = Some(crate::config::VaultJwtAuth {
-            mount: "workload-jwt".into(),
-            role: "rustguac".into(),
-            path: path.to_str().unwrap().into(),
-        });
+        config.jwt_auth = Some(jwt_file_auth(&path));
         let client = VaultClient::new(&config, "").await.unwrap();
         tokio::fs::write(&path, "jwt-two").await.unwrap();
         let response = client

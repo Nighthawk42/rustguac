@@ -125,19 +125,83 @@ impl std::fmt::Debug for VaultConfig {
     }
 }
 
+/// `[vault.jwt_auth]` (or under `[vault_shared]` / `[vault_local]`): log in
+/// with a workload identity JWT instead of AppRole. The JWT is fetched again
+/// at every login, so a rotated token is always the one used. Exactly one of
+/// `path` and `token_command` gives it.
 #[derive(Debug, Deserialize, Clone)]
 pub struct VaultJwtAuth {
+    /// The JWT auth method's mount, e.g. `jwt` or `kubernetes-jwt`.
     pub mount: String,
+    /// The role on that mount.
     pub role: String,
-    pub path: String,
+    /// A file holding the JWT: a Kubernetes projected service-account token,
+    /// a Nomad workload identity file, or one written by spiffe-helper.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// A command that prints the JWT, and nothing else, on stdout: a program
+    /// and its arguments, run directly (never through a shell), e.g. a
+    /// script that asks a cloud metadata service for the VM's identity
+    /// token. Its output is never logged.
+    #[serde(default)]
+    pub token_command: Option<Vec<String>>,
+    /// Seconds `token_command` may run before it is killed. Default 10.
+    #[serde(default = "default_jwt_command_timeout")]
+    pub token_command_timeout_secs: u64,
+}
+
+fn default_jwt_command_timeout() -> u64 {
+    10
+}
+
+impl VaultJwtAuth {
+    /// Check the settings before any login is tried.
+    pub fn validate(&self) -> Result<(), String> {
+        // The mount goes into the login URL path: plain segments only.
+        let mount_ok = !self.mount.is_empty()
+            && self.mount.split('/').all(|seg| {
+                !seg.is_empty()
+                    && seg != "."
+                    && seg != ".."
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            });
+        if !mount_ok {
+            return Err(
+                "jwt_auth.mount must be a Vault mount path such as `jwt` or `auth-k8s/jwt`".into(),
+            );
+        }
+        if self.role.trim().is_empty() {
+            return Err("jwt_auth.role is required".into());
+        }
+        let has_path = self.path.as_deref().is_some_and(|p| !p.trim().is_empty());
+        let has_command = self
+            .token_command
+            .as_ref()
+            .is_some_and(|c| !c.is_empty() && !c[0].trim().is_empty());
+        match (has_path, has_command) {
+            (true, false) | (false, true) => Ok(()),
+            (true, true) => Err("jwt_auth takes either path or token_command, not both".into()),
+            (false, false) => Err("jwt_auth needs path or token_command".into()),
+        }
+    }
 }
 
 impl VaultConfig {
-    pub fn secret_id_from_env(&self, name: &str) -> Result<String, std::env::VarError> {
-        if self.jwt_auth.is_some() {
-            Ok(String::new())
-        } else {
-            std::env::var(name)
+    /// The AppRole secret ID to log in with, from the environment variable
+    /// `env_name`, or an empty string when this backend logs in with a JWT
+    /// and needs none. The error says what is missing.
+    pub fn login_secret(&self, env_name: &str) -> Result<String, String> {
+        if let Some(ref jwt) = self.jwt_auth {
+            jwt.validate()?;
+            return Ok(String::new());
+        }
+        match std::env::var(env_name) {
+            Ok(s) if !s.is_empty() => Ok(s),
+            _ => Err(format!(
+                "{env_name} is required (or configure jwt_auth for workload identity login)"
+            )),
         }
     }
 }

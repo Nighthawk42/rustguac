@@ -238,10 +238,10 @@ async fn connect_named(config: &Config, name: &str) -> Arc<VaultClient> {
         }
     };
 
-    let secret_id = match std::env::var(env_var) {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            eprintln!("Error: {} env var required for backend '{}'", env_var, name);
+    let secret_id = match vault_config.login_secret(env_var) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: backend '{}': {}", name, e);
             std::process::exit(1);
         }
     };

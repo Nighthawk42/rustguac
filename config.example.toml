@@ -195,6 +195,8 @@ web_allowed_networks = ["127.0.0.0/8", "::1/128"]
 # mount = "workload-jwt"      # JWT auth mount, not the KV mount
 # role = "rustguac"
 # path = "/var/run/secrets/vault/token"
+# # ...or a command that prints the token (run directly, no shell):
+# # token_command = ["/opt/rustguac/bin/fetch-vault-jwt"]
 
 # ─── Recording ──────────────────────────────────────────────────────────────
 #

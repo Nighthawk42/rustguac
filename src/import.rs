@@ -287,10 +287,10 @@ pub async fn cmd_import_guacamole(
         }
     };
 
-    let secret_id = match std::env::var("VAULT_SECRET_ID") {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            eprintln!("Error: VAULT_SECRET_ID env var required");
+    let secret_id = match vault_config.login_secret("VAULT_SECRET_ID") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
             std::process::exit(1);
         }
     };

@@ -151,16 +151,26 @@ role = "rustguac"
 path = "/var/run/secrets/vault/token"
 ```
 
-All three `jwt_auth` fields are required. `mount` is the JWT auth mount, not the
-KV mount. The token file is reopened on every login and reauthentication, so
-projected Kubernetes token rotation is respected. JWT mode takes precedence over
-AppRole and never falls back to it when the file is missing, empty or rejected.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mount` | (required) | The JWT auth method's mount, not the KV mount, e.g. `jwt` or `auth-k8s/jwt` |
+| `role` | (required) | The role on that mount |
+| `path` | | A file holding the JWT |
+| `token_command` | | A program and its arguments that print the JWT, and nothing else, on stdout. Run directly, never through a shell; its output is never logged |
+| `token_command_timeout_secs` | `10` | How long `token_command` may run before it is killed |
+
+Give exactly one of `path` and `token_command`. The token is fetched again on
+every login and reauthentication, so a rotated token is always the one used.
+JWT mode takes precedence over AppRole and never falls back to it when the token
+is missing, empty or rejected. The `import-guacamole` and `vault-migrate`
+commands log in the same way.
 Use this with Vault/OpenBao JWT auth configured to verify the token issuer,
 audience and exact workload identity. This is separate from users' OIDC login.
 
 The same nested block works as `[vault_shared.jwt_auth]` and
 `[vault_local.jwt_auth]`; only AppRole-mode backends need their SecretID env var.
-See [Integrations](integrations.md#workload-jwt-authentication) for Kubernetes setup.
+See [Integrations](integrations.md#workload-jwt-authentication) for Kubernetes,
+Nomad, SPIRE and cloud VM setups.
 
 ### Multiple Vault backends (disaster recovery)
 

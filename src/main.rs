@@ -925,8 +925,8 @@ async fn run_server(config: Config, database: Db) {
     let mut local_cell = default_cell.clone();
 
     if let Some(ref vault_config) = config.vault {
-        match vault_config.secret_id_from_env("VAULT_SECRET_ID") {
-            Ok(sid) if vault_config.jwt_auth.is_some() || !sid.is_empty() => {
+        match vault_config.login_secret("VAULT_SECRET_ID") {
+            Ok(sid) => {
                 connect_vault_backend(
                     "default",
                     default_cell.clone(),
@@ -936,36 +936,32 @@ async fn run_server(config: Config, database: Db) {
                 )
                 .await;
             }
-            _ => {
-                tracing::error!("VAULT_SECRET_ID env var required when [vault] is configured");
+            Err(e) => {
+                tracing::error!("[vault]: {e}");
                 tracing::error!("Address book and drive features will be unavailable");
             }
         }
     }
 
     if let Some(ref vc) = config.vault_shared {
-        match vc.secret_id_from_env("VAULT_SHARED_SECRET_ID") {
-            Ok(sid) if vc.jwt_auth.is_some() || !sid.is_empty() => {
+        match vc.login_secret("VAULT_SHARED_SECRET_ID") {
+            Ok(sid) => {
                 let cell: VaultCell = Arc::new(tokio::sync::RwLock::new(None));
                 connect_vault_backend("shared", cell.clone(), vc.clone(), sid, None).await;
                 shared_cell = cell;
             }
-            _ => tracing::error!(
-                "VAULT_SHARED_SECRET_ID required for [vault_shared]; shared-scope connections unavailable"
-            ),
+            Err(e) => tracing::error!("[vault_shared]: {e}; shared-scope connections unavailable"),
         }
     }
 
     if let Some(ref vc) = config.vault_local {
-        match vc.secret_id_from_env("VAULT_LOCAL_SECRET_ID") {
-            Ok(sid) if vc.jwt_auth.is_some() || !sid.is_empty() => {
+        match vc.login_secret("VAULT_LOCAL_SECRET_ID") {
+            Ok(sid) => {
                 let cell: VaultCell = Arc::new(tokio::sync::RwLock::new(None));
                 connect_vault_backend("local", cell.clone(), vc.clone(), sid, None).await;
                 local_cell = cell;
             }
-            _ => tracing::error!(
-                "VAULT_LOCAL_SECRET_ID required for [vault_local]; instance-scope connections unavailable"
-            ),
+            Err(e) => tracing::error!("[vault_local]: {e}; instance-scope connections unavailable"),
         }
     }
 
