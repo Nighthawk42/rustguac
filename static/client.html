@@ -329,6 +329,8 @@
         var urlParams = new URLSearchParams(window.location.search);
         var shareToken = urlParams.get('token');
         var apiKey = sessionStorage.getItem('rustguac_api_key');
+        var touchClient = (navigator.maxTouchPoints || 0) > 0
+            || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
         // Pre-minted single-use WebSocket ticket passed in the URL. Lets a
         // headless API integration authenticate the owner connection without an
         // OIDC session or a stored API key: the backend mints it via
@@ -927,6 +929,13 @@
                         '<button id="ctrl-close" style="background:none;border:none;color:var(--text-dim);font-size:1.6em;cursor:pointer;font-family:monospace;padding:0 0.3em;">&times;</button>' +
                     '</div>' +
                     '<div style="padding:0.8em 1em;">' +
+                        '<div id="ctrl-touch-section" style="display:none;margin-bottom:1em;">' +
+                            '<div style="color:var(--text-muted);font-size:0.85em;margin-bottom:0.5em;letter-spacing:0.05em;">TOUCH CONTROL</div>' +
+                            '<div style="display:flex;gap:0.4em;">' +
+                                '<button id="ctrl-touchpad" style="flex:1;padding:0.5em;background:var(--input);color:var(--primary);border:1px solid var(--border);border-radius:3px;">Touchpad</button>' +
+                                '<button id="ctrl-touchscreen" style="flex:1;padding:0.5em;background:var(--input);color:var(--primary);border:1px solid var(--border);border-radius:3px;">Direct touch</button>' +
+                            '</div>' +
+                        '</div>' +
                         '<div style="color:var(--text-muted);font-size:0.85em;margin-bottom:0.5em;letter-spacing:0.05em;">SEND KEYS</div>' +
                         '<div id="ctrl-keys" style="display:flex;flex-wrap:wrap;gap:0.4em;"></div>' +
                     '</div>' +
@@ -936,6 +945,12 @@
                     '</div>';
                 document.body.appendChild(controlsPanel);
                 document.getElementById('ctrl-close').addEventListener('click', function() { toggleControlsPanel(); });
+                if (touchClient) {
+                    document.getElementById('ctrl-touch-section').style.display = 'block';
+                    document.getElementById('ctrl-touchpad').addEventListener('click', function() { setTouchInputMode('touchpad'); });
+                    document.getElementById('ctrl-touchscreen').addEventListener('click', function() { setTouchInputMode('touchscreen'); });
+                    updateTouchModeButtons();
+                }
                 var keysEl = document.getElementById('ctrl-keys');
                 SEND_KEYS.forEach(function(k) {
                     var b = document.createElement('button');
@@ -1813,7 +1828,7 @@
                                     // resize inside the same 16px band
                                     // afterwards is correctly skipped.
                                     sizeWouldChange(sw, sh);
-                                    client.sendSize(sw, sh);
+                                    if (!touchClient) client.sendSize(sw, sh);
                                 }
                             };
                             var scheduleFit = function() {
@@ -1981,11 +1996,11 @@
                 if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
                 var body = {
-                    width: window.innerWidth,
-                    height: window.innerHeight,
-                    screen_width: screen.width,
-                    screen_height: screen.height,
-                    dpi: Math.round((window.devicePixelRatio || 1) * 96)
+                    width: touchClient ? 1920 : window.innerWidth,
+                    height: touchClient ? 1080 : window.innerHeight,
+                    screen_width: touchClient ? 1920 : screen.width,
+                    screen_height: touchClient ? 1080 : screen.height,
+                    dpi: touchClient ? 96 : Math.round((window.devicePixelRatio || 1) * 96)
                 };
 
                 var url = '/api/addressbook/folders/' + encodeURIComponent(scope)
@@ -2082,6 +2097,36 @@
                 client.sendKeyEvent(0, keysym);
             };
 
+            // Mobile browsers only show their native on-screen keyboard for a
+            // focused editable field. Guacamole.Keyboard translates the
+            // field's key, text-input, composition, and IME events.
+            if (touchClient) {
+                var mobileKeyboardInput = document.createElement('input');
+                mobileKeyboardInput.type = 'text';
+                mobileKeyboardInput.autocomplete = 'off';
+                mobileKeyboardInput.autocapitalize = 'off';
+                mobileKeyboardInput.spellcheck = false;
+                mobileKeyboardInput.setAttribute('aria-label', 'Remote keyboard input');
+                mobileKeyboardInput.style.cssText = 'position:fixed;right:14px;bottom:14px;width:1px;height:1px;opacity:0.01;z-index:3200;';
+                document.body.appendChild(mobileKeyboardInput);
+                var mobileKeyboard = new Guacamole.Keyboard(mobileKeyboardInput);
+                mobileKeyboard.onkeydown = keyboard.onkeydown;
+                mobileKeyboard.onkeyup = keyboard.onkeyup;
+
+                var keyboardButton = document.createElement('button');
+                keyboardButton.type = 'button';
+                keyboardButton.textContent = '\u2328';
+                keyboardButton.title = 'Show keyboard';
+                keyboardButton.setAttribute('aria-label', 'Show keyboard');
+                keyboardButton.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:3199;width:52px;height:52px;border-radius:26px;border:1px solid var(--border);background:var(--primary);color:var(--text-on-primary);font-size:25px;box-shadow:0 3px 12px rgba(0,0,0,.45);';
+                keyboardButton.addEventListener('click', function() {
+                    mobileKeyboardInput.value = '';
+                    mobileKeyboardInput.focus({ preventScroll: true });
+                    mobileKeyboardInput.click();
+                });
+                document.body.appendChild(keyboardButton);
+            }
+
             // Release all held keys when the window loses focus or is hidden.
             // Modifier keyups are otherwise lost when focus shifts away (e.g.
             // the clipboard-permission prompt triggered by Ctrl+V, or alt-tab
@@ -2115,8 +2160,41 @@
             // events after a touch. Translate touchscreen gestures directly
             // so taps, drags, long-presses, and two-finger scrolling reach the
             // remote desktop.
-            var touchscreen = new Guacamole.Mouse.Touchscreen(client.getDisplay().getElement());
+            var touchInputMode = touchClient
+                ? (localStorage.getItem('rustguac_touch_mode') || 'touchpad')
+                : 'touchscreen';
+            function updateTouchModeButtons() {
+                var pad = document.getElementById('ctrl-touchpad');
+                var direct = document.getElementById('ctrl-touchscreen');
+                if (!pad || !direct) return;
+                pad.style.background = touchInputMode === 'touchpad' ? 'var(--primary)' : 'var(--input)';
+                pad.style.color = touchInputMode === 'touchpad' ? 'var(--text-on-primary)' : 'var(--primary)';
+                direct.style.background = touchInputMode === 'touchscreen' ? 'var(--primary)' : 'var(--input)';
+                direct.style.color = touchInputMode === 'touchscreen' ? 'var(--text-on-primary)' : 'var(--primary)';
+            }
+            function setTouchInputMode(mode) {
+                touchInputMode = mode;
+                localStorage.setItem('rustguac_touch_mode', mode);
+                updateTouchModeButtons();
+            }
+            var displayInputEl = client.getDisplay().getElement();
+            var touchscreen = new Guacamole.Mouse.Touchscreen(displayInputEl);
             touchscreen.onEach(['mousedown', 'mousemove', 'mouseup'], function(e) {
+                if (touchInputMode !== 'touchscreen') return;
+                var state = e.state;
+                if (fillX !== 1 || fillY !== 1) {
+                    state = new Guacamole.Mouse.State(state);
+                    state.x /= fillX;
+                    state.y /= fillY;
+                }
+                client.getDisplay().showCursor(true);
+                client.sendMouseState(state, true);
+            });
+            var touchpad = new Guacamole.Mouse.Touchpad(displayInputEl);
+            touchpad.currentState.x = Math.max(0, displayInputEl.offsetWidth / 2);
+            touchpad.currentState.y = Math.max(0, displayInputEl.offsetHeight / 2);
+            touchpad.onEach(['mousedown', 'mousemove', 'mouseup'], function(e) {
+                if (touchInputMode !== 'touchpad') return;
                 var state = e.state;
                 if (fillX !== 1 || fillY !== 1) {
                     state = new Guacamole.Mouse.State(state);
@@ -2279,7 +2357,7 @@
                     var anyPanelOpen = panelOpen || filePanelOpen;
                     var ts = rgTargetSize(anyPanelOpen);
                     var sw = ts[0], sh = ts[1];
-                    if (sizeWouldChange(sw, sh))
+                    if (!touchClient && sizeWouldChange(sw, sh))
                         client.sendSize(sw, sh);
                 }, 500);
             });
