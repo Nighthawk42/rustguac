@@ -587,11 +587,11 @@ impl DockerDriver {
                             ))
                         }
                     }
-                    let mount = format!(
-                        "{}:/home/{}:nosuid,nodev",
-                        host_path.display(),
-                        spec.username
-                    );
+                    // Docker's legacy `HostConfig.binds` syntax only accepts
+                    // bind access/propagation modes here. Filesystem flags
+                    // such as `nosuid,nodev` make container creation fail
+                    // with "invalid mode" on the Docker Engine API.
+                    let mount = format!("{}:/home/{}:rw", host_path.display(), spec.username);
                     tracing::info!(mount = %mount, "VDI home directory bind mount");
                     Some(vec![mount])
                 } else {
