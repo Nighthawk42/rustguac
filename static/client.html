@@ -17,6 +17,7 @@
         #display {
             width: 100%;
             height: 100%;
+            touch-action: none;
         }
         #status {
             position: fixed;
@@ -2109,6 +2110,23 @@
                 client.sendMouseState(state, true);
             });
 
+            // Browsers do not reliably synthesize mouse events from touch,
+            // and Guacamole.Mouse intentionally suppresses those synthetic
+            // events after a touch. Translate touchscreen gestures directly
+            // so taps, drags, long-presses, and two-finger scrolling reach the
+            // remote desktop.
+            var touchscreen = new Guacamole.Mouse.Touchscreen(client.getDisplay().getElement());
+            touchscreen.onEach(['mousedown', 'mousemove', 'mouseup'], function(e) {
+                var state = e.state;
+                if (fillX !== 1 || fillY !== 1) {
+                    state = new Guacamole.Mouse.State(state);
+                    state.x /= fillX;
+                    state.y /= fillY;
+                }
+                client.getDisplay().showCursor(true);
+                client.sendMouseState(state, true);
+            });
+
             // Absorb a small shortfall between the framebuffer and the
             // viewport. The uniform fit in scaleDisplay() makes one axis match
             // exactly and leaves the other short when the server could not
@@ -2182,7 +2200,6 @@
                 remoteCursor = { url: canvas.toDataURL('image/png'), x: x, y: y };
                 applyRemoteCursor();
             };
-
             // Auto-scale display. When a multi-monitor layout is active, the
             // main window shows only monitor 0 (always at the origin of the
             // combined framebuffer); the other heads are available as pop-out
